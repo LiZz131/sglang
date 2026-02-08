@@ -2861,6 +2861,7 @@ class DeepseekV2Model(nn.Module):
         super().__init__()
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
@@ -3258,6 +3259,91 @@ class DeepseekV2ForCausalLM(nn.Module):
             )
         else:
             return hidden_states
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],  # [start, end) 0-based
+        input_embeds: torch.Tensor = None,
+    ):
+        start, end = split_interval
+        # Embedding: only when this chunk starts from layer 0 and we are first PP rank
+        if start == 0:
+            if self.pp_group.is_first_rank:
+                if input_embeds is None:
+                    forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+                else:
+                    forward_batch.hidden_states = input_embeds
+                forward_batch.residual = None
+
+        # Layers that this rank owns and fall in [start, end)
+        layer_start = max(start, self.model.start_layer)
+        layer_end = min(end, self.model.end_layer)
+        if layer_start < layer_end:
+            device = forward_batch.hidden_states.device
+            num_layers_this_chunk = layer_end - layer_start
+            zero_allocator = BumpAllocator(
+                buffer_size=num_layers_this_chunk * 2,
+                dtype=torch.float32,
+                device=device,
+            )
+            has_gemm = (
+                hasattr(self.model, "gemm_output_zero_allocator_size")
+                and getattr(self.model, "gemm_output_zero_allocator_size", 0) > 0
+            )
+            gemm_output_zero_allocator = (
+                BumpAllocator(
+                    buffer_size=self.model.gemm_output_zero_allocator_size,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                if has_gemm
+                else None
+            )
+            llama_4_scaling = None
+            if self.model.llama_4_scaling_config is not None:
+                llama_4_scaling = _get_llama_4_scaling(
+                    original_max_position_embeddings=self.model.llama_4_scaling_config[
+                        "original_max_position_embeddings"
+                    ],
+                    scaling_beta=self.model.llama_4_scaling_config["beta"],
+                    positions=positions,
+                )
+            for i in range(layer_start, layer_end):
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    layer = self.model.layers[i]
+                    forward_batch.hidden_states, forward_batch.residual = layer(
+                        positions,
+                        forward_batch.hidden_states,
+                        forward_batch,
+                        forward_batch.residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                        llama_4_scaling,
+                    )
+
+        if end == self.model.num_hidden_layers and self.pp_group.is_last_rank:
+            if forward_batch.residual is None:
+                hidden_states = self.model.norm(forward_batch.hidden_states)
+            else:
+                hidden_states, _ = self.model.norm(
+                    forward_batch.hidden_states, forward_batch.residual
+                )
+            forward_batch.hidden_states = hidden_states
+            result = self.logits_processor(
+                input_ids,
+                forward_batch.hidden_states,
+                self.lm_head,
+                forward_batch,
+                None,  # aux_hidden_states
+            )
+        else:
+            result = None
+
+        return result
 
     @property
     def start_layer(self):
