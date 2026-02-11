@@ -538,6 +538,134 @@ class Fp8LinearMethod(LinearMethodBase):
             use_per_token_if_dynamic=False,
         )
 
+    def apply_for_split_prefill(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        tp_attention_size: int = 1,
+        tp_attention_rank: int = 0,
+        is_column: bool = True,
+    ) -> torch.Tensor:
+        """Prefill path: layer 已持有 decode 块（第一次按 tp_attention_size 划分），
+        在此块内按 tp_rank 做第二次划分得到 prefill 用的 shard。
+        例: tp_size=4, tp_attention_size=2 时，decode 块为 [0,1] 与 [2,3]；
+        tp_rank=1 且 tp_attention_rank=0 时从块 [0,1] 中取后半份即 [1]。
+        is_column=True 表示 column 并行（按输出维切）；False 表示 row 并行（按输入维切）。
+        """
+        if self.use_marlin:
+            raise NotImplementedError(
+                "apply_for_split_prefill with Marlin is not supported: "
+                "weight is in packed format and cannot be sharded by view."
+            )
+
+        # layer 上已是 decode 块：output/input_size_per_partition 为块内维度
+        out_chunk = layer.output_size_per_partition
+        in_chunk = layer.input_size_per_partition
+
+        # 同一 decode 块内做 prefill 的 rank 数；块内 prefill 下标
+        local_prefill_size = tp_size // tp_attention_size
+        local_prefill_rank = tp_rank % local_prefill_size
+
+        if self.block_quant:
+            block_n, block_k = self.quant_config.weight_block_size
+            weight = layer.weight
+            scale = layer.weight_scale_inv
+            # block_quant 存的是 (out_chunk, in_chunk)
+            if is_column:
+                shard_n = out_chunk // local_prefill_size
+                start_n = local_prefill_rank * shard_n
+                weight_shard = weight.narrow(0, start_n, shard_n)
+                shard_out_blocks = (shard_n + block_n - 1) // block_n
+                start_ob = start_n // block_n
+                scale_shard = scale.narrow(0, start_ob, shard_out_blocks)
+                bias_shard = (
+                    layer.bias.narrow(0, start_n, shard_n)
+                    if layer.bias is not None
+                    else None
+                )
+            else:
+                shard_k = in_chunk // local_prefill_size
+                start_k = local_prefill_rank * shard_k
+                weight_shard = weight.narrow(1, start_k, shard_k)
+                shard_in_blocks = (shard_k + block_k - 1) // block_k
+                start_ib = start_k // block_k
+                scale_shard = scale.narrow(1, start_ib, shard_in_blocks)
+                bias_shard = layer.bias
+
+            if use_intel_amx_backend(layer):
+                return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
+                    x,
+                    weight_shard,
+                    scale_shard,
+                    self.quant_config.weight_block_size,
+                    bias_shard,
+                    x.dtype,
+                    True,
+                )
+            if isinstance(x, tuple):
+                return self.w8a8_block_fp8_linear(
+                    input=x[0],
+                    weight=weight_shard,
+                    block_size=self.quant_config.weight_block_size,
+                    weight_scale=scale_shard,
+                    input_scale=x[1],
+                    bias=bias_shard,
+                )
+            return self.w8a8_block_fp8_linear(
+                input=x,
+                weight=weight_shard,
+                block_size=self.quant_config.weight_block_size,
+                weight_scale=scale_shard,
+                input_scale=None,
+                bias=bias_shard,
+            )
+
+        # 非 block：weight 存的是 (in_chunk, out_chunk)
+        weight = layer.weight
+        scale = layer.weight_scale
+        if is_column:
+            shard_n = out_chunk // local_prefill_size
+            start_n = local_prefill_rank * shard_n
+            weight_shard = weight.narrow(1, start_n, shard_n)
+            if scale.numel() == out_chunk or (
+                scale.dim() >= 1 and scale.shape[-1] == out_chunk
+            ):
+                scale_shard = scale.narrow(-1, start_n, shard_n).contiguous()
+            else:
+                scale_shard = scale
+            bias_shard = (
+                layer.bias.narrow(0, start_n, shard_n)
+                if layer.bias is not None
+                else None
+            )
+        else:
+            shard_k = in_chunk // local_prefill_size
+            start_k = local_prefill_rank * shard_k
+            weight_shard = weight.narrow(0, start_k, shard_k)
+            scale_shard = scale
+            bias_shard = layer.bias
+
+        return apply_fp8_linear(
+            input=x,
+            weight=weight_shard,
+            weight_scale=scale_shard,
+            input_scale=layer.input_scale,
+            bias=bias_shard,
+            cutlass_fp8_supported=self.cutlass_fp8_supported,
+            use_per_token_if_dynamic=False,
+        )
+
+    def apply_for_decode(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Decode 路径：使用全量权重，直接走 apply。"""
+        return self.apply(layer, x, bias)
 
 class Fp8MoEMethod(FusedMoEMethodBase):
     """MoE method for FP8.
