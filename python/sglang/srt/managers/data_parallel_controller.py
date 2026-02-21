@@ -74,6 +74,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     SHORTEST_QUEUE = auto()
     MINIMUM_TOKENS = auto()
+    SPECIAL_DP_ATTENTION = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -160,6 +161,8 @@ class DataParallelController:
         self.load_balance_method = LoadBalanceMethod.from_str(
             server_args.load_balance_method
         )
+        if server_args.enable_special_dp_attention:
+            self.load_balance_method = LoadBalanceMethod.SPECIAL_DP_ATTENTION
         self.run_scheduler_process_func = run_scheduler_process_func
 
         # For DP balance
@@ -179,6 +182,7 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
             LoadBalanceMethod.MINIMUM_TOKENS: self.minimum_tokens_scheduler,
+            LoadBalanceMethod.SPECIAL_DP_ATTENTION: self.special_dp_attention_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
 
@@ -560,6 +564,17 @@ class DataParallelController:
             self.round_robin_scheduler(req)
         else:
             self.follow_bootstrap_room_scheduler(req)
+
+    def special_dp_attention_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        # for each dp rank, send the request
+        # TODO(lbz): need to set decode_rank for the request
+        logger.debug(f"Special DP Attention scheduler, sending request to all DP ranks")
+        for dp_rank in range(self.server_args.dp_size):
+            logger.debug(f"Sending request to DP rank {dp_rank}, request: {req.rid}")
+            self.workers[dp_rank].send_pyobj(req)
 
     def event_loop(self):
         while True:
