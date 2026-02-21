@@ -569,12 +569,19 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
+        # set the decode_dp_rank for the request
+        self.set_decode_dp_rank(req)
+
         # for each dp rank, send the request
-        # TODO(lbz): need to set decode_rank for the request
         logger.debug(f"Special DP Attention scheduler, sending request to all DP ranks")
         for dp_rank in range(self.server_args.dp_size):
             logger.debug(f"Sending request to DP rank {dp_rank}, request: {req.rid}")
             self.workers[dp_rank].send_pyobj(req)
+    
+    def set_decode_dp_rank(self, req: Req):
+        # TODO(lbz): need to set decode_rank for the request, here is a demo implementation
+        req.decode_dp_rank = self.round_robin_counter
+        self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
 
     def event_loop(self):
         while True:
