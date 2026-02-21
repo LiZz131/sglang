@@ -3524,7 +3524,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                         zero_allocator,
                         gemm_output_zero_allocator,
                         llama_4_scaling,
-                    logger.debug(f"causal split prefill, layer {i}, hidden_states: {forward_batch.hidden_states.shape}, residual: {forward_batch.residual.shape if forward_batch.residual is not None else None}")
                     )
                     logger.debug(f"causal split prefill, layer {i}, hidden_states: {forward_batch.hidden_states.shape}, residual: {forward_batch.residual.shape if forward_batch.residual is not None else None}")
 
