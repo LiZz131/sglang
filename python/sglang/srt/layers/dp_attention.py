@@ -166,7 +166,11 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def is_dp_max_padding(cls) -> bool:
-        return cls._dp_max_padding
+        # return cls._dp_max_padding
+        # 若尚未调用 set_dp_buffer_len（例如 split prefill 未走 prepare_mlp_sync_batch），
+        # 则默认返回 True，避免 AttributeError，并保守地启用 symmetric memory。
+        # TODO(lbz): need to fix this, need more efficient way to determine this
+        return getattr(cls, "_dp_max_padding", True)
 
 
 def set_dp_buffer_len(
