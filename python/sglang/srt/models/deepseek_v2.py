@@ -1555,7 +1555,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             if self.use_nsa:
                 q_lora = self.q_a_layernorm(q)
                 if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
-                    # TODO(lbz): 这里需要修改, 因为 prefill 的时候, 这里有可能需要修改view的结果
                     q = self.q_b_proj.forward_split_prefill_normal_tp(
                         q_lora, tp_size=self.attn_tp_size, tp_rank=self.attn_tp_rank, 
                         tp_attention_size=self.tp_size, tp_attention_rank=self.tp_rank,
@@ -1585,7 +1584,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                     None,
                 )
                 if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
-                    # TODO(lbz): 这里需要修改, 因为 prefill 的时候, 这里有可能需要修改view的结果
                     q = self.q_b_proj.forward_split_prefill_normal_tp(
                         q, tp_size=self.attn_tp_size, tp_rank=self.attn_tp_rank, 
                         tp_attention_size=self.tp_size, tp_attention_rank=self.tp_rank,
@@ -1609,7 +1607,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                     output_unquantized_inp1=False,
                 )
                 if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
-                    # TODO(lbz): 这里需要修改, 因为 prefill 的时候, 这里有可能需要修改view的结果
                     q = self.q_b_proj.forward_split_prefill_normal_tp(
                         q, tp_size=self.attn_tp_size, tp_rank=self.attn_tp_rank, 
                         tp_attention_size=self.tp_size, tp_attention_rank=self.tp_rank,
@@ -1621,7 +1618,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 q = self.q_a_layernorm(q)
                 if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
-                    # TODO(lbz): 这里需要修改, 因为 prefill 的时候, 这里有可能需要修改view的结果
                     logger.info(f"split prefill normal tp, q: {q.shape}")
                     logger.info(f"tp_size: {self.tp_size}, tp_rank: {self.tp_rank}, tp_attention_size: {self.attn_tp_size}, tp_attention_rank: {self.attn_tp_rank}")
                     q = self.q_b_proj.forward_split_prefill_normal_tp(
@@ -1724,6 +1720,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         return q, k, v, forward_batch
 
     def forward_normal_core(self, q, k, v, forward_batch):
+        logger.info(f"forward_normal_core, q: {q.shape}, k: {k.shape}, v: {v.shape}")
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
             attn_output = attn_output.reshape(-1, self.tp_num_heads * self.v_head_dim)
