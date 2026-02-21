@@ -29,6 +29,7 @@ import tqdm
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -70,6 +71,7 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
+    AttentionInputs,
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
@@ -1108,6 +1110,13 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.quant_config = quant_config
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = attn_tp_rank
+        self.attn_tp_size = attn_tp_size
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.enable_special_dp_attention = get_global_server_args().enable_special_dp_attention
+        # pdmux + dp-attention
+        self.enable_pdmux = get_global_server_args().enable_pdmux
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
@@ -1120,6 +1129,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
+        assert num_heads % self.tp_size == 0
+        self.tp_num_heads = num_heads // self.tp_size
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1238,17 +1249,29 @@ class DeepseekV2AttentionMLA(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
-
-        self.attn_mha = RadixAttention(
-            self.num_local_heads,
-            self.qk_nope_head_dim + self.qk_rope_head_dim,
-            self.scaling,
-            num_kv_heads=self.num_local_heads,
-            layer_id=layer_id,
-            v_head_dim=self.v_head_dim,
-            quant_config=quant_config,
-            prefix=add_prefix("attn_mha", prefix),
-        )
+        
+        if self.enable_special_dp_attention and self.enable_pdmux:
+            self.attn_mha = RadixAttention(
+                self.tp_num_heads,
+                self.qk_nope_head_dim + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=self.tp_num_heads,
+                layer_id=layer_id,
+                v_head_dim=self.v_head_dim,
+                quant_config=quant_config,
+                prefix=add_prefix("attn_mha", prefix),
+            )
+        else:
+            self.attn_mha = RadixAttention(
+                self.num_local_heads,
+                self.qk_nope_head_dim + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=self.num_local_heads,
+                layer_id=layer_id,
+                v_head_dim=self.v_head_dim,
+                quant_config=quant_config,
+                prefix=add_prefix("attn_mha", prefix),
+            )
 
         self.alt_stream = alt_stream
         self.attn_mha.kv_b_proj = None
@@ -1418,6 +1441,10 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        
+        if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention and self.enable_pdmux and attn_forward_method not in [AttnForwardMethod.MHA, AttnForwardMethod.MHA_ONE_SHOT]:
+            raise NotImplementedError(f"DP-Attention + PD-MUX is not supported for attention method: {attn_forward_method.name}")
+
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
@@ -1464,6 +1491,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
         if inner_state is None:
             return hidden_states
+
+        if self.enable_special_dp_attention and self.enable_pdmux and attn_forward_method not in [AttnForwardMethod.MHA, AttnForwardMethod.MHA_ONE_SHOT]:
+            raise NotImplementedError(f"DP-Attention + PD-MUX is not supported for attention method: {attn_forward_method}")
 
         if attn_forward_method == AttnForwardMethod.MHA:
             return self.forward_normal_core(*inner_state)
@@ -1524,9 +1554,18 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             if self.use_nsa:
                 q_lora = self.q_a_layernorm(q)
-                q = self.q_b_proj(q_lora)[0].view(
-                    -1, self.num_local_heads, self.qk_head_dim
-                )
+                if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
+                    # TODO(lbz): 这里需要修改, 因为 prefill 的时候, 这里有可能需要修改view的结果
+                    q = self.q_b_proj.forward_split_prefill_normal_tp(
+                        q_lora, tp_size=self.attn_tp_size, tp_rank=self.attn_tp_rank, 
+                        tp_attention_size=self.tp_size, tp_attention_rank=self.tp_rank,
+                    )[0].view(
+                        -1, self.tp_num_heads, self.qk_head_dim
+                    )
+                else:
+                    q = self.q_b_proj(q_lora)[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
                 _ = self.indexer(
                     x=hidden_states,
                     q_lora=q_lora,
@@ -1545,7 +1584,16 @@ class DeepseekV2AttentionMLA(nn.Module):
                     None,
                     None,
                 )
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
+                    # TODO(lbz): 这里需要修改, 因为 prefill 的时候, 这里有可能需要修改view的结果
+                    q = self.q_b_proj.forward_split_prefill_normal_tp(
+                        q, tp_size=self.attn_tp_size, tp_rank=self.attn_tp_rank, 
+                        tp_attention_size=self.tp_size, tp_attention_rank=self.tp_rank,
+                    )[0].view(
+                        -1, self.tp_num_heads, self.qk_head_dim
+                    )
+                else:
+                    q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
 
                 q, _, _, _ = fused_rms_fp8_group_quant(
@@ -1560,15 +1608,43 @@ class DeepseekV2AttentionMLA(nn.Module):
                     res1=None,
                     output_unquantized_inp1=False,
                 )
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
+                    # TODO(lbz): 这里需要修改, 因为 prefill 的时候, 这里有可能需要修改view的结果
+                    q = self.q_b_proj.forward_split_prefill_normal_tp(
+                        q, tp_size=self.attn_tp_size, tp_rank=self.attn_tp_rank, 
+                        tp_attention_size=self.tp_size, tp_attention_rank=self.tp_rank,
+                    )[0].view(
+                        -1, self.tp_num_heads, self.qk_head_dim
+                    )
+                else:
+                    q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             else:
                 q = self.q_a_layernorm(q)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
+                    # TODO(lbz): 这里需要修改, 因为 prefill 的时候, 这里有可能需要修改view的结果
+                    logger.info(f"split prefill normal tp, q: {q.shape}")
+                    logger.info(f"tp_size: {self.tp_size}, tp_rank: {self.tp_rank}, tp_attention_size: {self.attn_tp_size}, tp_attention_rank: {self.attn_tp_rank}")
+                    q = self.q_b_proj.forward_split_prefill_normal_tp(
+                        q, tp_size=self.tp_size, tp_rank=self.tp_rank, 
+                        tp_attention_size=self.attn_tp_size, tp_attention_rank=self.attn_tp_rank,
+                    )[0].view(
+                        -1, self.tp_num_heads, self.qk_head_dim
+                    )
+                else:
+                    q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
 
         else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
+            if self.enable_special_dp_attention and self.enable_pdmux:
+                q = self.q_proj.forward_split_prefill_normal_tp(
+                    hidden_states, tp_size=self.tp_size, tp_rank=self.tp_rank, 
+                    tp_attention_size=self.attn_tp_size, tp_attention_rank=self.attn_tp_rank,
+                )[0].view(
+                    -1, self.tp_num_heads, self.qk_head_dim
+                )
+            else:
+                q = self.q_proj(hidden_states)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
 
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -1600,6 +1676,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
+        # TODO: 关键步骤, 计算kv缓存并保存, 用来在decode阶段, 加速计算
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
         if (
             forward_batch.mha_one_shot
@@ -1616,22 +1693,49 @@ class DeepseekV2AttentionMLA(nn.Module):
                     forward_batch,
                 )
         if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-            kv = self.kv_b_proj(
-                kv_a_quanted,
-            )[0]
+            if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
+                kv = self.kv_b_proj.forward_split_prefill_normal_tp(
+                    kv_a_quanted, tp_size=self.tp_size, tp_rank=self.tp_rank, 
+                    tp_attention_size=self.attn_tp_size, tp_attention_rank=self.attn_tp_rank,
+                )[0]
+            else:
+                kv = self.kv_b_proj(
+                    kv_a_quanted,
+                )[0]
         else:
-            kv = self.kv_b_proj(kv_a)[0]
-        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
+                kv = self.kv_b_proj.forward_split_prefill_normal_tp(
+                    kv_a, tp_size=self.tp_size, tp_rank=self.tp_rank, 
+                    tp_attention_size=self.attn_tp_size, tp_attention_rank=self.attn_tp_rank,
+                )[0]
+                kv = kv.view(-1, self.tp_num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            else:
+                kv = self.kv_b_proj(kv_a)[0]
+                kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
 
-        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+        if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
+            logger.info(f"prepare concat k")
+            logger.info(f"split prefill normal tp, k_nope: {k_nope.shape}, k_pe: {k_pe.shape}")
+            k = self._concat_and_cast_mha_k_split_prefill_normal_tp(k_nope, k_pe, forward_batch)
+        else:
+            k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
 
     def forward_normal_core(self, q, k, v, forward_batch):
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
+        if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
+            attn_output = attn_output.reshape(-1, self.tp_num_heads * self.v_head_dim)
+            logger.info(f"split prefill normal tp, attn_output: {attn_output.shape}")
+            output, _ = self.o_proj.forward_split_prefill_normal_tp(
+                attn_output, tp_size=self.tp_size, tp_rank=self.tp_rank, 
+                tp_attention_size=self.attn_tp_size, tp_attention_rank=self.attn_tp_rank,
+            )
+        else:
+            attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+            logger.info(f"dp-attention, attn_output: {attn_output.shape}")
+            output, _ = self.o_proj(attn_output)
         return output
 
     def _fuse_rope_for_trtllm_mla(self, forward_batch: ForwardBatch) -> bool:
@@ -1763,9 +1867,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                         layer_id=self.layer_id,
                     )
         else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
+            if self.enable_special_dp_attention and self.enable_pdmux:
+                q = self.q_proj.forward_split_prefill_normal_tp(
+                    hidden_states, tp_size=self.tp_size, tp_rank=self.tp_rank, 
+                    tp_attention_size=self.attn_tp_size, tp_attention_rank=self.attn_tp_rank,
+                )[0].view(
+                    -1, self.tp_num_heads, self.qk_head_dim
+                )
+            else:
+                q = self.q_proj(hidden_states)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
@@ -2083,9 +2195,17 @@ class DeepseekV2AttentionMLA(nn.Module):
             q = self.q_a_layernorm(q)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
+            if self.enable_special_dp_attention and self.enable_pdmux:
+                q = self.q_proj.forward_split_prefill_normal_tp(
+                    hidden_states, tp_size=self.tp_size, tp_rank=self.tp_rank, 
+                    tp_attention_size=self.attn_tp_size, tp_attention_rank=self.attn_tp_rank,
+                )[0].view(
+                    -1, self.tp_num_heads, self.qk_head_dim
+                )
+            else:
+                q = self.q_proj(hidden_states)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -2562,6 +2682,27 @@ class DeepseekV2AttentionMLA(nn.Module):
             k[..., self.qk_nope_head_dim :] = k_pe
         return k
 
+    def _concat_and_cast_mha_k_split_prefill_normal_tp(self, k_nope, k_pe, forward_batch):
+        # TODO(lbz): 需要修改, 默认使用的是 self.num_local_heads, 但是我们需要的是 self.tp_num_heads
+        k_shape = (k_nope.shape[0], self.tp_num_heads, self.qk_head_dim)
+
+        if _is_cuda:
+            if (
+                self.current_attention_backend == "fa3"
+                and self.kv_cache_dtype != "auto"
+            ):
+                attn_dtype = forward_batch.token_to_kv_pool.dtype
+            else:
+                attn_dtype = k_nope.dtype
+            k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
+            # TODO(lbz): 需要debug
+            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+        else:
+            k = k_nope.new_empty(*k_shape)
+            k[..., : self.qk_nope_head_dim] = k_nope
+            k[..., self.qk_nope_head_dim :] = k_pe
+        return k
+
     @staticmethod
     def _get_q_b_proj_quant_config(quant_config):
         if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
@@ -2618,6 +2759,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
+        self.enable_special_dp_attention = get_global_server_args().enable_special_dp_attention
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
@@ -2726,6 +2868,63 @@ class DeepseekV2DecoderLayer(nn.Module):
                 else ""
             )
         )
+
+        if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
+            logger.info(f"split prefill with dp-attention, decoder layer id: {self.layer_id}")
+            logger.info(f"hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+            # TODO: Implement the logic to handle split prefill with dp-attention
+            # 第一层进入的时候, 一定是 full 状态; 后续层次也默认使用 full 状态
+            
+            # LN 操作
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states += residual
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            logger.info(f"after input_layernorm, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+            
+            # set attn inputs
+            if self.self_attn.prepare_qkv_latent is not None:
+                attn_inputs = AttentionInputs(
+                    hidden_states, forward_batch, self.self_attn.prepare_qkv_latent
+                )
+                get_attn_tp_context().set_attn_inputs(attn_inputs)
+            logger.info(f"after set_attn_inputs, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+
+            # Attention 操作
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                llama_4_scaling=llama_4_scaling,
+            )
+            logger.info(f"after self_attn, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+
+            # 此时 hidden_states 形状完整, 值不完整, 需要通过 all-reduce 变成完整数据
+            # post-attention-layernorm 操作, 
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            logger.info(f"after tensor_model_parallel_all_reduce, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+            hidden_states += residual
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            logger.info(f"after post_attention_layernorm, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+
+            # MLP 操作
+            if isinstance(self.mlp, DeepseekV2MLP):
+                gemm_output_zero_allocator = None
+            
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                False,
+                False,
+                gemm_output_zero_allocator,
+            )
+            logger.info(f"after mlp, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+            return hidden_states, residual
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
@@ -3071,6 +3270,7 @@ class DeepseekV2Model(nn.Module):
                     llama_4_scaling,
                 )
 
+        logger.info(f"after end layer, hidden_states: {hidden_states.shape}, residual: {residual.shape}")
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers[normal_end_layer : self.end_layer],
@@ -3158,6 +3358,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             # ranks other than the last rank will have a placeholder layer
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
+        self.enable_special_dp_attention = get_global_server_args().enable_special_dp_attention
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
@@ -3323,7 +3524,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                         zero_allocator,
                         gemm_output_zero_allocator,
                         llama_4_scaling,
+                    logger.debug(f"causal split prefill, layer {i}, hidden_states: {forward_batch.hidden_states.shape}, residual: {forward_batch.residual.shape if forward_batch.residual is not None else None}")
                     )
+                    logger.debug(f"causal split prefill, layer {i}, hidden_states: {forward_batch.hidden_states.shape}, residual: {forward_batch.residual.shape if forward_batch.residual is not None else None}")
 
         if end == self.model.num_hidden_layers and self.pp_group.is_last_rank:
             if forward_batch.residual is None:
@@ -3333,12 +3536,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                     forward_batch.hidden_states, forward_batch.residual
                 )
             forward_batch.hidden_states = hidden_states
+            logger.debug(f"causal split prefill, end layer, hidden_states: {forward_batch.hidden_states.shape}, residual: {forward_batch.residual.shape if forward_batch.residual is not None else None}")
             result = self.logits_processor(
                 input_ids,
                 forward_batch.hidden_states,
                 self.lm_head,
                 forward_batch,
                 None,  # aux_hidden_states
+                special_dp_attention=self.enable_special_dp_attention,
             )
         else:
             result = None

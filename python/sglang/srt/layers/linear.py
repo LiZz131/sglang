@@ -451,6 +451,37 @@ class ColumnParallelLinear(LinearBase):
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
+    def forward_split_prefill_normal_tp(
+        self,
+        input_: torch.Tensor,
+        *,
+        tp_size: int,
+        tp_rank: int,
+        tp_attention_size: int,
+        tp_attention_rank: int,
+    ):
+        if self in [MergedColumnParallelLinear, QKVParallelLinear]:
+            raise NotImplementedError("DP-Attention + PD-MUX is not supported for this linear layer")
+        
+        bias = self.bias if not self.skip_bias_add else None
+        output_parallel = self.quant_method.apply_for_split_prefill(
+            layer=self,
+            x=input_,
+            bias=bias,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            tp_attention_size=tp_attention_size,
+            tp_attention_rank=tp_attention_rank,
+            is_column=True,   # 这一类固定按输出维切
+        )
+        if self.gather_output:
+            # All-gather across the partitions.
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
         s += f", output_features={self.output_size_per_partition}"
@@ -1417,6 +1448,51 @@ class RowParallelLinear(LinearBase):
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output = output_parallel
+
+        output_bias = self.bias if self.skip_bias_add else None
+
+        return output, output_bias
+
+    def forward_split_prefill_normal_tp(
+        self,
+        input_: torch.Tensor,
+        *,
+        tp_size: int,
+        tp_rank: int,
+        tp_attention_size: int,
+        tp_attention_rank: int,
+        skip_all_reduce: bool = False,
+    ):
+        # Row parallel 的 input 可能先 split/不 split，这里逻辑可沿用原 forward
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            splitted_input = split_tensor_along_last_dim(
+                input_, num_partitions=tp_size
+            )
+            input_parallel = splitted_input[tp_rank].contiguous()
+
+        # 仍然只做一次 matmul，但在 quant_method 里把 weight 切成 prefill shard
+        bias_ = None if (tp_rank > 0 or self.skip_bias_add) else self.bias
+        # use_symmetric_memory: 见 pynccl_allocator.SymmetricMemoryContext。
+        # disabled=not is_allocation_symmetric(): dp-attention 且 SUM_LEN 时各 rank 显存布局不对称，禁用 symmetric memory。
+        # 此时没有 dp-attention，启用 symmetric memory
+        with use_symmetric_memory(get_tp_group(), disabled=False):
+            output_parallel = self.quant_method.apply_for_split_prefill(
+                layer=self,
+                x=input_parallel,
+                bias=bias_,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                tp_attention_size=tp_attention_size,
+                tp_attention_rank=tp_attention_rank,
+                is_column=False,  # row 并行按输入维切
+            )
+        
+        if self.reduce_results and tp_size > 1 and not skip_all_reduce:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel

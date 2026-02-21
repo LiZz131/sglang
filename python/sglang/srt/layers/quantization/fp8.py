@@ -567,7 +567,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # 同一 decode 块内做 prefill 的 rank 数；块内 prefill 下标
         local_prefill_size = tp_size // tp_attention_size
-        local_prefill_rank = tp_rank % local_prefill_size
+        local_prefill_rank = tp_rank // tp_attention_size
 
         if self.block_quant:
             block_n, block_k = self.quant_config.weight_block_size
@@ -594,6 +594,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 start_ib = start_k // block_k
                 scale_shard = scale.narrow(1, start_ib, shard_in_blocks)
                 bias_shard = layer.bias
+
+            # narrow 在 dim=1（row 并行）时产生非连续视图，DeepGEMM/Triton 要求 weight 连续, 算子要求, 强制设置为连续
+            weight_shard = weight_shard.contiguous()
+            scale_shard = scale_shard.contiguous()
 
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
