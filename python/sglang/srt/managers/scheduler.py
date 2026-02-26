@@ -1188,7 +1188,8 @@ class Scheduler(
                 return []
 
         if self.pp_rank == 0:
-            if self.attn_tp_rank == 0:
+            if self.attn_tp_rank == 0 and (not self.enable_special_dp_attention or self.dp_rank == 0):
+                # special dp attention, only when dp rank is 0 and attn_tp_rank is 0, then receive requests
                 recv_reqs = []
 
                 while True:
@@ -1226,7 +1227,7 @@ class Scheduler(
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
-        if self.server_args.enable_dp_attention:
+        if self.server_args.enable_dp_attention and not self.enable_special_dp_attention:
             if self.attn_tp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:

@@ -573,10 +573,11 @@ class DataParallelController:
         self.set_decode_dp_rank(req)
 
         # for each dp rank, send the request
-        logger.debug(f"Special DP Attention scheduler, sending request to all DP ranks")
-        for dp_rank in range(self.server_args.dp_size):
-            logger.debug(f"Sending request to DP rank {dp_rank}, request: {req.rid}")
-            self.workers[dp_rank].send_pyobj(req)
+        logger.debug(f"Special DP Attention scheduler, sending request to rank0, other ranks will receive by broadcast")
+        # for dp_rank in range(self.server_args.dp_size):
+        #     logger.debug(f"Sending request to DP rank {dp_rank}, request: {req.rid}")
+        #     self.workers[dp_rank].send_pyobj(req)
+        self.workers[0].send_pyobj(req)
     
     def set_decode_dp_rank(self, req: Req):
         # TODO(lbz): need to set decode_rank for the request, here is a demo implementation
