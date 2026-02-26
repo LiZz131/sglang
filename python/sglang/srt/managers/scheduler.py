@@ -2963,7 +2963,10 @@ def run_scheduler_process(
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
             if scheduler.enable_pdmux:
-                scheduler.event_loop_pdmux()
+                if server_args.enable_special_dp_attention:
+                    scheduler.event_loop_pdmux_for_special_dp_attention()
+                else:
+                    scheduler.event_loop_pdmux()
             elif server_args.pp_size > 1:
                 scheduler.event_loop_pp()
             elif scheduler.enable_overlap:

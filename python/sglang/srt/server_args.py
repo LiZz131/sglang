@@ -638,6 +638,7 @@ class ServerArgs:
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
     sm_group_num: int = 8
+    enable_special_dp_attention: bool = False
 
     # For Multi-Modal
     mm_max_concurrent_calls: int = 32
@@ -4568,6 +4569,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.sm_group_num,
             help="Number of sm partition groups.",
+        )
+        parser.add_argument(
+            "--enable-special-dp-attention",
+            action="store_true",
+            help="Enable pdmux + dp attention for deepseek v3",
         )
 
         # Configuration file support
