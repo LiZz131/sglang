@@ -15,7 +15,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dp_attention import get_attention_dp_rank, get_attention_dp_size, is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -549,55 +549,68 @@ class Fp8LinearMethod(LinearMethodBase):
         tp_attention_rank: int = 0,
         is_column: bool = True,
     ) -> torch.Tensor:
-        """Prefill path: layer 已持有 decode 块（第一次按 tp_attention_size 划分），
-        在此块内按 tp_rank 做第二次划分得到 prefill 用的 shard。
-        例: tp_size=4, tp_attention_size=2 时，decode 块为 [0,1] 与 [2,3]；
-        tp_rank=1 且 tp_attention_rank=0 时从块 [0,1] 中取后半份即 [1]。
-        is_column=True 表示 column 并行（按输出维切）；False 表示 row 并行（按输入维切）。
-        """
         if self.use_marlin:
             raise NotImplementedError(
                 "apply_for_split_prefill with Marlin is not supported: "
                 "weight is in packed format and cannot be sharded by view."
             )
+        
+        cached = hasattr(layer, "cached_shard_weight")
 
-        # layer 上已是 decode 块：output/input_size_per_partition 为块内维度
         out_chunk = layer.output_size_per_partition
         in_chunk = layer.input_size_per_partition
 
-        # 同一 decode 块内做 prefill 的 rank 数；块内 prefill 下标
-        local_prefill_size = tp_size // tp_attention_size
-        local_prefill_rank = tp_rank // tp_attention_size
+        local_prefill_size = get_attention_dp_size()
+        local_prefill_rank = get_attention_dp_rank()
+
+        # note: in fp8, the weight is stored in the shape of (out_chunk, in_chunk)
+        input_dim = 1
+        output_dim = 0
+
+        logger.debug(f"in apply_for_split_prefill, out_chunk: {out_chunk}, in_chunk: {in_chunk}, local_prefill_size: {local_prefill_size}, local_prefill_rank: {local_prefill_rank}")
+        logger.debug(f"layer.weight.shape: {layer.weight.shape}, layer.weight_scale_inv.shape: {layer.weight_scale_inv.shape}")
 
         if self.block_quant:
-            block_n, block_k = self.quant_config.weight_block_size
-            weight = layer.weight
-            scale = layer.weight_scale_inv
-            # block_quant 存的是 (out_chunk, in_chunk)
-            if is_column:
-                shard_n = out_chunk // local_prefill_size
-                start_n = local_prefill_rank * shard_n
-                weight_shard = weight.narrow(0, start_n, shard_n)
-                shard_out_blocks = (shard_n + block_n - 1) // block_n
-                start_ob = start_n // block_n
-                scale_shard = scale.narrow(0, start_ob, shard_out_blocks)
-                bias_shard = (
-                    layer.bias.narrow(0, start_n, shard_n)
-                    if layer.bias is not None
-                    else None
-                )
+            if not cached:
+                block_n, block_k = self.quant_config.weight_block_size
+                weight = layer.weight
+                scale = layer.weight_scale_inv
+                if is_column:
+                    shard_n = out_chunk // local_prefill_size
+                    start_n = local_prefill_rank * shard_n
+                    weight_shard = weight.narrow(output_dim, start_n, shard_n)
+                    shard_out_blocks = (shard_n + block_n - 1) // block_n
+                    start_ob = start_n // block_n
+                    scale_shard = scale.narrow(output_dim, start_ob, shard_out_blocks)
+                    bias_shard = (
+                        layer.bias.narrow(output_dim, start_n, shard_n)
+                        if layer.bias is not None
+                        else None
+                    )
+                else:
+                    shard_k = in_chunk // local_prefill_size
+                    start_k = local_prefill_rank * shard_k
+                    weight_shard = weight.narrow(input_dim, start_k, shard_k)
+                    shard_in_blocks = (shard_k + block_k - 1) // block_k
+                    start_ib = start_k // block_k
+                    scale_shard = scale.narrow(input_dim, start_ib, shard_in_blocks)
+                    bias_shard = (
+                        layer.bias.narrow(input_dim, start_k, shard_k)
+                        if layer.bias is not None
+                        else None
+                    )
+                layer.cached_shard_bias = bias_shard
             else:
-                shard_k = in_chunk // local_prefill_size
-                start_k = local_prefill_rank * shard_k
-                weight_shard = weight.narrow(1, start_k, shard_k)
-                shard_in_blocks = (shard_k + block_k - 1) // block_k
-                start_ib = start_k // block_k
-                scale_shard = scale.narrow(1, start_ib, shard_in_blocks)
-                bias_shard = layer.bias
+                weight_shard = layer.cached_shard_weight
+                scale_shard = layer.cached_shard_scale
+                bias_shard = getattr(layer, "cached_shard_bias", None)
 
-            # narrow 在 dim=1（row 并行）时产生非连续视图，DeepGEMM/Triton 要求 weight 连续, 算子要求, 强制设置为连续
-            weight_shard = weight_shard.contiguous()
-            scale_shard = scale_shard.contiguous()
+            # narrow when dim=1 (row parallel) produces a non-continuous view, DeepGEMM/Triton requires weight to be continuous, operator requires, force it to be continuous
+            if not cached:
+                weight_shard = weight_shard.contiguous()
+                scale_shard = scale_shard.contiguous()
+                layer.cached_shard_weight = weight_shard
+                layer.cached_shard_scale = scale_shard
 
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
@@ -627,30 +640,37 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias_shard,
             )
 
-        # 非 block：weight 存的是 (in_chunk, out_chunk)
         weight = layer.weight
         scale = layer.weight_scale
-        if is_column:
-            shard_n = out_chunk // local_prefill_size
-            start_n = local_prefill_rank * shard_n
-            weight_shard = weight.narrow(1, start_n, shard_n)
-            if scale.numel() == out_chunk or (
-                scale.dim() >= 1 and scale.shape[-1] == out_chunk
-            ):
-                scale_shard = scale.narrow(-1, start_n, shard_n).contiguous()
+        if not cached:
+            if is_column:
+                shard_n = out_chunk // local_prefill_size
+                start_n = local_prefill_rank * shard_n
+                weight_shard = weight.narrow(output_dim, start_n, shard_n)
+                if scale.numel() == out_chunk or (
+                    scale.dim() >= 1 and scale.shape[-1] == out_chunk
+                ):
+                    scale_shard = scale.narrow(output_dim, start_n, shard_n).contiguous()
+                else:
+                    scale_shard = scale
+                bias_shard = (
+                    layer.bias.narrow(output_dim, start_n, shard_n)
+                    if layer.bias is not None
+                    else None
+                )
             else:
+                shard_k = in_chunk // local_prefill_size
+                start_k = local_prefill_rank * shard_k
+                weight_shard = weight.narrow(input_dim, start_k, shard_k)
                 scale_shard = scale
-            bias_shard = (
-                layer.bias.narrow(0, start_n, shard_n)
-                if layer.bias is not None
-                else None
-            )
+                bias_shard = layer.bias.narrow(input_dim, start_k, shard_k)
+            layer.cached_shard_weight = weight_shard
+            layer.cached_shard_scale = scale_shard
+            layer.cached_shard_bias = bias_shard
         else:
-            shard_k = in_chunk // local_prefill_size
-            start_k = local_prefill_rank * shard_k
-            weight_shard = weight.narrow(0, start_k, shard_k)
-            scale_shard = scale
-            bias_shard = layer.bias
+            weight_shard = layer.cached_shard_weight
+            scale_shard = layer.cached_shard_scale
+            bias_shard = layer.cached_shard_bias
 
         return apply_fp8_linear(
             input=x,
