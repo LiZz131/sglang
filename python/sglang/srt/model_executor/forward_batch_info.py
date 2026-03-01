@@ -296,6 +296,8 @@ class ForwardBatch:
     model_specific_states: Dict[str, any] = None
     # current split index of layer
     split_index: int = 0
+    # for special dp attention
+    special_dp_attention: bool = False
 
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether the kv cache needs to be attended in current pass
