@@ -373,6 +373,18 @@ class SchedulerMultiplexMixin:
                         )
                         # log prefill stats late
                         self.log_prefill_stats_late(self.split_prefill_batch)
+                        # TODO(lbz): for special dp attention, here, we need to convert the split_prefill_batch to the running_batch
+                        if self.enable_special_dp_attention:
+                            keep_indices = self.split_prefill_batch.dp_local_req_indices
+                            drop_indices = [i for i in range(self.split_prefill_batch.batch_size()) if i not in keep_indices]
+                            # for the not local reqs, we need free the req_pool_idx, out_cache_loc, etc.
+                            for i in drop_indices:
+                                req = self.split_prefill_batch.reqs[i]
+                                release_kv_cache(req, self.split_prefill_batch.tree_cache, is_insert=False)
+                            self.split_prefill_batch.filter_batch(keep_indices=keep_indices)
+                            logger.info(f"keep indices: {keep_indices}")
+                            logger.info(f"after filter, split_prefill_batch: {self.split_prefill_batch.batch_size()}")
+
                         if self.running_batch and not self.running_batch.is_empty():
                             self.running_batch.merge_batch(self.split_prefill_batch)
                         else:

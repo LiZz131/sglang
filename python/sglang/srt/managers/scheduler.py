@@ -1424,6 +1424,10 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # TODO(lbz): if enable_special_dp_attention, we need to set decode_dp_rank here
+            decode_dp_rank = None
+            if self.enable_special_dp_attention:
+                decode_dp_rank = recv_req.decode_dp_rank
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -1453,6 +1457,7 @@ class Scheduler(
                 routing_key=recv_req.routing_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
+                decode_dp_rank=decode_dp_rank,
             )
             req.tokenizer = self.tokenizer
 

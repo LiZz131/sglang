@@ -524,6 +524,7 @@ class Req:
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        decode_dp_rank: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -546,6 +547,9 @@ class Req:
         self.kv_allocated_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+
+        # for special dp attention
+        self.decode_dp_rank = decode_dp_rank
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -1252,6 +1256,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_forward_batch: ForwardBatch = None
     seq_lens_cpu_cache: torch.Tensor = None
 
+    # For special dp attention
+    dp_local_token_start: Optional[int] = None
+    dp_local_token_end: Optional[int] = None
+    dp_local_extend_num_tokens: Optional[int] = None
+    dp_rank: Optional[int] = None
+    dp_local_req_indices: Optional[List[int]] = None
+
     # Stream
     has_stream: bool = False
 
@@ -1296,7 +1307,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
+        dp_rank: Optional[int] = None,
     ):
+        # TODO(lbz): if enable_special_dp_attention, we need to sort reqs here by decode_dp_rank, from low to high
+        if get_global_server_args().enable_special_dp_attention:
+            reqs = sorted(reqs, key=lambda x: x.decode_dp_rank if x.decode_dp_rank is not None else 0, reverse=False)
+            for i, req in enumerate(reqs):
+                logger.info(f"req {i} decode_dp_rank: {req.decode_dp_rank}, rid: {req.rid}")
+
         return_logprob = any(req.return_logprob for req in reqs)
 
         is_hybrid_swa = False
@@ -1321,6 +1339,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_config=dllm_config,
+            dp_rank=dp_rank,
         )
 
     def batch_size(self):
@@ -1422,6 +1441,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
+        # TODO(lbz): Init dp_local_token_start and dp_local_token_end
+        # use input ids to calculate dp_local_token_start and dp_local_token_end, find the first local and last local
+        if get_global_server_args().enable_special_dp_attention:
+            dp_local_token_start = None
+            dp_local_token_end = None
+            found_first_local = False
+            for i, req in enumerate(reqs):
+                if not found_first_local and req.decode_dp_rank is not None and req.decode_dp_rank == self.dp_rank:
+                    dp_local_token_start = sum(seq_lens[:i])
+                    found_first_local = True
+                if found_first_local and req.decode_dp_rank is not None and req.decode_dp_rank != self.dp_rank:
+                    dp_local_token_end = sum(seq_lens[:i])
+                    break
+            if dp_local_token_start is not None and dp_local_token_end is not None:
+                self.dp_local_token_start = dp_local_token_start
+                self.dp_local_token_end = dp_local_token_end
+            elif dp_local_token_start is not None and dp_local_token_end is None:
+                self.dp_local_token_start = dp_local_token_start
+                self.dp_local_token_end = sum(seq_lens)
+            else:
+                self.dp_local_token_start = 0
+                self.dp_local_token_end = 0
+                logger.info(f"No local token found for reqs")
+            dp_local_extend_num_tokens = self.dp_local_token_end - self.dp_local_token_start
+            logger.info(f"dp_local_token_start: {self.dp_local_token_start}, dp_local_token_end: {self.dp_local_token_end}, dp_local_extend_num_tokens: {dp_local_extend_num_tokens}")
+            self.dp_local_req_indices = [i for i, req in enumerate(reqs) if req.decode_dp_rank is not None and req.decode_dp_rank == self.dp_rank]
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
             r.dimensions is not None for r in reqs
