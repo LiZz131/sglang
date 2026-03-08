@@ -22,6 +22,7 @@ from sglang.srt.multiplex.pdmux_context import (
     load_pdmux_config,
     set_current_stream_idx,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -35,6 +36,7 @@ class SchedulerMultiplexMixin:
     def init_pdmux(self: Scheduler):
         # The current split prefill batch
         self.split_prefill_batch: Optional[ScheduleBatch] = None
+        self.decode_or_idle_batch: Optional[ScheduleBatch] = None
 
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
         self.pdmux_config = load_pdmux_config(self.server_args.pdmux_config_path)
@@ -263,16 +265,20 @@ class SchedulerMultiplexMixin:
             with torch.cuda.stream(decode_stream):
                 nvtx.range_push("decode_stream:update_running_batch")
                 set_pdmux_status(False)
-                self.running_batch = self.update_running_batch(self.running_batch)
-                if self.running_batch and not self.running_batch.is_empty():
-                    logger.debug(f"before prepare mlp sync batch, running_batch: {self.running_batch}")
-                    self.running_batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(self.running_batch, need_sync=self.require_mlp_sync)
-                    logger.debug(f"after prepare mlp sync batch, global_num_tokens: {self.running_batch.global_num_tokens}, global_num_tokens_for_logprob: {self.running_batch.global_num_tokens_for_logprob}")
+                # TODO(lbz): in update_running_batch, we filter the batch, 
+                if not self.running_batch.is_empty():
+                    self.running_batch = self.update_running_batch(self.running_batch)
+                    self.decode_or_idle_batch = self.running_batch if not self.running_batch.is_empty() else None
+                else:
+                    self.decode_or_idle_batch = None
+                
+                self.decode_or_idle_batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(self.decode_or_idle_batch, need_sync=self.require_mlp_sync, log_stats=False)
                 adjust_stream_group = adjust_stream_group or (
-                    stream_idx > 0 and self.running_batch.is_empty()
+                    stream_idx > 0 and self.decode_or_idle_batch is None
                 )
                 # TODO(lbz): running_batch use mlp sync batch, so can it be empty?
-                if self.running_batch.is_empty() and self.split_prefill_batch is None:
+                # if self.running_batch is not None and self.running_batch.is_empty() and self.split_prefill_batch is None:
+                if self.decode_or_idle_batch is None and self.split_prefill_batch is None:
                     self.check_memory()
                     self.check_tree_cache()
                     self.new_token_ratio = self.init_new_token_ratio
@@ -284,6 +290,7 @@ class SchedulerMultiplexMixin:
                 prefill_stream.synchronize()
                 decode_stream.synchronize()
                 stream_idx, stream_group = self.adjust_stream_groups()
+                logger.info(f"calc adjust_stream_groups, stream_idx: {stream_idx}, stream_group: {stream_group}")
                 prefill_stream = stream_group[0]
                 decode_stream = stream_group[1]
                 adjust_stream_group = False
@@ -296,8 +303,9 @@ class SchedulerMultiplexMixin:
                 nvtx.range_push("decode_stream:process_decode_batch")
                 set_pdmux_status(False)
                 # process decode batch
-                if self.running_batch and not self.running_batch.is_empty():
-                    decode_result = self.run_batch(self.running_batch)
+                if self.decode_or_idle_batch and not self.decode_or_idle_batch.is_empty():
+                    logger.debug(f"before run_batch, decode_or_idle_batch: {self.decode_or_idle_batch.batch_size()}")
+                    decode_result = self.run_batch(self.decode_or_idle_batch)
                     decode_done = True
                 else:
                     decode_done = False
@@ -351,7 +359,7 @@ class SchedulerMultiplexMixin:
                 set_pdmux_status(False)
                 decode_stream.synchronize()
                 if decode_done:
-                    self.process_batch_result(self.running_batch, decode_result)
+                    self.process_batch_result(self.decode_or_idle_batch, decode_result)
                 nvtx.range_pop()
 
             with torch.cuda.stream(prefill_stream):
@@ -376,14 +384,37 @@ class SchedulerMultiplexMixin:
                         # TODO(lbz): for special dp attention, here, we need to convert the split_prefill_batch to the running_batch
                         if self.enable_special_dp_attention:
                             keep_indices = self.split_prefill_batch.dp_local_req_indices
-                            drop_indices = [i for i in range(self.split_prefill_batch.batch_size()) if i not in keep_indices]
-                            # for the not local reqs, we need free the req_pool_idx, out_cache_loc, etc.
+                            if keep_indices is None:
+                                logger.warning(
+                                    "dp_local_req_indices is None; ensure prepare_for_extend "
+                                    "sets it when server enable_special_dp_attention is True"
+                                )
+                                keep_indices = []
+                            drop_indices = [
+                                i
+                                for i in range(self.split_prefill_batch.batch_size())
+                                if i not in keep_indices
+                            ]
+                            logger.debug(
+                                f"special_dp_attention: keep_indices={keep_indices}, "
+                                f"drop_indices={drop_indices}, batch_size={self.split_prefill_batch.batch_size()}"
+                            )
                             for i in drop_indices:
                                 req = self.split_prefill_batch.reqs[i]
-                                release_kv_cache(req, self.split_prefill_batch.tree_cache, is_insert=False)
+                                logger.debug(
+                                    f"releasing dropped req i={i} rid={req.rid} "
+                                    f"req_pool_idx={req.req_pool_idx}"
+                                )
+                                release_kv_cache(
+                                    req,
+                                    self.split_prefill_batch.tree_cache,
+                                    is_insert=False,
+                                )
                             self.split_prefill_batch.filter_batch(keep_indices=keep_indices)
-                            logger.info(f"keep indices: {keep_indices}")
-                            logger.info(f"after filter, split_prefill_batch: {self.split_prefill_batch.batch_size()}")
+                            logger.info(
+                                f"keep indices: {keep_indices}, "
+                                f"after filter split_prefill_batch: {self.split_prefill_batch.batch_size()}"
+                            )
 
                         if self.running_batch and not self.running_batch.is_empty():
                             self.running_batch.merge_batch(self.split_prefill_batch)
