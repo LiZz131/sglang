@@ -82,6 +82,39 @@ class SchedulerMultiplexMixin:
         self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
         return stream_idx, self.stream_groups[stream_idx]
 
+    def adjust_stream_groups_for_special_dp_attention(
+        self: Scheduler,
+    ) -> tuple[int, tuple[ExternalStream, ExternalStream]]:
+        # use the max decode bs to adjust the stream group
+        max_decode_bs = max(self.decode_or_idle_batch.global_num_tokens) if self.decode_or_idle_batch is not None else 0
+        if not max_decode_bs == 0 and self.split_prefill_batch:
+            manual_divisions = self.pdmux_config.manual_divisions
+            if manual_divisions:
+                for i in range(len(manual_divisions)):
+                    _, _, threshold = manual_divisions[i]
+                    if max_decode_bs >= threshold:
+                        stream_idx = i + 1
+            else:
+                stream_idx = max(
+                    1,
+                    min(
+                        self.real_sm_group_num - 2,
+                        max_decode_bs
+                        * (self.real_sm_group_num - 2)
+                        // self.pdmux_config.decode_bs_divisor,
+                    ),
+                )
+            set_current_stream_idx(stream_idx)
+        elif not max_decode_bs == 0:
+            set_current_stream_idx(self.real_sm_group_num - 1)
+        else:
+            set_current_stream_idx(0)
+
+        stream_idx = get_current_stream_idx()
+
+        self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
+        return stream_idx, self.stream_groups[stream_idx]
+
     def update_split_prefill_batch(self: Scheduler, sm_count: int) -> bool:
         if self.split_prefill_batch:
             return False
@@ -289,8 +322,9 @@ class SchedulerMultiplexMixin:
                 nvtx.range_push("sync_and_adjust_stream_group")
                 prefill_stream.synchronize()
                 decode_stream.synchronize()
-                stream_idx, stream_group = self.adjust_stream_groups()
-                logger.info(f"calc adjust_stream_groups, stream_idx: {stream_idx}, stream_group: {stream_group}")
+                # TODO(lbz): we need make all ranks adjust to the same stream group
+                stream_idx, stream_group = self.adjust_stream_groups_for_special_dp_attention()
+                logger.info(f"calc adjust_stream_groups_for_special_dp_attention, stream_idx: {stream_idx}, stream_group: {stream_group}")
                 prefill_stream = stream_group[0]
                 decode_stream = stream_group[1]
                 adjust_stream_group = False
@@ -303,7 +337,7 @@ class SchedulerMultiplexMixin:
                 nvtx.range_push("decode_stream:process_decode_batch")
                 set_pdmux_status(False)
                 # process decode batch
-                if self.decode_or_idle_batch and not self.decode_or_idle_batch.is_empty():
+                if self.decode_or_idle_batch:
                     logger.debug(f"before run_batch, decode_or_idle_batch: {self.decode_or_idle_batch.batch_size()}")
                     decode_result = self.run_batch(self.decode_or_idle_batch)
                     decode_done = True
