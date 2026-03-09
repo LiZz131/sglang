@@ -448,12 +448,15 @@ class SchedulerMultiplexMixin:
                             logger.info(
                                 f"keep indices: {keep_indices}, "
                                 f"after filter split_prefill_batch: {self.split_prefill_batch.batch_size()}"
+                                f"split_prefill_batch.input_ids: {self.split_prefill_batch.input_ids.shape if self.split_prefill_batch.input_ids is not None else None}"
+                                f"split_prefill_batch.output_ids: {self.split_prefill_batch.output_ids.shape if self.split_prefill_batch.output_ids is not None else None}"
                             )
 
-                        if self.running_batch and not self.running_batch.is_empty():
-                            self.running_batch.merge_batch(self.split_prefill_batch)
-                        else:
-                            self.running_batch = self.split_prefill_batch
+                        if self.split_prefill_batch is not None and self.split_prefill_batch.batch_size() != 0:
+                            if self.running_batch and not self.running_batch.is_empty():
+                                self.running_batch.merge_batch(self.split_prefill_batch)
+                            else:
+                                self.running_batch = self.split_prefill_batch
 
                         self.split_prefill_batch = None
                         wait_prefill_kernel_done = False
