@@ -288,6 +288,7 @@ class Scheduler(
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_pdmux = server_args.enable_pdmux
+        self.enable_save_kv_cache_for_dp = server_args.enable_save_kv_cache_for_dp
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
         self.enable_metrics_for_all_schedulers = (
@@ -773,6 +774,7 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            enable_special_dp_attention_prefix_0=self.enable_special_dp_attention_prefix_0,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         if self.server_args.enable_prefill_delayer:
@@ -1993,7 +1995,12 @@ class Scheduler(
                     # skip staging requests that are ongoing prefetch
                     continue
 
-            req.init_next_round_input(self.tree_cache)
+            if self.enable_special_dp_attention_prefix_0:
+                req.ignore_cache_prefix = True
+                req.init_next_round_input(tree_cache=None)
+            else:
+                req.ignore_cache_prefix = False
+                req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
