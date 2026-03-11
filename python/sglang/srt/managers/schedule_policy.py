@@ -97,6 +97,7 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        enable_special_dp_attention_prefix_0: bool=False,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -105,12 +106,25 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
 
+        self.enable_special_dp_attention_prefix_0 = enable_special_dp_attention_prefix_0
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
     def calc_priority(
         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
     ) -> bool:
+        # When special dp attention prefix_0 is enabled, we should avoid using
+        # cache-aware scheduling policies that rely on prefix matching, because
+        # different DP ranks may see different tree cache states.
+        if self.enable_special_dp_attention_prefix_0:
+            # Fall back to cache-agnostic policies (FCFS or LOF / RANDOM / ROUTING_KEY)
+            # without computing any prefix matches.
+            if self.enable_priority_scheduling:
+                SchedulePolicy._sort_by_priority_and_fcfs(
+                    waiting_queue, self.priority_sign
+                )
+            return False
+
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(

@@ -646,6 +646,10 @@ class Req:
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
+        # Whether to ignore cache prefix matching and always treat prefix length as 0.
+        # This is controlled by the scheduler when special dp attention prefix_0 is enabled.
+        self.ignore_cache_prefix: bool = False
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
@@ -864,31 +868,39 @@ class Req:
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
-        token_ids = self.fill_ids[:max_prefix_len]
-
-        if tree_cache is not None:
-            match_result = tree_cache.match_prefix(
-                key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
-                **(
-                    {"req": self, "cow_mamba": True}
-                    if isinstance(tree_cache, MambaRadixCache)
-                    else {}
-                ),
-            )
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-                self.mamba_branching_seqlen,
-            ) = (
-                match_result.device_indices,
-                match_result.last_device_node,
-                match_result.last_host_node,
-                match_result.host_hit_length,
-                match_result.mamba_branching_seqlen,
-            )
-            self.cache_protected_len = len(self.prefix_indices)
+        if self.ignore_cache_prefix:
+            # force the prefix length to be 0, clear all prefix related states
+            self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+            self.last_node = None
+            self.last_host_node = None
+            self.host_hit_length = 0
+            self.mamba_branching_seqlen = None
+            self.cache_protected_len = 0
+        else:
+            token_ids = self.fill_ids[:max_prefix_len]
+            if tree_cache is not None:
+                match_result = tree_cache.match_prefix(
+                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                    **(
+                        {"req": self, "cow_mamba": True}
+                        if isinstance(tree_cache, MambaRadixCache)
+                        else {}
+                    ),
+                )
+                (
+                    self.prefix_indices,
+                    self.last_node,
+                    self.last_host_node,
+                    self.host_hit_length,
+                    self.mamba_branching_seqlen,
+                ) = (
+                    match_result.device_indices,
+                    match_result.last_device_node,
+                    match_result.last_host_node,
+                    match_result.host_hit_length,
+                    match_result.mamba_branching_seqlen,
+                )
+                self.cache_protected_len = len(self.prefix_indices)
 
         if (
             self.is_retracted
