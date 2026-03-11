@@ -2223,6 +2223,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            dp_local_token_start=self.dp_local_token_start,
+            dp_local_token_end=self.dp_local_token_end,
         )
 
     def copy(self):

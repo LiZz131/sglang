@@ -639,6 +639,7 @@ class ServerArgs:
     pdmux_config_path: Optional[str] = None
     sm_group_num: int = 8
     enable_special_dp_attention: bool = False
+    enable_save_kv_cache_for_dp: bool = False
 
     # For Multi-Modal
     mm_max_concurrent_calls: int = 32
@@ -4574,6 +4575,11 @@ class ServerArgs:
             "--enable-special-dp-attention",
             action="store_true",
             help="Enable pdmux + dp attention for deepseek v3",
+        )
+        parser.add_argument(
+            "--enable-save-kv-cache-for-dp",
+            action="store_true",
+            help="Enable saving kv cache for special dp attention.",
         )
 
         # Configuration file support
