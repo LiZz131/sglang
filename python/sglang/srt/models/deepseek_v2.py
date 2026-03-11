@@ -1115,6 +1115,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.enable_special_dp_attention = get_global_server_args().enable_special_dp_attention
+        self.enable_save_kv_cache_for_dp = get_global_server_args().enable_save_kv_cache_for_dp
         # pdmux + dp-attention
         self.enable_pdmux = get_global_server_args().enable_pdmux
         self.use_nsa = is_deepseek_nsa(config)
@@ -1673,7 +1674,13 @@ class DeepseekV2AttentionMLA(nn.Module):
         q[..., self.qk_nope_head_dim :] = q_pe
 
         # TODO: 关键步骤, 计算kv缓存并保存, 用来在decode阶段, 加速计算
-        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        if self.enable_save_kv_cache_for_dp:
+            if forward_batch.dp_local_token_start is not None and forward_batch.dp_local_token_end is not None:
+                self._set_mla_kv_buffer_for_dp(latent_cache, kv_a, k_pe, forward_batch)
+            else:
+                self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        else:
+            self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
         if (
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
@@ -2595,6 +2602,26 @@ class DeepseekV2AttentionMLA(nn.Module):
             # Save latent cache
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+            )
+
+    def _set_mla_kv_buffer_for_dp(
+        self,
+        latent_cache: torch.Tensor,
+        kv_a: torch.Tensor,
+        k_pe: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if _is_cuda or _use_aiter_gfx95:
+            # Save latent cache
+            # slice kv_a and k_pe according to forward_batch.dp_local_token_start and forward_batch.dp_local_token_end
+            # out_cache_loc has been sliced
+            assert forward_batch.out_cache_loc.shape[0] == forward_batch.dp_local_token_end - forward_batch.dp_local_token_start
+            if forward_batch.dp_local_token_end - forward_batch.dp_local_token_start == 0:
+                return
+            kv_a_sliced = kv_a[forward_batch.dp_local_token_start:forward_batch.dp_local_token_end]
+            k_pe_sliced = k_pe[forward_batch.dp_local_token_start:forward_batch.dp_local_token_end]
+            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                self.attn_mha, forward_batch.out_cache_loc, kv_a_sliced.unsqueeze(1), k_pe_sliced
             )
 
     def _get_mla_kv_buffer(

@@ -2223,6 +2223,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            dp_local_token_start=self.dp_local_token_start,
+            dp_local_token_end=self.dp_local_token_end,
         )
 
     def copy(self):
@@ -2294,6 +2296,10 @@ class ModelWorkerBatch:
     can_run_dp_cuda_graph: bool
     tbo_split_seq_index: Optional[int]
     global_forward_mode: Optional[ForwardMode]
+
+    # For special dp attention
+    dp_local_token_start: Optional[int] = None
+    dp_local_token_end: Optional[int] = None
 
     # For extend
     extend_num_tokens: Optional[int]
