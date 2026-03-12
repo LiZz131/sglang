@@ -871,8 +871,8 @@ class Req:
         if self.ignore_cache_prefix:
             # force the prefix length to be 0, clear all prefix related states
             self.prefix_indices = torch.empty((0,), dtype=torch.int64)
-            self.last_node = None
-            self.last_host_node = None
+            self.last_node = tree_cache.root_node
+            self.last_host_node = tree_cache.root_node
             self.host_hit_length = 0
             self.mamba_branching_seqlen = None
             self.cache_protected_len = 0
