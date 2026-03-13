@@ -433,18 +433,25 @@ class SchedulerMultiplexMixin:
                                 f"special_dp_attention: keep_indices={keep_indices}, "
                                 f"drop_indices={drop_indices}, batch_size={self.split_prefill_batch.batch_size()}"
                             )
-                            for i in drop_indices:
-                                req = self.split_prefill_batch.reqs[i]
-                                logger.debug(
-                                    f"releasing dropped req i={i} rid={req.rid} "
-                                    f"req_pool_idx={req.req_pool_idx}"
-                                )
-                                release_kv_cache(
-                                    req,
-                                    self.split_prefill_batch.tree_cache,
-                                    is_insert=False,
-                                )
-                            self.split_prefill_batch.filter_batch(keep_indices=keep_indices)
+                            # when we enable_save_kv_cache_for_dp, we do not need to release the kv cache, 
+                            #  because we didn't alloc or save cache for these reqs
+                            if not self.enable_save_kv_cache_for_dp:
+                                for i in drop_indices:
+                                    req = self.split_prefill_batch.reqs[i]
+                                    logger.info(
+                                        f"releasing dropped req i={i} rid={req.rid} "
+                                        f"req_pool_idx={req.req_pool_idx}"
+                                    )
+                                    release_kv_cache(
+                                        req,
+                                        self.split_prefill_batch.tree_cache,
+                                        is_insert=False,
+                                    )
+                            # TODO(lbz): bugfix, after filter batch, bs=0 but output_ids is not None, need to fix it
+                            self.split_prefill_batch.filter_batch(
+                                keep_indices=keep_indices,
+                                req_pool_indices_is_dp_local=True,
+                            )
                             logger.info(
                                 f"keep indices: {keep_indices}, "
                                 f"after filter split_prefill_batch: {self.split_prefill_batch.batch_size()}"

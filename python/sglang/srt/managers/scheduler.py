@@ -288,7 +288,9 @@ class Scheduler(
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_pdmux = server_args.enable_pdmux
+        self.enable_special_dp_attention = server_args.enable_special_dp_attention
         self.enable_save_kv_cache_for_dp = server_args.enable_save_kv_cache_for_dp
+        self.enable_special_dp_attention_prefix_0 = server_args.enable_special_dp_attention_prefix_0
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
         self.enable_metrics_for_all_schedulers = (
@@ -2072,6 +2074,7 @@ class Scheduler(
             self.spec_algorithm,
             chunked_req=self.chunked_req,
             dllm_config=self.dllm_config,
+            dp_rank=self.dp_rank,
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered

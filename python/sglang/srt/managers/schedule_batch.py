@@ -1269,11 +1269,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens_cpu_cache: torch.Tensor = None
 
     # For special dp attention
+    enable_save_kv_cache_for_dp: bool = False
+    dp_rank: Optional[int] = None
+    dp_local_reqs: Optional[List[Req]] = None
     dp_local_token_start: Optional[int] = None
     dp_local_token_end: Optional[int] = None
     dp_local_extend_num_tokens: Optional[int] = None
-    dp_rank: Optional[int] = None
     dp_local_req_indices: Optional[List[int]] = None
+    dp_local_input_ids: Optional[List[List[int]]] = None
+    dp_local_seq_lens: Optional[torch.Tensor] = None
+    dp_local_seq_lens_cpu: Optional[torch.Tensor] = None
+    dp_local_orig_seq_lens: Optional[torch.Tensor] = None
+    dp_local_prefix_lens: Optional[List[int]] = None
+    dp_local_extend_lens: Optional[List[int]] = None
 
     # Stream
     has_stream: bool = False
@@ -1333,6 +1341,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             is_hybrid_swa = True
 
+        enable_save_kv_cache_for_dp = get_global_server_args().enable_save_kv_cache_for_dp
+
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
@@ -1352,6 +1362,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             chunked_req=chunked_req,
             dllm_config=dllm_config,
             dp_rank=dp_rank,
+            enable_save_kv_cache_for_dp=enable_save_kv_cache_for_dp,
         )
 
     def batch_size(self):
@@ -1453,17 +1464,60 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
-        # TODO(lbz): Init dp_local_token_start and dp_local_token_end
-        # use input ids to calculate dp_local_token_start and dp_local_token_end, find the first local and last local
-        if get_global_server_args().enable_special_dp_attention:
+        # When server has enable_special_dp_attention, we always set dp_local_* so the mixin can
+        # filter and release non-local reqs after prefill (avoid token leak). Local-only allocation
+        # is gated by enable_save_kv_cache.
+        enable_save_kv_cache = self.enable_save_kv_cache_for_dp
+        server_special_dp_attention = get_global_server_args().enable_special_dp_attention
+        enable_special_dp_attention_save_kv_cache = server_special_dp_attention and enable_save_kv_cache
+
+        if server_special_dp_attention:
+            self.dp_local_req_indices = [
+                i
+                for i, req in enumerate(reqs)
+                if req.decode_dp_rank is not None and req.decode_dp_rank == self.dp_rank
+            ]
+            self.dp_local_reqs = [reqs[i] for i in self.dp_local_req_indices]
+            self.dp_local_input_ids = [
+                req.fill_ids[len(req.prefix_indices) :] for req in self.dp_local_reqs
+            ]
+            self.dp_local_extend_num_tokens = sum(
+                len(ids) for ids in self.dp_local_input_ids
+            )
+            self.dp_local_seq_lens = torch.tensor(
+                [len(r.fill_ids) for r in self.dp_local_reqs],
+                dtype=torch.int64,
+            ).to(self.device, non_blocking=True)
+            self.dp_local_seq_lens_cpu = torch.tensor(
+                [len(r.fill_ids) for r in self.dp_local_reqs], dtype=torch.int64
+            )
+            self.dp_local_orig_seq_lens = torch.tensor(
+                [
+                    max(len(r.fill_ids), len(r.origin_input_ids))
+                    for r in self.dp_local_reqs
+                ],
+                dtype=torch.int32,
+            ).to(self.device, non_blocking=True)
+            self.dp_local_prefix_lens = [len(r.prefix_indices) for r in self.dp_local_reqs]
+            self.dp_local_extend_lens = [r.extend_input_len for r in self.dp_local_reqs]
+
+            # dp_local_token_start / dp_local_token_end for forward slice
             dp_local_token_start = None
             dp_local_token_end = None
             found_first_local = False
             for i, req in enumerate(reqs):
-                if not found_first_local and req.decode_dp_rank is not None and req.decode_dp_rank == self.dp_rank:
+                if (
+                    not found_first_local
+                    and req.decode_dp_rank is not None
+                    and req.decode_dp_rank == self.dp_rank
+                ):
                     dp_local_token_start = sum(seq_lens[:i])
                     found_first_local = True
-                if found_first_local and req.decode_dp_rank is not None and req.decode_dp_rank != self.dp_rank:
+                if (
+                    found_first_local
+                    and req.decode_dp_rank is not None
+                    and req.decode_dp_rank != self.dp_rank
+                ):
                     dp_local_token_end = sum(seq_lens[:i])
                     break
             if dp_local_token_start is not None and dp_local_token_end is not None:
@@ -1529,15 +1583,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
 
+        local_idx_for_global = (
+            {global_i: local_idx for local_idx, global_i in enumerate(self.dp_local_req_indices)}
+            if enable_special_dp_attention_save_kv_cache
+            else None
+        )
+
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
 
-            req.extend_batch_idx += 1
+            if enable_special_dp_attention_save_kv_cache:
+                if i in local_idx_for_global:
+                    req.req_pool_idx = req_pool_indices[local_idx_for_global[i]]
+                    req.kv_committed_len = seq_len
+                    req.kv_allocated_len = seq_len
+                else:
+                    req.req_pool_idx = None
+                    req.kv_committed_len = 0
+                    req.kv_allocated_len = 0
+            else:
+                req.req_pool_idx = req_pool_indices[i]
+                req.kv_committed_len = seq_len
+                req.kv_allocated_len = seq_len
 
-            # update req-level memory management fields
-            req.kv_committed_len = seq_len
-            req.kv_allocated_len = seq_len
+            req.extend_batch_idx += 1
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -2076,7 +2145,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
-        self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+        if not req_pool_indices_is_dp_local:
+            self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
@@ -2308,6 +2378,10 @@ class ModelWorkerBatch:
     can_run_dp_cuda_graph: bool
     tbo_split_seq_index: Optional[int]
     global_forward_mode: Optional[ForwardMode]
+
+    # For special dp attention
+    dp_local_token_start: Optional[int]
+    dp_local_token_end: Optional[int]
 
     # For extend
     extend_num_tokens: Optional[int]

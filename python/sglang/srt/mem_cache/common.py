@@ -330,6 +330,7 @@ def alloc_req_slots(
 
 def alloc_for_extend(
     batch: ScheduleBatch,
+    enable_special_dp_attention: bool=False,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
@@ -341,6 +342,8 @@ def alloc_for_extend(
     """
     # free out-of-window swa tokens
     if isinstance(batch.tree_cache, SWAChunkCache):
+        if enable_special_dp_attention:
+            raise NotImplementedError("Special dp attention is not supported for swa eviction")
         for req, pre_len in zip(batch.reqs, batch.prefix_lens):
             if batch.enable_overlap:
                 # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
@@ -353,27 +356,49 @@ def alloc_for_extend(
             else:
                 batch.tree_cache.evict_swa(req, pre_len)
 
-    bs = len(batch.reqs)
-    prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    if enable_special_dp_attention:
+        bs = len(batch.dp_local_reqs)
+        prefix_tensors = [r.prefix_indices for r in batch.dp_local_reqs]
+    else:
+        bs = len(batch.reqs)
+        prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
-    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
-    prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
-    extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+    if enable_special_dp_attention:
+        prefix_lens_cpu = torch.tensor(batch.dp_local_prefix_lens, dtype=torch.int64)
+        extend_lens_cpu = torch.tensor(batch.dp_local_extend_lens, dtype=torch.int64)
+        prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
+        extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+    else:
+        prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
+        extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
+        prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
+        extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
     # Allocate req slots
-    req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, bs, batch.reqs, batch.tree_cache
-    )
-    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-    req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+    if enable_special_dp_attention:
+        req_pool_indices = alloc_req_slots(
+            batch.req_to_token_pool, bs, batch.dp_local_reqs, batch.tree_cache
+        )
+        req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+        req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+    else:
+        req_pool_indices = alloc_req_slots(
+            batch.req_to_token_pool, bs, batch.reqs, batch.tree_cache
+        )
+        req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+        req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
     if batch.tree_cache.page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        if enable_special_dp_attention:
+            out_cache_loc = alloc_token_slots(batch.tree_cache, batch.dp_local_extend_num_tokens)
+        else:
+            out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
+        if enable_special_dp_attention:
+            raise NotImplementedError("Special dp attention is not supported for paged allocation")
         last_loc = [
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
             for t in prefix_tensors
@@ -389,19 +414,34 @@ def alloc_for_extend(
         )
 
     # Write to req_to_token_pool
-    write_cache_indices(
-        out_cache_loc,
-        req_pool_indices_device,
-        req_pool_indices_cpu,
-        prefix_lens_device,
-        prefix_lens_cpu,
-        batch.seq_lens,
-        batch.seq_lens_cpu,
-        extend_lens_device,
-        extend_lens_cpu,
-        prefix_tensors,
-        batch.req_to_token_pool,
-    )
+    if enable_special_dp_attention:
+        write_cache_indices(
+            out_cache_loc,
+            req_pool_indices_device,
+            req_pool_indices_cpu,
+            prefix_lens_device,
+            prefix_lens_cpu,
+            batch.dp_local_seq_lens,
+            batch.dp_local_seq_lens_cpu,
+            extend_lens_device,
+            extend_lens_cpu,
+            prefix_tensors,
+            batch.req_to_token_pool,
+        )
+    else:
+        write_cache_indices(
+            out_cache_loc,
+            req_pool_indices_device,
+            req_pool_indices_cpu,
+            prefix_lens_device,
+            prefix_lens_cpu,
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            extend_lens_device,
+            extend_lens_cpu,
+            prefix_tensors,
+            batch.req_to_token_pool,
+        )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 
