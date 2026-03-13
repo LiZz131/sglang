@@ -1999,7 +1999,7 @@ class Scheduler(
 
             if self.enable_special_dp_attention_prefix_0:
                 req.ignore_cache_prefix = True
-                req.init_next_round_input(tree_cache=None)
+                req.init_next_round_input(self.tree_cache)
             else:
                 req.ignore_cache_prefix = False
                 req.init_next_round_input(self.tree_cache)

@@ -1572,7 +1572,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-            self
+            self,
+            enable_special_dp_attention_save_kv_cache
+        )
+        logger.debug(
+            f"alloc_for_extend: out_cache_loc.shape={out_cache_loc.shape}, "
+            f"req_pool_indices len={len(req_pool_indices)}"
         )
 
         # Set fields
@@ -2108,6 +2113,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         keep_indices: Optional[List[int]] = None,
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
+        req_pool_indices_is_dp_local: bool = False,
     ):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info

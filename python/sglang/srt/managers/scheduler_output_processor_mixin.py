@@ -137,11 +137,13 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        release_kv_cache(req, self.tree_cache)
+                        if not self.enable_special_dp_attention or self._is_dp_local_req(batch, req):
+                            release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
-                        self.tree_cache.cache_unfinished_req(req)
+                        if not self.enable_special_dp_attention or self._is_dp_local_req(batch, req):
+                            self.tree_cache.cache_unfinished_req(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -287,6 +289,12 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
+    def _is_dp_local_req(self: Scheduler, batch: ScheduleBatch, req: Req) -> bool:    
+        return (
+            batch.dp_local_req_indices is not None
+            and req in batch.dp_local_req_indices
+        )
+    
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
