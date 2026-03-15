@@ -37,6 +37,7 @@ class SchedulerMultiplexMixin:
         # The current split prefill batch
         self.split_prefill_batch: Optional[ScheduleBatch] = None
         self.decode_or_idle_batch: Optional[ScheduleBatch] = None
+        self.decode_forward_count = 0
 
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
         self.pdmux_config = load_pdmux_config(self.server_args.pdmux_config_path)
@@ -44,10 +45,17 @@ class SchedulerMultiplexMixin:
         self.stream_groups = get_stream_groups()
         self.sm_counts = get_sm_counts()
         self.real_sm_group_num = len(self.stream_groups)
-        self.enable_special_dp_attention = self.server_args.enable_special_dp_attention
         logger.info(
             f"PD-Multiplexing enabled with {self.real_sm_group_num} stream groups, sm_counts (prefill_sm, decode_sm): {self.sm_counts}"
         )
+        self.log_stream_groups()
+
+    def log_stream_groups(self: Scheduler):
+        for i, stream_group in enumerate(self.stream_groups):
+            # group, prefill stream id/sms, decode stream id/sms
+            logger.info(f"stream_group {i}: ")
+            logger.info(f"  prefill stream id: {stream_group[0].stream_id}, sms: {self.sm_counts[i][0]}")
+            logger.info(f"  decode stream id: {stream_group[1].stream_id}, sms: {self.sm_counts[i][1]}")
 
     # TODO(jason-fxz): This is a temporary demo
     def adjust_stream_groups(
@@ -273,7 +281,7 @@ class SchedulerMultiplexMixin:
         decode_stream = stream_group[1]
         torch.cuda.empty_cache()
 
-        logger.debug("Starting event loop for pd multiplexing...")
+        logger.info("Starting event loop for pd multiplexing...")
 
         while True:
             with torch.cuda.stream(decode_stream):
@@ -281,7 +289,7 @@ class SchedulerMultiplexMixin:
                 set_pdmux_status(False)
                 recv_reqs = self.recv_requests()
                 if recv_reqs:
-                    logger.debug(f"in event_loop_pdmux, decode_stream: recv_reqs: {len(recv_reqs)}")
+                    logger.info(f"in event_loop_pdmux, decode_stream: recv_reqs: {len(recv_reqs)}")
                 self.process_input_requests(recv_reqs)
                 nvtx.range_pop()
 
@@ -309,6 +317,12 @@ class SchedulerMultiplexMixin:
                 adjust_stream_group = adjust_stream_group or (
                     stream_idx > 0 and self.decode_or_idle_batch is None
                 )
+                if self.decode_or_idle_batch is not None:
+                    # logger.info(f"after maybe_prepare_mlp_sync_batch_and_log_stats, decode_or_idle_batch: {self.decode_or_idle_batch.batch_size()}, global_num_tokens: {self.decode_or_idle_batch.global_num_tokens}")
+                    pass
+                else:
+                    # logger.info(f"after maybe_prepare_mlp_sync_batch_and_log_stats, decode_or_idle_batch is None")
+                    pass
                 # TODO(lbz): running_batch use mlp sync batch, so can it be empty?
                 # if self.running_batch is not None and self.running_batch.is_empty() and self.split_prefill_batch is None:
                 if self.decode_or_idle_batch is None and self.split_prefill_batch is None:
@@ -324,13 +338,12 @@ class SchedulerMultiplexMixin:
                 decode_stream.synchronize()
                 # TODO(lbz): we need make all ranks adjust to the same stream group
                 stream_idx, stream_group = self.adjust_stream_groups_for_special_dp_attention()
-                logger.info(f"calc adjust_stream_groups_for_special_dp_attention, stream_idx: {stream_idx}, stream_group: {stream_group}")
                 prefill_stream = stream_group[0]
                 decode_stream = stream_group[1]
                 adjust_stream_group = False
-                logger.debug(
-                    f"Adjusting stream groups: {stream_idx}, prefill sm: {self.sm_counts[stream_idx][0]}, decode sm: {self.sm_counts[stream_idx][1]}"
-                )
+                # logger.info(
+                #    f"Adjusting stream groups: {stream_idx}, prefill sm: {self.sm_counts[stream_idx][0]}, decode sm: {self.sm_counts[stream_idx][1]}"
+                # )
                 nvtx.range_pop()
 
             with torch.cuda.stream(decode_stream):
@@ -338,9 +351,16 @@ class SchedulerMultiplexMixin:
                 set_pdmux_status(False)
                 # process decode batch
                 if self.decode_or_idle_batch:
-                    logger.debug(f"before run_batch, decode_or_idle_batch: {self.decode_or_idle_batch.batch_size()}")
+                    # logger.info(f"before run_batch, decode_or_idle_batch: {self.decode_or_idle_batch.batch_size()}")
+                    # self.decode_forward_count += 1
+                    # logger.info(f"decode_forward_count: {self.decode_forward_count}")
+                    # logger.info("="*80)
+                    # for req in self.decode_or_idle_batch.reqs:
+                    #     # rid, len(fill_ids), len_output_ids, finished()
+                    #     logger.info(f"req: {req.rid}, len(fill_ids): {len(req.fill_ids)}, len_output_ids: {len(req.output_ids)}, finished: {req.finished()}")
                     decode_result = self.run_batch(self.decode_or_idle_batch)
                     decode_done = True
+
                 else:
                     decode_done = False
                 nvtx.range_pop()
@@ -374,9 +394,9 @@ class SchedulerMultiplexMixin:
                     self.split_prefill_batch.split_forward_count = forward_count
                     # TODO(lbz): try to use the synchronize for normal tp in special dp attention
                     # prefill_stream.synchronize()
-                    logger.info(f"before run_batch, split_prefill_batch: {self.split_prefill_batch.batch_size()}")
                     prefill_result = self.run_batch(self.split_prefill_batch)
-                    logger.info(f"after run_batch, split_prefill_batch: {self.split_prefill_batch.batch_size()}")
+                    # logger.info(f"after run_prefill_batch, split_prefill_batch: {self.split_prefill_batch.batch_size()}")
+                    # logger.info(f"after run_prefill_batch, split_prefill_batch.input_ids: {self.split_prefill_batch.input_ids.shape}")
                     if next_split_index == self.model_config.num_hidden_layers:
                         self.split_prefill_batch.split_prefill_finished = True
                         prefill_exe_done = prefill_stream.record_event()
@@ -429,19 +449,19 @@ class SchedulerMultiplexMixin:
                                 for i in range(self.split_prefill_batch.batch_size())
                                 if i not in keep_indices
                             ]
-                            logger.debug(
-                                f"special_dp_attention: keep_indices={keep_indices}, "
-                                f"drop_indices={drop_indices}, batch_size={self.split_prefill_batch.batch_size()}"
-                            )
+                            # logger.info(
+                            #     f"special_dp_attention: keep_indices={keep_indices}, "
+                            #     f"drop_indices={drop_indices}, batch_size={self.split_prefill_batch.batch_size()}"
+                            # )
                             # when we enable_save_kv_cache_for_dp, we do not need to release the kv cache, 
                             #  because we didn't alloc or save cache for these reqs
                             if not self.enable_save_kv_cache_for_dp:
                                 for i in drop_indices:
                                     req = self.split_prefill_batch.reqs[i]
-                                    logger.info(
-                                        f"releasing dropped req i={i} rid={req.rid} "
-                                        f"req_pool_idx={req.req_pool_idx}"
-                                    )
+                                    # logger.info(
+                                    #     f"releasing dropped req i={i} rid={req.rid} "
+                                    #     f"req_pool_idx={req.req_pool_idx}"
+                                    # )
                                     release_kv_cache(
                                         req,
                                         self.split_prefill_batch.tree_cache,
@@ -452,12 +472,12 @@ class SchedulerMultiplexMixin:
                                 keep_indices=keep_indices,
                                 req_pool_indices_is_dp_local=True,
                             )
-                            logger.info(
-                                f"keep indices: {keep_indices}, "
-                                f"after filter split_prefill_batch: {self.split_prefill_batch.batch_size()}"
-                                f"split_prefill_batch.input_ids: {self.split_prefill_batch.input_ids.shape if self.split_prefill_batch.input_ids is not None else None}"
-                                f"split_prefill_batch.output_ids: {self.split_prefill_batch.output_ids.shape if self.split_prefill_batch.output_ids is not None else None}"
-                            )
+                            # logger.info(
+                            #     f"keep indices: {keep_indices}, "
+                            #     f"after filter split_prefill_batch: {self.split_prefill_batch.batch_size()}"
+                            #     f"split_prefill_batch.input_ids: {self.split_prefill_batch.input_ids.shape if self.split_prefill_batch.input_ids is not None else None}"
+                            #     f"split_prefill_batch.output_ids: {self.split_prefill_batch.output_ids.shape if self.split_prefill_batch.output_ids is not None else None}"
+                            # )
 
                         if self.split_prefill_batch is not None and self.split_prefill_batch.batch_size() != 0:
                             if self.running_batch and not self.running_batch.is_empty():

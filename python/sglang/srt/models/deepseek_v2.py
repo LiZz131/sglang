@@ -1393,9 +1393,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             attention_backend = get_global_server_args().prefill_attention_backend
         self.current_attention_backend = attention_backend
-
         handler = AttentionBackendRegistry.get_handler(attention_backend)
-        return handler(self, forward_batch)
+        result = handler(self, forward_batch)
+
+        if result == AttnForwardMethod.MLA and self.enable_special_dp_attention and forward_batch.forward_mode.is_split_prefill():
+            logger.info(f"MLA is not supported for split prefill with dp-attention, change to MHA")
+            result = AttnForwardMethod.MHA
+        
+        return result
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -1692,8 +1697,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        # TODO: 关键步骤, 计算kv缓存并保存, 用来在decode阶段, 加速计算
-        logger.debug(f"set_mla_kv_buffer, latent_cache: {latent_cache.shape}, kv_a: {kv_a.shape}, k_pe: {k_pe.shape}")
+        # TODO(lbz): 
+        # logger.debug(f"set_mla_kv_buffer, latent_cache: {latent_cache.shape}, kv_a: {kv_a.shape}, k_pe: {k_pe.shape}")
         if self.enable_save_kv_cache_for_dp:
             if forward_batch.dp_local_token_start is not None and forward_batch.dp_local_token_end is not None:
                 self._set_mla_kv_buffer_for_dp(latent_cache, kv_a, k_pe, forward_batch)
@@ -1739,24 +1744,21 @@ class DeepseekV2AttentionMLA(nn.Module):
         v = kv[..., self.qk_nope_head_dim :]
 
         if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
-            logger.debug(f"prepare concat k")
-            logger.debug(f"split prefill normal tp, k_nope: {k_nope.shape}, k_pe: {k_pe.shape}")
+            # logger.debug(f"prepare concat k")
+            # logger.debug(f"split prefill normal tp, k_nope: {k_nope.shape}, k_pe: {k_pe.shape}")
             k = self._concat_and_cast_mha_k_split_prefill_normal_tp(k_nope, k_pe, forward_batch)
         else:
             k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
 
     def forward_normal_core(self, q, k, v, forward_batch):
-        logger.debug(f"forward_normal_core, q: {q.shape}, k: {k.shape}, v: {v.shape}")
         if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
             attn_output = self.attn_mha_normal_tp(q, k, v, forward_batch, save_kv_cache=False)
             attn_output = attn_output.reshape(-1, self.tp_num_heads * self.v_head_dim)
-            logger.debug(f"split prefill normal tp, attn_output: {attn_output.shape}")
             output, _ = self.o_proj.forward_split_prefill_normal_tp(attn_output, tp_size=self.tp_size, tp_rank=self.tp_rank, tp_attention_size=self.attn_tp_size, tp_attention_rank=self.attn_tp_rank)
         else:
             attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-            logger.debug(f"dp-attention, attn_output: {attn_output.shape}")
             output, _ = self.o_proj(attn_output)
         return output
 
@@ -1915,6 +1917,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
+        # q_nope: torch.Size([2, 128, 128]), q_pe: torch.Size([2, 128, 64])
+        # use_deep_gemm_bmm: False, _is_hip: False, _use_aiter_gfx95: False
+        # w_kc.dtype: torch.bfloat16
+        # logger.debug(f"q_nope: {q_nope.shape}, q_pe: {q_pe.shape}")
+        # logger.debug(f"use_deep_gemm_bmm: {self.use_deep_gemm_bmm}, _is_hip: {_is_hip}, _use_aiter_gfx95: {_use_aiter_gfx95}")
+        # logger.debug(f"w_kc.dtype: {self.w_kc.dtype}")
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
@@ -1982,9 +1990,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
             )
         else:
+            # q_nope: torch.Size([9, 64, 128])
+            # w_kc: torch.Size([128, 128, 512]), w_kc_normal_tp: torch.Size([128, 64, 512])
             if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
-                logger.debug(f"in forward_absorb_prepare, w_kc: {self.w_kc.shape}, w_kc_normal_tp: {self.w_kc_normal_tp.shape}")
-                logger.debug(f"q_nope: {q_nope.shape}")
                 q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc_normal_tp)
             else:
                 q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
@@ -2212,14 +2220,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
             else:
                 if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
-                    logger.debug(f"w_vc: {self.w_vc.shape}, w_vc_normal_tp: {self.w_vc_normal_tp.shape}")
-                    logger.debug(f"attn_output: {attn_output.shape}")
+                    # logger.debug(f"w_vc: {self.w_vc.shape}, w_vc_normal_tp: {self.w_vc_normal_tp.shape}")
+                    # logger.debug(f"attn_output: {attn_output.shape}")
                     attn_bmm_output = torch.empty(
                         (attn_output.shape[0], self.tp_num_heads * self.v_head_dim),
                         dtype=attn_output.dtype,
                         device=attn_output.device,
                     )
-                    logger.debug(f"attn_bmm_output: {attn_bmm_output.shape}")
+                    # logger.debug(f"attn_bmm_output: {attn_bmm_output.shape}")
                     torch.bmm(
                         attn_output.transpose(0, 1),
                         self.w_vc_normal_tp,
@@ -2227,16 +2235,16 @@ class DeepseekV2AttentionMLA(nn.Module):
                             -1, self.tp_num_heads, self.v_head_dim
                         ).transpose(0, 1),
                     )
-                    logger.debug(f"attn_bmm_output: {attn_bmm_output.shape}")
+                    # logger.debug(f"attn_bmm_output: {attn_bmm_output.shape}")
                 else:
                     #  attn_output: torch.Size([2, 128, 512]), w_vc: torch.Size([128, 512, 128])
-                    logger.debug(f"attn_output: {attn_output.shape}, w_vc: {self.w_vc.shape}")
+                    # logger.debug(f"attn_output: {attn_output.shape}, w_vc: {self.w_vc.shape}")
                     attn_bmm_output = torch.empty(
                         (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
                         dtype=attn_output.dtype,
                         device=attn_output.device,
                     )
-                    logger.debug(f"attn_bmm_output: {attn_bmm_output.shape}")
+                    # logger.debug(f"attn_bmm_output: {attn_bmm_output.shape}")
                     torch.bmm(
                         attn_output.transpose(0, 1),
                         self.w_vc,
@@ -2244,7 +2252,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                             -1, self.num_local_heads, self.v_head_dim
                         ).transpose(0, 1),
                     )
-                    logger.debug(f"attn_bmm_output: {attn_bmm_output.shape}")
+                    # logger.debug(f"attn_bmm_output: {attn_bmm_output.shape}")
         
         if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
             output, _ = self.o_proj.forward_split_prefill_normal_tp(
@@ -2979,9 +2987,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         )
 
-        if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
-            logger.info(f"split prefill with dp-attention, decoder layer id: {self.layer_id}")
-            logger.info(f"hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+        if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention: 
+            # logger.info(f"split prefill with dp-attention, decoder layer id: {self.layer_id}, layer_scatter_modes: {layer_scatter_modes}")
+            # logger.debug(f"hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
             # TODO: Implement the logic to handle split prefill with dp-attention
             # 第一层进入的时候, 一定是 full 状态; 后续层次也默认使用 full 状态
             
@@ -2993,7 +3001,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states += residual
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
-            logger.info(f"after input_layernorm, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+            # logger.debug(f"after input_layernorm, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
             
             # set attn inputs
             if self.self_attn.prepare_qkv_latent is not None:
@@ -3001,7 +3009,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     hidden_states, forward_batch, self.self_attn.prepare_qkv_latent
                 )
                 get_attn_tp_context().set_attn_inputs(attn_inputs)
-            logger.info(f"after set_attn_inputs, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+            # logger.debug(f"after set_attn_inputs, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
 
             # Attention 操作
             hidden_states = self.self_attn(
@@ -3011,16 +3019,17 @@ class DeepseekV2DecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
                 llama_4_scaling=llama_4_scaling,
             )
-            logger.info(f"after self_attn, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+            # logger.debug(f"after self_attn, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
 
             # 此时 hidden_states 形状完整, 值不完整, 需要通过 all-reduce 变成完整数据
             # post-attention-layernorm 操作, 
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-            logger.info(f"after tensor_model_parallel_all_reduce, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+            # logger.info(f"layer id: {self.layer_id}, after tensor_model_parallel_all_reduce, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+            # logger.info(f"layer id: {self.layer_id}, after tensor_model_parallel_all_reduce, hidden_states mean is: {hidden_states.mean()}")
             hidden_states += residual
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
-            logger.info(f"after post_attention_layernorm, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+            # logger.debug(f"after post_attention_layernorm, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
 
             # MLP 操作
             if isinstance(self.mlp, DeepseekV2MLP):
@@ -3033,7 +3042,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 False,
                 gemm_output_zero_allocator,
             )
-            logger.info(f"after mlp, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
+            # logger.debug(f"after mlp, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
             return hidden_states, residual
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -3380,7 +3389,7 @@ class DeepseekV2Model(nn.Module):
                     llama_4_scaling,
                 )
 
-        logger.info(f"after end layer, hidden_states: {hidden_states.shape}, residual: {residual.shape}")
+        # logger.info(f"after end layer, hidden_states: {hidden_states.shape}, residual: {residual.shape}")
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers[normal_end_layer : self.end_layer],
@@ -3595,6 +3604,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         # Layers that this rank owns and fall in [start, end)
         layer_start = max(start, self.model.start_layer)
         layer_end = min(end, self.model.end_layer)
+        # TODO(lbz): remove this after debugging, for checking the kv cache type
+        # forward batch kv cache: <sglang.srt.mem_cache.memory_pool.MLATokenToKVPool object at 0x7c9f5015d0a0>
         if layer_start < layer_end:
             device = forward_batch.hidden_states.device
             num_layers_this_chunk = layer_end - layer_start
