@@ -576,12 +576,29 @@ class SchedulerMetricsMixin:
         num_tokens += sum(req.seqlen for queue in waiting_queues for req in queue)
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
 
+        # For special_dp_attention: decode/prefill/waiting metrics (dp_local)
+        decode_bs = 0
+        prefill_to_decode_dp_local_reqs = 0
+        waiting_prefill_dp_local_reqs = 0
+        if self.enable_special_dp_attention:
+            if self.waiting_queue is not None:
+                for r in self.waiting_queue:
+                    if r.decode_dp_rank is not None and r.decode_dp_rank == self.dp_rank:
+                        waiting_prefill_dp_local_reqs += 1
+            if self.decode_or_idle_batch and not self.decode_or_idle_batch.is_empty():
+                decode_bs = self.decode_or_idle_batch.batch_size()
+            if self.split_prefill_batch and not self.split_prefill_batch.is_empty():
+                prefill_to_decode_dp_local_reqs = len(self.split_prefill_batch.dp_local_reqs)
+
         return GetLoadReqOutput(
             dp_rank=self.dp_rank,
             num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
             ts_tic=time.perf_counter(),
+            decode_bs=decode_bs,
+            prefill_to_decode_dp_local_reqs=prefill_to_decode_dp_local_reqs,
+            waiting_prefill_dp_local_reqs=waiting_prefill_dp_local_reqs,
         )
 
     @contextmanager

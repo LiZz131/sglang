@@ -1695,6 +1695,10 @@ class GetLoadReqOutput(BaseReq):
     num_waiting_reqs: int
     num_tokens: int
     ts_tic: float
+    # For special_dp_attention
+    decode_bs: int
+    prefill_to_decode_dp_local_reqs: int
+    waiting_prefill_dp_local_reqs: int
 
 
 @dataclass

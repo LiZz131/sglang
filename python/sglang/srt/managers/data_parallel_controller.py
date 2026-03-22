@@ -21,7 +21,7 @@ import threading
 import time
 from collections import deque
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Dict
 
 import psutil
 import setproctitle
@@ -31,6 +31,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     BlockReqInput,
+    GetLoadReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
@@ -188,6 +189,16 @@ class DataParallelController:
 
         # Load balance budget
         self.dp_budget = DPBudget(server_args.dp_size)
+        # For special_dp_attention only: decode/prefill/waiting metrics (dp_local) and
+        # pending buffer (see handle_load_update_req / set_decode_dp_rank).
+        if server_args.enable_special_dp_attention:
+            self.special_dp_attention_loads: Dict[int, Optional[GetLoadReqOutput]] = {}
+            for dp_rank in range(server_args.dp_size):
+                self.special_dp_attention_loads[dp_rank] = None
+            self.special_dp_attention_pending_load_buffer = [0] * server_args.dp_size
+        else:
+            self.special_dp_attention_loads = {}
+            self.special_dp_attention_pending_load_buffer = []
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -225,6 +236,13 @@ class DataParallelController:
             worker.send_pyobj(obj)
 
     def handle_load_update_req(self, obj):
+        if self.server_args.enable_special_dp_attention:
+            for load in obj.loads:
+                self.special_dp_attention_loads[load.dp_rank] = load
+                dp_rank = load.dp_rank
+                buf = self.special_dp_attention_pending_load_buffer
+                if 0 <= dp_rank < len(buf):
+                    buf[dp_rank] = 0
         self.dp_budget.update_budget(obj)
 
     def dispatching_with_trace(self, req: Req):
@@ -581,8 +599,44 @@ class DataParallelController:
     
     def set_decode_dp_rank(self, req: Req):
         # TODO(lbz): need to set decode_rank for the request, here is a demo implementation
-        req.decode_dp_rank = self.round_robin_counter
-        self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
+        use_round_robin = False
+        if use_round_robin:
+            req.decode_dp_rank = self.round_robin_counter
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
+        else:
+            dp_size = len(self.workers)
+            if self.special_dp_attention_loads and len(self.special_dp_attention_loads) >= 1:
+                def effective_load(load: Optional[GetLoadReqOutput]) -> int:
+                    if load is None:
+                        return 0
+                    return (
+                        getattr(load, "decode_bs", 0)
+                        + getattr(load, "prefill_to_decode_dp_local_reqs", 0)
+                        + getattr(load, "waiting_prefill_dp_local_reqs", 0)
+                    )
+                buf = self.special_dp_attention_pending_load_buffer
+                use_pending = (
+                    self.server_args.enable_special_dp_attention
+                    and len(buf) == dp_size
+                )
+                candidates = [
+                    (
+                        r,
+                        effective_load(self.special_dp_attention_loads[r])
+                        + (buf[r] if use_pending else 0),
+                    )
+                    for r in range(dp_size)
+                    if r in self.special_dp_attention_loads
+                ]
+                if candidates:
+                    req.decode_dp_rank = min(candidates, key=lambda x: x[1])[0]
+                else:
+                    req.decode_dp_rank = self.round_robin_counter
+                    self.round_robin_counter = (self.round_robin_counter + 1) % dp_size
+                if use_pending:
+                    buf[req.decode_dp_rank] += 1
+                # logger.info("Set decode dp rank to %d", req.decode_dp_rank)
+                # logger.info("Special dp attention loads: %s", self.special_dp_attention_loads)
 
     def event_loop(self):
         while True:
