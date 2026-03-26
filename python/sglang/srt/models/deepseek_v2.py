@@ -175,6 +175,8 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 
+import torch.cuda.nvtx as nvtx
+
 if _use_aiter_gfx95:
 
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
@@ -3637,6 +3639,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                     positions=positions,
                 )
             for i in range(layer_start, layer_end):
+                # logger.info(f"prefill layer {i} forward, start={layer_start}, end={layer_end}")
+                layer_gpu_handle = nvtx.range_start(f"{layer_start} : {layer_end} prefill layer {i} launch, start={layer_start}, end={layer_end}")
                 with get_global_expert_distribution_recorder().with_current_layer(i):
                     layer = self.model.layers[i]
                     forward_batch.hidden_states, forward_batch.residual = layer(
@@ -3650,6 +3654,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     )
                     logger.debug(f"causal split prefill, layer {i}, hidden_states: {forward_batch.hidden_states.shape}, residual: {forward_batch.residual.shape if forward_batch.residual is not None else None}")
 
+                nvtx.range_end(layer_gpu_handle)
         if end == self.model.num_hidden_layers and self.pp_group.is_last_rank:
             if forward_batch.residual is None:
                 hidden_states = self.model.norm(forward_batch.hidden_states)

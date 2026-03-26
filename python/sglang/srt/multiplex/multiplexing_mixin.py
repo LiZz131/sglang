@@ -150,9 +150,24 @@ class SchedulerMultiplexMixin:
         decode_stream = stream_group[1]
         torch.cuda.empty_cache()
 
+        # for nvtx profiling, we need to use the range_start and range_end
+        loop_range_handle = None
+        decode_forward_count = 0
+        decode_gpu_handle = None
+        prefill_whole_batch_count = 0
+        prefill_forward_count = 0
+        prefill_gpu_handle = None
+        prefill_launch_handle = None
+
+        def get_sg_msg():
+            return f"stream_group: {stream_idx}, prefill sm: {self.sm_counts[stream_idx][0]}, decode sm: {self.sm_counts[stream_idx][1]}"
+
         logger.debug("Starting event loop for pd multiplexing...")
 
         while True:
+            if loop_range_handle is None:
+                loop_range_handle = nvtx.range_start(get_sg_msg() + "adjust_stream_group")
+
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
                 recv_reqs = self.recv_requests()
@@ -181,7 +196,14 @@ class SchedulerMultiplexMixin:
             if adjust_stream_group:
                 prefill_stream.synchronize()
                 decode_stream.synchronize()
+
+                nvtx.range_end(loop_range_handle)
+                loop_range_handle = None
+
                 stream_idx, stream_group = self.adjust_stream_groups()
+
+                loop_range_handle = nvtx.range_start(get_sg_msg() + "adjust_stream_group")
+
                 prefill_stream = stream_group[0]
                 decode_stream = stream_group[1]
                 adjust_stream_group = False
@@ -193,6 +215,8 @@ class SchedulerMultiplexMixin:
                 set_pdmux_status(False)
                 # process decode batch
                 if self.running_batch and not self.running_batch.is_empty():
+                    decode_gpu_handle = nvtx.range_start("run decode batch" + f": {decode_forward_count}")
+                    decode_forward_count += 1
                     decode_result = self.run_batch(self.running_batch)
                     decode_done = True
                 else:
@@ -223,7 +247,14 @@ class SchedulerMultiplexMixin:
                     )
 
                     self.split_prefill_batch.split_forward_count = forward_count
+                    if prefill_gpu_handle is None:
+                        prefill_gpu_handle = nvtx.range_start("run prefill batch" + f": {prefill_whole_batch_count}")
+                        prefill_whole_batch_count += 1
+                    prefill_launch_handle = nvtx.range_start("launch prefill batch" + f": {prefill_forward_count}")
+                    prefill_forward_count += 1
                     prefill_result = self.run_batch(self.split_prefill_batch)
+                    nvtx.range_end(prefill_launch_handle)
+                    prefill_launch_handle = None
                     if next_split_index == self.model_config.num_hidden_layers:
                         self.split_prefill_batch.split_prefill_finished = True
                         prefill_exe_done = prefill_stream.record_event()
@@ -238,6 +269,8 @@ class SchedulerMultiplexMixin:
                 set_pdmux_status(False)
                 decode_stream.synchronize()
                 if decode_done:
+                    nvtx.range_end(decode_gpu_handle)
+                    decode_gpu_handle = None
                     self.process_batch_result(self.running_batch, decode_result)
 
             with torch.cuda.stream(prefill_stream):
@@ -253,6 +286,8 @@ class SchedulerMultiplexMixin:
 
                     self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
                     if flags.item() == self.tp_size:
+                        nvtx.range_end(prefill_gpu_handle)
+                        prefill_gpu_handle = None
                         self.process_batch_result(
                             self.split_prefill_batch, prefill_result
                         )
@@ -266,7 +301,6 @@ class SchedulerMultiplexMixin:
                         self.split_prefill_batch = None
                         wait_prefill_kernel_done = False
                         adjust_stream_group = True
-                    nvtx.range_pop()
 
     @torch.inference_mode()
     def event_loop_pdmux_for_special_dp_attention(self: Scheduler):
@@ -281,30 +315,40 @@ class SchedulerMultiplexMixin:
         decode_stream = stream_group[1]
         torch.cuda.empty_cache()
 
+        # for nvtx profiling, we need to use the range_start and range_end
+        loop_range_handle = None
+        decode_forward_count = 0
+        decode_gpu_handle = None
+        prefill_whole_batch_count = 0
+        prefill_forward_count = 0
+        prefill_gpu_handle = None
+        prefill_launch_handle = None
+
+        def get_sg_msg():
+            return f"stream_group: {stream_idx}, prefill sm: {self.sm_counts[stream_idx][0]}, decode sm: {self.sm_counts[stream_idx][1]}"
+
         logger.info("Starting event loop for pd multiplexing...")
 
         while True:
+            if loop_range_handle is None:
+                loop_range_handle = nvtx.range_start(get_sg_msg() + "adjust_stream_group")
+
             with torch.cuda.stream(decode_stream):
-                nvtx.range_push("decode_stream:recv_requests")
                 set_pdmux_status(False)
                 recv_reqs = self.recv_requests()
                 if recv_reqs:
                     logger.info(f"in event_loop_pdmux, decode_stream: recv_reqs: {len(recv_reqs)}")
                 self.process_input_requests(recv_reqs)
-                nvtx.range_pop()
-
+                
             with torch.cuda.stream(prefill_stream):
-                nvtx.range_push("prefill_stream:update_split_prefill_batch")
                 set_pdmux_status(True)
                 sm_count = self.sm_counts[stream_idx][0]
                 if not wait_prefill_kernel_done:
                     adjust_stream_group = (
                         self.update_split_prefill_batch(sm_count) or adjust_stream_group
                     )
-                nvtx.range_pop()
-
+                
             with torch.cuda.stream(decode_stream):
-                nvtx.range_push("decode_stream:update_running_batch")
                 set_pdmux_status(False)
                 # TODO(lbz): in update_running_batch, we filter the batch, 
                 if not self.running_batch.is_empty():
@@ -330,24 +374,27 @@ class SchedulerMultiplexMixin:
                     self.check_tree_cache()
                     self.new_token_ratio = self.init_new_token_ratio
                     self.maybe_sleep_on_idle()
-                nvtx.range_pop()
-
+                
             if adjust_stream_group:
-                nvtx.range_push("sync_and_adjust_stream_group")
                 prefill_stream.synchronize()
                 decode_stream.synchronize()
+
+                nvtx.range_end(loop_range_handle)
+                loop_range_handle = None
+
                 # TODO(lbz): we need make all ranks adjust to the same stream group
                 stream_idx, stream_group = self.adjust_stream_groups_for_special_dp_attention()
+
+                loop_range_handle = nvtx.range_start(get_sg_msg() + "adjust_stream_group")
+
                 prefill_stream = stream_group[0]
                 decode_stream = stream_group[1]
                 adjust_stream_group = False
                 # logger.info(
                 #    f"Adjusting stream groups: {stream_idx}, prefill sm: {self.sm_counts[stream_idx][0]}, decode sm: {self.sm_counts[stream_idx][1]}"
                 # )
-                nvtx.range_pop()
 
             with torch.cuda.stream(decode_stream):
-                nvtx.range_push("decode_stream:process_decode_batch")
                 set_pdmux_status(False)
                 # process decode batch
                 if self.decode_or_idle_batch:
@@ -358,15 +405,15 @@ class SchedulerMultiplexMixin:
                     # for req in self.decode_or_idle_batch.reqs:
                     #     # rid, len(fill_ids), len_output_ids, finished()
                     #     logger.info(f"req: {req.rid}, len(fill_ids): {len(req.fill_ids)}, len_output_ids: {len(req.output_ids)}, finished: {req.finished()}")
+                    decode_gpu_handle = nvtx.range_start("run decode batch" + f": {decode_forward_count}")
+                    decode_forward_count += 1
                     decode_result = self.run_batch(self.decode_or_idle_batch)
                     decode_done = True
 
                 else:
                     decode_done = False
-                nvtx.range_pop()
-
+                
             with torch.cuda.stream(prefill_stream):
-                nvtx.range_push("prefill_stream:process_prefill_batch")
                 set_pdmux_status(True)
                 if (
                     self.split_prefill_batch
@@ -392,9 +439,14 @@ class SchedulerMultiplexMixin:
                     )
 
                     self.split_prefill_batch.split_forward_count = forward_count
-                    # TODO(lbz): try to use the synchronize for normal tp in special dp attention
-                    # prefill_stream.synchronize()
+                    if prefill_gpu_handle is None:
+                        prefill_gpu_handle = nvtx.range_start("run prefill batch" + f": {prefill_whole_batch_count}")
+                        prefill_whole_batch_count += 1
+                    prefill_launch_handle = nvtx.range_start("launch prefill batch" + f": {prefill_forward_count}")
+                    prefill_forward_count += 1
                     prefill_result = self.run_batch(self.split_prefill_batch)
+                    nvtx.range_end(prefill_launch_handle)
+                    prefill_launch_handle = None
                     # logger.info(f"after run_prefill_batch, split_prefill_batch: {self.split_prefill_batch.batch_size()}")
                     # logger.info(f"after run_prefill_batch, split_prefill_batch.input_ids: {self.split_prefill_batch.input_ids.shape}")
                     if next_split_index == self.model_config.num_hidden_layers:
@@ -406,18 +458,16 @@ class SchedulerMultiplexMixin:
                     prefill_done = True
                 else:
                     prefill_done = False
-                nvtx.range_pop()
-
+                
             with torch.cuda.stream(decode_stream):
-                nvtx.range_push("decode_stream:process_decode_result")
                 set_pdmux_status(False)
                 decode_stream.synchronize()
                 if decode_done:
+                    nvtx.range_end(decode_gpu_handle)
+                    decode_gpu_handle = None
                     self.process_batch_result(self.decode_or_idle_batch, decode_result)
-                nvtx.range_pop()
-
+                
             with torch.cuda.stream(prefill_stream):
-                nvtx.range_push("prefill_stream:process_prefill_result")
                 set_pdmux_status(True)
                 if prefill_done and self.split_prefill_batch.split_prefill_finished:
                     wait_prefill_kernel_done = True
@@ -430,6 +480,8 @@ class SchedulerMultiplexMixin:
 
                     self.tp_cpu_group.allreduce(flags, dist.ReduceOp.SUM).wait()
                     if flags.item() == self.tp_size:
+                        nvtx.range_end(prefill_gpu_handle)
+                        prefill_gpu_handle = None
                         self.process_batch_result(
                             self.split_prefill_batch, prefill_result
                         )
