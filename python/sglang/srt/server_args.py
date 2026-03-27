@@ -641,10 +641,6 @@ class ServerArgs:
     enable_special_dp_attention: bool = False
     enable_save_kv_cache_for_dp: bool = False
     enable_special_dp_attention_prefix_0: bool = False
-    warmup_for_special_dp_attention: bool = False
-    special_dp_warmup_bs_list: Optional[List[int]] = None
-    special_dp_warmup_context_list: Optional[List[int]] = None
-    special_dp_warmup_max_new_tokens: int = 1
     auto_adjust_stream_group: bool = True
     manual_stream_group_idx: int = 0
 
