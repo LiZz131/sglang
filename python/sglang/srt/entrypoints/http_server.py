@@ -44,6 +44,7 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 import numpy as np
 import orjson
 import requests
+import torch.cuda.nvtx as nvtx
 import uvicorn
 import uvloop
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
@@ -158,6 +159,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # Global constants
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
+REQUEST_NVTX_HEADER = "X-SGLANG-NVTX-RANGE"
 
 
 # Store global states
@@ -187,6 +189,27 @@ def set_global_state(global_state: _GlobalState):
 
 def get_global_state() -> _GlobalState:
     return _global_state
+
+
+def _start_request_nvtx_range(request: Request) -> Optional[object]:
+    """Start an NVTX range when requested by HTTP header."""
+    range_name = request.headers.get(REQUEST_NVTX_HEADER)
+    if not range_name:
+        return None
+    try:
+        return nvtx.range_start(f"http_request:{range_name}")
+    except Exception as e:
+        logger.warning(f"Failed to start NVTX range for request: {e}")
+        return None
+
+
+def _end_request_nvtx_range(handle: Optional[object]):
+    if handle is None:
+        return
+    try:
+        nvtx.range_end(handle)
+    except Exception as e:
+        logger.warning(f"Failed to end NVTX range for request: {e}")
 
 
 async def init_multi_tokenizer() -> ServerArgs:
@@ -616,6 +639,7 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    request_nvtx_handle = _start_request_nvtx_range(request)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -632,6 +656,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 yield b"data: " + orjson.dumps(
                     out, option=orjson.OPT_NON_STR_KEYS
                 ) + b"\n\n"
+            finally:
+                _end_request_nvtx_range(request_nvtx_handle)
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -648,6 +674,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+        finally:
+            _end_request_nvtx_range(request_nvtx_handle)
 
 
 @app.api_route("/generate_from_file", methods=["POST"])
