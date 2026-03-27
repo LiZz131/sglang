@@ -2540,6 +2540,8 @@ class Scheduler(
                 "pp_max_micro_batch_size",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
+                "auto_adjust_stream_group",
+                "manual_stream_group_idx",
             ]
         )
 
@@ -2554,6 +2556,14 @@ class Scheduler(
             ):
                 logging.warning(
                     f"Updating {k} to {v} is rejected because it is out of the valid range [1, {self.max_running_requests // self.pp_size}]."
+                )
+                if_success = False
+                break
+            elif k == "manual_stream_group_idx" and (
+                v < 0 or v >= getattr(self, "real_sm_group_num", 1)
+            ):
+                logging.warning(
+                    f"Updating {k} to {v} is rejected because it is out of the valid range [0, {max(getattr(self, 'real_sm_group_num', 1) - 1, 0)}]."
                 )
                 if_success = False
                 break

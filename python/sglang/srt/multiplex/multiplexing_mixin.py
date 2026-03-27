@@ -93,6 +93,13 @@ class SchedulerMultiplexMixin:
     def adjust_stream_groups_for_special_dp_attention(
         self: Scheduler,
     ) -> tuple[int, tuple[ExternalStream, ExternalStream]]:
+        if not getattr(self.server_args, "auto_adjust_stream_group", True):
+            stream_idx = int(getattr(self.server_args, "manual_stream_group_idx", 0))
+            stream_idx = max(0, min(stream_idx, self.real_sm_group_num - 1))
+            set_current_stream_idx(stream_idx)
+            self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
+            return stream_idx, self.stream_groups[stream_idx]
+
         # use the max decode bs to adjust the stream group
         max_decode_bs = max(self.decode_or_idle_batch.global_num_tokens) if self.decode_or_idle_batch is not None else 0
         if not max_decode_bs == 0 and self.split_prefill_batch:

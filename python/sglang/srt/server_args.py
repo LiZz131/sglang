@@ -641,6 +641,12 @@ class ServerArgs:
     enable_special_dp_attention: bool = False
     enable_save_kv_cache_for_dp: bool = False
     enable_special_dp_attention_prefix_0: bool = False
+    warmup_for_special_dp_attention: bool = False
+    special_dp_warmup_bs_list: Optional[List[int]] = None
+    special_dp_warmup_context_list: Optional[List[int]] = None
+    special_dp_warmup_max_new_tokens: int = 1
+    auto_adjust_stream_group: bool = True
+    manual_stream_group_idx: int = 0
 
     # For Multi-Modal
     mm_max_concurrent_calls: int = 32
@@ -4586,6 +4592,22 @@ class ServerArgs:
             "--enable-special-dp-attention-prefix-0",
             action="store_true",
             help="Enable setting prefix=0 for special dp attention.",
+        )
+        parser.add_argument(
+            "--auto-adjust-stream-group",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.auto_adjust_stream_group,
+            help=(
+                "Whether to auto-adjust stream_group according to runtime load. "
+                "Disable it to pin a fixed stream_group via --manual-stream-group-idx "
+                "or /set_internal_state."
+            ),
+        )
+        parser.add_argument(
+            "--manual-stream-group-idx",
+            type=int,
+            default=ServerArgs.manual_stream_group_idx,
+            help="Fixed stream_group index when auto_adjust_stream_group is disabled.",
         )
 
         # Configuration file support
