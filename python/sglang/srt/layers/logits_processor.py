@@ -22,6 +22,7 @@ import triton
 import triton.language as tl
 from torch import nn
 
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -35,6 +36,7 @@ from sglang.srt.layers.dp_attention import (
     dp_scatter,
     get_attention_dp_rank,
     get_attention_dp_size,
+    get_attention_tp_rank,
     get_attention_tp_size,
     get_dp_device,
     get_dp_dtype,
@@ -48,7 +50,10 @@ from sglang.srt.layers.utils.logprob import (
     get_top_logprobs_chunk,
     get_top_logprobs_prefill,
 )
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+    get_dp_attn_normal_tp_gather_reorder_index,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -384,6 +389,7 @@ class LogitsProcessor(nn.Module):
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
         aux_hidden_states: Optional[torch.Tensor] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
+        special_dp_attention: bool = False,
     ) -> LogitsProcessorOutput:
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
@@ -525,7 +531,7 @@ class LogitsProcessor(nn.Module):
             )
 
         full_logits = (
-            self._get_logits(hidden_states, lm_head, logits_metadata)
+            self._get_logits(hidden_states, lm_head, logits_metadata, special_dp_attention=special_dp_attention)
             if self.return_full_logits
             else None
         )
@@ -574,7 +580,7 @@ class LogitsProcessor(nn.Module):
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            logits = self._get_logits(pruned_states, lm_head, logits_metadata, special_dp_attention=special_dp_attention)
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -848,6 +854,7 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
+        special_dp_attention: bool = False,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -855,7 +862,7 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
-        if self.do_tensor_parallel_all_gather_dp_attn:
+        if self.do_tensor_parallel_all_gather_dp_attn and not special_dp_attention:
             logits_metadata.compute_dp_attention_metadata()
             hidden_states, local_hidden_states = (
                 logits_metadata.gathered_buffer,
@@ -867,25 +874,32 @@ class LogitsProcessor(nn.Module):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
         elif hasattr(lm_head, "weight"):
+            if special_dp_attention:
+                # TODO(lbz): just for shape, is not right, need to be modified
+                # weight = lm_head.weight.tensor_split(get_attention_dp_size(), dim=0)[get_attention_dp_rank()]
+                weight = lm_head.weight
+            else:
+                weight = lm_head.weight
+            logger.debug(f"in get_logits, special_dp_attention: {special_dp_attention}, weight shape: {weight.shape}")
             if self.use_fp32_lm_head:
                 logits = torch.matmul(
-                    hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
+                    hidden_states.to(torch.float32), weight.to(torch.float32).T
                 )
             elif use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
-                    lm_head.weight,
+                    weight,
                     None,  # bias
                     True,  # is_vnni
                 )
             elif get_global_server_args().rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
                 logits = torch.matmul(
-                    hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
+                    hidden_states.bfloat16(), weight.T.bfloat16()
                 )
             else:
                 logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                    hidden_states.to(weight.dtype), weight.T
                 )
         else:
             # GGUF models
@@ -903,8 +917,11 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        # 这里是一个影响通信的地方, matmul 之后, 需要进行 all-gather,
+        # 若开启 dp-attn 且用 normal-tp 二次划分 (full_tp_size > attn_tp_size),
+        # 需对 full TP 做 all-gather 再按 vocab 顺序重排.
         if self.do_tensor_parallel_all_gather:
-            if self.use_attn_tp_group:
+            if self.use_attn_tp_group and not special_dp_attention:
                 if self.config.vocab_size % self.attn_tp_size == 0:
                     global_logits = torch.empty(
                         (
@@ -931,10 +948,23 @@ class LogitsProcessor(nn.Module):
                         logits,
                     )
                 logits = global_logits
+            elif special_dp_attention:
+                logits = tensor_model_parallel_all_gather(logits)
+                logger.debug(f"in get_logits, special_dp_attention is True, do all-gather, logits shape: {logits.shape}")
+                # TODO(lbz): reorder logits, ensure the correct order
+                # reorder_index = get_dp_attn_normal_tp_gather_reorder_index(
+                #     self.config.vocab_size,
+                #     get_tensor_model_parallel_world_size(),
+                #     get_attention_dp_size(),
+                #     logits.device,
+                # )
+                # logger.debug(f"in get_logits, special_dp_attention is True, reorder_index is: {reorder_index}")
+                # logits = logits[:, reorder_index]
+                logger.debug(f"in get_logits, special_dp_attention is True, logits shape after reorder: {logits.shape}")
             else:
                 logits = tensor_model_parallel_all_gather(logits)
 
-        if self.do_tensor_parallel_all_gather_dp_attn:
+        if self.do_tensor_parallel_all_gather_dp_attn and not special_dp_attention:
             logits, global_logits = (
                 torch.empty(
                     (local_hidden_states.shape[0], logits.shape[1]),
