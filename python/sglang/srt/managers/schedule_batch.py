@@ -1229,6 +1229,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    # Per-DP sum(seq_lens_cpu) after MLP sync (special_dp_attention); length dp_size
+    global_seq_lens_sum_per_dp: Optional[List[int]] = None
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
@@ -1330,6 +1332,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         dp_rank: Optional[int] = None,
     ):
         # TODO(lbz): if enable_special_dp_attention, we need to sort reqs here by decode_dp_rank, from low to high
+        # need test the stability of the sort
         if get_global_server_args().enable_special_dp_attention:
             reqs = sorted(reqs, key=lambda x: x.decode_dp_rank if x.decode_dp_rank is not None else 0, reverse=False)
             for i, req in enumerate(reqs):
@@ -1450,7 +1453,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
-
         if self.is_dllm():
             # For DLLM, we use a separate forward mode
             self.forward_mode = ForwardMode.DLLM_EXTEND
@@ -2270,6 +2272,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_ids_logprobs=self.token_ids_logprobs,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            global_seq_lens_sum_per_dp=self.global_seq_lens_sum_per_dp,
             is_extend_in_batch=self.is_extend_in_batch,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             tbo_split_seq_index=self.tbo_split_seq_index,
@@ -2380,6 +2383,7 @@ class ModelWorkerBatch:
     # For DP attention
     global_num_tokens: Optional[List[int]]
     global_num_tokens_for_logprob: Optional[List[int]]
+    global_seq_lens_sum_per_dp: Optional[List[int]]
     is_extend_in_batch: bool
     can_run_dp_cuda_graph: bool
     tbo_split_seq_index: Optional[int]

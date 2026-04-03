@@ -361,6 +361,8 @@ class ForwardBatch:
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    # Per-DP sum(seq_lens_cpu) when special_dp_attention (length dp_size)
+    global_seq_lens_sum_per_dp: Optional[List[int]] = None
     # The padding mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for extend, local start pos and num tokens is different in logits processor
@@ -488,6 +490,9 @@ class ForwardBatch:
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob, dtype=torch.int64
             ).to(device, non_blocking=True)
+
+        if batch.global_seq_lens_sum_per_dp is not None:
+            ret.global_seq_lens_sum_per_dp = list(batch.global_seq_lens_sum_per_dp)
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)

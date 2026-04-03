@@ -35,6 +35,8 @@ class MLPSyncBatchInfo:
     tp0_info: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    # Per-DP sum(seq_lens_cpu) when enable_special_dp_attention (length dp_size)
+    global_seq_lens_sum_per_dp: Optional[list[int]] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -76,6 +78,31 @@ class MLPSyncBatchInfo:
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
+    def all_gather_seq_lens_sum(
+        self,
+        local_seq_lens_sum: int,
+        device,
+        group: torch.distributed.ProcessGroup,
+    ):
+        """Gather sum(seq_lens_cpu) from each rank; take TP=0 slice -> one int per DP rank."""
+        local_t = torch.tensor(
+            [local_seq_lens_sum], device=device, dtype=torch.int64
+        )
+        n_ranks = self.dp_size * self.tp_size
+        global_t = torch.empty(n_ranks, dtype=torch.int64, device=device)
+        torch.distributed.all_gather_into_tensor(global_t, local_t, group=group)
+        global_t = global_t.view(self.dp_size, self.tp_size)
+        self.global_seq_lens_sum_per_dp = global_t[:, 0].tolist()
+
+
+def _local_seq_lens_sum_for_mlp_sync(local_batch: Optional[ScheduleBatch]) -> int:
+    if local_batch is None or local_batch.forward_mode.is_prebuilt():
+        return 0
+    slc = local_batch.seq_lens_cpu
+    if slc is None or slc.numel() == 0:
+        return 0
+    return int(slc.sum().item())
+
 
 def _update_gather_batch(
     batch: ScheduleBatch,
@@ -100,6 +127,8 @@ def _update_gather_batch(
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
 
+    batch.global_seq_lens_sum_per_dp = mlp_sync_info.global_seq_lens_sum_per_dp
+
 
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
@@ -111,6 +140,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    enable_special_dp_attention: bool = False,
 ):
     # Check if other DP workers have running batches
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
@@ -155,6 +185,8 @@ def prepare_mlp_sync_batch_raw(
 
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
 
+    local_seq_lens_sum = _local_seq_lens_sum_for_mlp_sync(local_batch)
+
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
         tp_size=attn_tp_size,
@@ -168,6 +200,9 @@ def prepare_mlp_sync_batch_raw(
 
     if not skip_all_gather:
         mlp_sync_info.all_gather(device=device, group=group)
+
+        if enable_special_dp_attention:
+            mlp_sync_info.all_gather_seq_lens_sum(local_seq_lens_sum, device, group)
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -205,6 +240,7 @@ class SchedulerDPAttnMixin:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            enable_special_dp_attention=self.server_args.enable_special_dp_attention,
         )
 
     def maybe_prepare_mlp_sync_batch_and_log_stats(
