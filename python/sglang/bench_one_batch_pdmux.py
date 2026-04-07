@@ -432,6 +432,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner: ModelRunne
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
             disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
             offload_tags=set(),
+            enable_special_dp_attention=model_runner.server_args.enable_special_dp_attention,
         )
 
 
@@ -551,10 +552,18 @@ def timed_extend(
 def timed_decode(
     input_token_ids, batch, model_runner, stream: torch.cuda.Stream
 ):
-    """Decode with timing.  Returns (next_token_ids, timing_dict)."""
+    """Decode with timing.
+
+    batch_info 必须在 prepare_for_decode + prepare_mlp_sync 之后采集，与本次 forward 一致；
+    若在循环里先于 timed_decode 调用 _batch_info_str_decode，第一步仍是 extend 态，
+    seq_lens 为整段 prefill 长度，global_num_tokens 为 extend 填充（如 [128,128]），
+    而非 decode 步的 [1,1]。
+    """
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
+    decode_batch_info = _batch_info_str_decode(batch)
+
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     _log_special_dp_extend(batch, forward_batch, "timed_decode")
@@ -582,7 +591,7 @@ def timed_decode(
         "decode_launch_ms": cpu_launch_ms,
         "decode_run_ms": gpu_time_ms,
     }
-    return next_token_ids, timing
+    return next_token_ids, timing, decode_batch_info
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +618,11 @@ def _batch_info_str_decode(batch: ScheduleBatch) -> str:
         global_str = "[" + ",".join(str(int(x)) for x in gnt) + "]"
     else:
         global_str = "[]"
+
+    gsspd = getattr(batch, "global_seq_lens_sum_per_dp", None)
+    if gsspd is not None and len(gsspd) > 0:
+        gsspd_str = "[" + ",".join(str(int(x)) for x in gsspd) + "]"
+        return f"{local_str}|{global_str}|{gsspd_str}"
     return f"{local_str}|{global_str}"
 
 
@@ -703,9 +717,7 @@ def bench_one_config(
         if stage in ("decode", "both"):
             assert next_token_ids is not None and batch is not None
             for d_step in range(output_len):
-                decode_batch_info = _batch_info_str_decode(batch)
-
-                next_token_ids, decode_timing = timed_decode(
+                next_token_ids, decode_timing, decode_batch_info = timed_decode(
                     next_token_ids, batch, model_runner, decode_stream
                 )
 
