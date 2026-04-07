@@ -59,6 +59,7 @@ from itertools import chain
 import logging
 import multiprocessing
 import os
+import re
 import time
 from types import SimpleNamespace
 from typing import Literal, Optional, Tuple
@@ -255,6 +256,17 @@ class PdmuxBenchArgs:
     stage: str = "both"  # prefill / decode / both
     # 打印 special-dp / dp_local / out_cache_loc 等（便于对照 deepseek_v2 断言）
     debug_batch: bool = False
+    # --- randomness ---
+    random_seed: int = 0
+    # intra-batch prompt length randomness (per-request origin_input_ids length)
+    input_len_mode: str = "fixed"  # fixed / uniform / loguniform / zipf
+    input_len_min: int = 0  # 0 => use base input_len
+    input_len_max: int = 0  # 0 => use base input_len
+    zipf_s: float = 1.2
+    # cross-DP randomness via decode_dp_rank assignment (only meaningful for special DP attention)
+    dp_assign_mode: str = "uniform"  # uniform / counts
+    dp_counts: str = ""  # e.g. "5,9" for dp_size=2, sum must equal batch_size
+    dp_len_multipliers: str = ""  # optional per-dp multiplier, e.g. "1.0,1.3"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -306,6 +318,64 @@ class PdmuxBenchArgs:
             "--debug-batch",
             action="store_true",
             help="Log ScheduleBatch/ForwardBatch dp_local 与 out_cache_loc 等字段（排查 special-dp）",
+        )
+        parser.add_argument(
+            "--bench-random-seed",
+            type=int,
+            dest="random_seed",
+            default=PdmuxBenchArgs.random_seed,
+            help="Random seed for synthetic batch generation.",
+        )
+        parser.add_argument(
+            "--bench-input-len-mode",
+            type=str,
+            dest="input_len_mode",
+            default=PdmuxBenchArgs.input_len_mode,
+            choices=["fixed", "uniform", "loguniform", "zipf"],
+            help="Randomize per-request prompt length inside a batch.",
+        )
+        parser.add_argument(
+            "--bench-input-len-min",
+            type=int,
+            dest="input_len_min",
+            default=PdmuxBenchArgs.input_len_min,
+            help="Min prompt length for randomization (0 => use base --input-len).",
+        )
+        parser.add_argument(
+            "--bench-input-len-max",
+            type=int,
+            dest="input_len_max",
+            default=PdmuxBenchArgs.input_len_max,
+            help="Max prompt length for randomization (0 => use base --input-len).",
+        )
+        parser.add_argument(
+            "--bench-zipf-s",
+            type=float,
+            dest="zipf_s",
+            default=PdmuxBenchArgs.zipf_s,
+            help="Zipf exponent (only used when --input-len-mode=zipf).",
+        )
+        parser.add_argument(
+            "--bench-dp-assign-mode",
+            type=str,
+            dest="dp_assign_mode",
+            default=PdmuxBenchArgs.dp_assign_mode,
+            choices=["uniform", "counts"],
+            help="How to assign decode_dp_rank for requests (special DP attention).",
+        )
+        parser.add_argument(
+            "--bench-dp-counts",
+            type=str,
+            dest="dp_counts",
+            default=PdmuxBenchArgs.dp_counts,
+            help='Per-DP request counts, e.g. \"5,9\" (sum must equal batch_size). Used when --dp-assign-mode=counts.',
+        )
+        parser.add_argument(
+            "--bench-dp-len-multipliers",
+            type=str,
+            dest="dp_len_multipliers",
+            default=PdmuxBenchArgs.dp_len_multipliers,
+            help='Optional per-DP prompt length multipliers, e.g. \"1.0,1.3\" (len==dp_size).',
         )
 
     @classmethod
@@ -383,33 +453,178 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
 # ---------------------------------------------------------------------------
 
 
-def prepare_synthetic_reqs(batch_size: int, input_len: int):
-    input_ids = np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
-    sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
-    reqs = []
-    dp_sz = get_attention_dp_size()
-    for i in range(batch_size):
-        # decode_dp_rank：该 req 在 decode 阶段由哪个 DP rank 负责（与两端存储一致）。
-        # bs==1 时若固定为 0，则在 attn_dp_rank!=0 的进程上无 dp_local，会触发 dp_local_token_* 与 out_cache_loc 不一致。
-        if dp_sz > 0:
-            if batch_size == 1:
-                assigned_dp = get_attention_dp_rank()
-            else:
-                assigned_dp = i % dp_sz
+def _parse_int_list(s: str) -> list[int]:
+    if not s:
+        return []
+    return [int(x) for x in re.split(r"\s*,\s*", s.strip()) if x != ""]
+
+
+def _parse_float_list(s: str) -> list[float]:
+    if not s:
+        return []
+    return [float(x) for x in re.split(r"\s*,\s*", s.strip()) if x != ""]
+
+
+def _assign_decode_dp_ranks(
+    rng: np.random.Generator,
+    *,
+    batch_size: int,
+    dp_size: int,
+    mode: str,
+    dp_counts: str,
+) -> list[int]:
+    if dp_size <= 1:
+        return [0 for _ in range(batch_size)]
+    if mode == "uniform":
+        ranks = rng.integers(0, dp_size, size=batch_size, dtype=np.int32).tolist()
+        # Avoid empty dp_local on any rank. In special-dp + save-kv-cache, an empty dp_local
+        # will break the prefill path (out_cache_loc is local-only). We still allow asymmetry.
+        if batch_size >= dp_size:
+            for r in range(dp_size):
+                if r not in ranks:
+                    # Overwrite an entry (deterministic but random index) to ensure coverage.
+                    idx = int(rng.integers(0, batch_size))
+                    ranks[idx] = r
+        return ranks
+    if mode == "counts":
+        counts = _parse_int_list(dp_counts)
+        if len(counts) != dp_size:
+            raise ValueError(f"--dp-counts must have len==dp_size ({dp_size}), got {counts}")
+        if sum(counts) != batch_size:
+            raise ValueError(f"--dp-counts sum must equal batch_size ({batch_size}), got {counts}")
+        if batch_size >= dp_size and any(c <= 0 for c in counts):
+            raise ValueError(
+                f"--dp-counts must be positive for each dp when batch_size>=dp_size; got {counts}"
+            )
+        ranks: list[int] = []
+        for r, c in enumerate(counts):
+            ranks.extend([r] * c)
+        rng.shuffle(ranks)
+        return ranks
+    raise ValueError(f"Unknown --dp-assign-mode: {mode}")
+
+
+def _sample_prompt_lens(
+    rng: np.random.Generator,
+    *,
+    batch_size: int,
+    base_input_len: int,
+    mode: str,
+    len_min: int,
+    len_max: int,
+    zipf_s: float,
+    dp_ranks: list[int],
+    dp_len_multipliers: list[float],
+) -> list[int]:
+    lo = len_min if len_min > 0 else base_input_len
+    hi = len_max if len_max > 0 else base_input_len
+    if lo <= 0 or hi <= 0:
+        raise ValueError(f"Invalid input length bounds: lo={lo}, hi={hi}")
+    if lo > hi:
+        raise ValueError(f"Invalid input length bounds: lo={lo} > hi={hi}")
+
+    if mode == "fixed":
+        lens = [base_input_len for _ in range(batch_size)]
+    elif mode == "uniform":
+        lens = rng.integers(lo, hi + 1, size=batch_size, dtype=np.int32).tolist()
+    elif mode == "loguniform":
+        if lo == hi:
+            lens = [lo for _ in range(batch_size)]
         else:
-            assigned_dp = 0
+            u = rng.uniform(np.log(lo), np.log(hi + 1e-9), size=batch_size)
+            lens = np.clip(np.exp(u).astype(np.int32), lo, hi).tolist()
+    elif mode == "zipf":
+        if lo == hi:
+            lens = [lo for _ in range(batch_size)]
+        else:
+            span = hi - lo + 1
+            z = rng.zipf(zipf_s, size=batch_size).astype(np.int64)
+            lens = (lo + (z % span)).astype(np.int32).tolist()
+    else:
+        raise ValueError(f"Unknown --input-len-mode: {mode}")
+
+    if dp_len_multipliers:
+        for i in range(batch_size):
+            r = int(dp_ranks[i])
+            if 0 <= r < len(dp_len_multipliers):
+                lens[i] = int(max(1, round(lens[i] * float(dp_len_multipliers[r]))))
+    return lens
+
+
+def prepare_synthetic_reqs(
+    *,
+    batch_size: int,
+    base_input_len: int,
+    bench_args: PdmuxBenchArgs,
+    model_runner: ModelRunner,
+    rng: np.random.Generator,
+) -> tuple[list[Req], dict]:
+    """Return (reqs, meta). Meta contains the realized randomness for modeling."""
+    sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
+
+    dp_size = get_attention_dp_size()
+    enable_special = bool(model_runner.server_args.enable_special_dp_attention)
+
+    if enable_special and dp_size > 0:
+        dp_ranks = _assign_decode_dp_ranks(
+            rng,
+            batch_size=batch_size,
+            dp_size=dp_size,
+            mode=bench_args.dp_assign_mode,
+            dp_counts=bench_args.dp_counts,
+        )
+        # bs==1 时若固定为 0，则在 attn_dp_rank!=0 的进程上无 dp_local；因此 bs==1 强制落本 rank
+        if batch_size == 1:
+            dp_ranks = [get_attention_dp_rank()]
+    else:
+        dp_size = max(int(model_runner.server_args.dp_size), 1)
+        dp_ranks = [0 for _ in range(batch_size)]
+
+    dp_len_multipliers = _parse_float_list(bench_args.dp_len_multipliers)
+    if dp_len_multipliers and len(dp_len_multipliers) != dp_size:
+        raise ValueError(
+            f"--dp-len-multipliers must have len==dp_size ({dp_size}), got {dp_len_multipliers}"
+        )
+
+    prompt_lens = _sample_prompt_lens(
+        rng,
+        batch_size=batch_size,
+        base_input_len=base_input_len,
+        mode=bench_args.input_len_mode,
+        len_min=bench_args.input_len_min,
+        len_max=bench_args.input_len_max,
+        zipf_s=bench_args.zipf_s,
+        dp_ranks=dp_ranks,
+        dp_len_multipliers=dp_len_multipliers,
+    )
+
+    reqs: list[Req] = []
+    for i in range(batch_size):
+        ilen = int(prompt_lens[i])
+        toks = rng.integers(0, 10000, size=ilen, dtype=np.int32).tolist()
         req = Req(
             rid=i,
             origin_input_text="",
-            origin_input_ids=list(input_ids[i]),
+            origin_input_ids=toks,
             sampling_params=sampling_params,
-            decode_dp_rank=assigned_dp,
+            decode_dp_rank=int(dp_ranks[i]) if enable_special else None,
         )
         req.fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
         reqs.append(req)
-    return reqs
+
+    sums = [0 for _ in range(max(dp_size, 1))]
+    for l, r in zip(prompt_lens, dp_ranks):
+        sums[int(r)] += int(l)
+
+    meta = {
+        "req_prompt_lens": prompt_lens,
+        "decode_dp_ranks": dp_ranks,
+        "prompt_len_sum_per_dp": sums,
+        "max_prompt_len_sum_per_dp": max(sums) if sums else 0,
+    }
+    return reqs, meta
 
 
 def _make_dummy_tree_cache(model_runner):
@@ -420,6 +635,23 @@ def _make_dummy_tree_cache(model_runner):
     )
 
 
+def _make_idle_batch(model_runner: ModelRunner) -> ScheduleBatch:
+    """Mirror SchedulerDPAttnMixin.get_idle_batch() for bench usage."""
+    tree_cache = _make_dummy_tree_cache(model_runner)
+    idle_batch = ScheduleBatch.init_new(
+        [],
+        model_runner.req_to_token_pool,
+        model_runner.token_to_kv_pool_allocator,
+        tree_cache,
+        model_runner.model_config,
+        enable_overlap=False,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        dp_rank=dp_rank_for_schedule_batch(model_runner),
+    )
+    idle_batch.prepare_for_idle()
+    return idle_batch
+
+
 def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner: ModelRunner):
     if require_mlp_sync(model_runner.server_args):
         prepare_mlp_sync_batch_raw(
@@ -427,7 +659,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner: ModelRunne
             dp_size=model_runner.server_args.dp_size,
             attn_tp_size=1,
             tp_group=model_runner.tp_group,
-            get_idle_batch=None,
+            get_idle_batch=lambda: _make_idle_batch(model_runner),
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
             disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
@@ -516,7 +748,17 @@ def timed_extend(
         dp_rank=dp_rank_for_schedule_batch(model_runner),
     )
     batch.prepare_for_extend()
-    narrow_schedule_batch_to_dp_local_prefill(batch, model_runner)
+    sa = model_runner.server_args
+    # special-dp + save-kv: this rank may have 0 dp_local reqs. In that case we must NOT run
+    # the extend forward (no KV allocated); instead run an IDLE batch to participate in MLP sync.
+    if (
+        sa.enable_save_kv_cache_for_dp
+        and sa.enable_special_dp_attention
+        and (batch.dp_local_reqs is None or len(batch.dp_local_reqs) == 0)
+    ):
+        batch = _make_idle_batch(model_runner)
+    else:
+        narrow_schedule_batch_to_dp_local_prefill(batch, model_runner)
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
@@ -539,7 +781,10 @@ def timed_extend(
     gpu_time_ms = start_event.elapsed_time(end_event)
     cpu_launch_ms = (cpu_end - cpu_start) * 1000.0
 
-    next_token_ids = model_runner.sample(logits_output, forward_batch)
+    if batch.batch_size() > 0:
+        next_token_ids = model_runner.sample(logits_output, forward_batch)
+    else:
+        next_token_ids = torch.empty(0, dtype=torch.int64, device=model_runner.device)
 
     timing = {
         "prefill_launch_ms": cpu_launch_ms,
@@ -559,6 +804,31 @@ def timed_decode(
     seq_lens 为整段 prefill 长度，global_num_tokens 为 extend 填充（如 [128,128]），
     而非 decode 步的 [1,1]。
     """
+    # special-dp: this rank may be idle (0 local req). In that case, run an IDLE batch to
+    # participate in MLP sync rather than prepare_for_decode().
+    if batch is None or batch.batch_size() == 0:
+        idle = _make_idle_batch(model_runner)
+        _maybe_prepare_mlp_sync_batch(idle, model_runner)
+        decode_batch_info = _batch_info_str_decode(idle)
+        model_worker_batch = idle.get_model_worker_batch()
+        forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+        _log_special_dp_extend(idle, forward_batch, "timed_decode_idle")
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(stream):
+            start_event.record(stream)
+            cpu_start = time.perf_counter()
+            _ = model_runner.forward(forward_batch).logits_output
+            cpu_end = time.perf_counter()
+            end_event.record(stream)
+        stream.synchronize()
+        timing = {
+            "decode_launch_ms": (cpu_end - cpu_start) * 1000.0,
+            "decode_run_ms": start_event.elapsed_time(end_event),
+        }
+        next_token_ids = torch.empty(0, dtype=torch.int64, device=model_runner.device)
+        return next_token_ids, timing, decode_batch_info
+
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
@@ -640,6 +910,8 @@ def bench_one_config(
     stream_group_idx: int,
     warmup_steps: int,
     bench_steps: int,
+    bench_args: PdmuxBenchArgs,
+    rng: np.random.Generator,
     tp_rank: int,
     stage: Literal["prefill", "decode", "both"],
 ):
@@ -690,7 +962,13 @@ def bench_one_config(
         next_token_ids = None
         batch = None
 
-        reqs = prepare_synthetic_reqs(batch_size, input_len)
+        reqs, synth_meta = prepare_synthetic_reqs(
+            batch_size=batch_size,
+            base_input_len=input_len,
+            bench_args=bench_args,
+            model_runner=model_runner,
+            rng=rng,
+        )
         prefill_batch_info = _batch_info_str_prefill(reqs)
 
         if stage in ("prefill", "both"):
@@ -702,6 +980,7 @@ def bench_one_config(
                     "batch_info": prefill_batch_info,
                     "batch_size": batch_size,
                     "input_len": input_len,
+                    **synth_meta,
                     **prefill_timing,
                 }
                 prefill_records.append(rec)
@@ -726,6 +1005,7 @@ def bench_one_config(
                         "batch_info": decode_batch_info,
                         "batch_size": batch_size,
                         "decode_step": d_step,
+                        **synth_meta,
                         **decode_timing,
                     }
                     decode_records.append(rec)
@@ -798,6 +1078,10 @@ def bench_pdmux(
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
+    # RNG: deterministic and rank-stable
+    seed = int(bench_args.random_seed)
+    rng = np.random.default_rng(seed + 1000 * tp_rank)
+
     # 1) Initialize green context streams BEFORE loading model
     pdmux_config = setup_pdmux_streams(gpu_id, server_args, bench_args)
     rank_print(
@@ -818,8 +1102,12 @@ def bench_pdmux(
     set_current_stream_idx(bench_args.stream_group_idx)
     model_runner.update_decode_attn_backend(bench_args.stream_group_idx)
     sg = get_stream_groups()[bench_args.stream_group_idx]
-    warm_reqs = prepare_synthetic_reqs(
-        bench_args.batch_size[0], bench_args.input_len[0]
+    warm_reqs, _ = prepare_synthetic_reqs(
+        batch_size=bench_args.batch_size[0],
+        base_input_len=bench_args.input_len[0],
+        bench_args=bench_args,
+        model_runner=model_runner,
+        rng=rng,
     )
     next_ids, batch = _extend_once(warm_reqs, model_runner, sg[0])
     for _ in range(min(4, bench_args.output_len[0])):
@@ -847,6 +1135,8 @@ def bench_pdmux(
             stream_group_idx=bench_args.stream_group_idx,
             warmup_steps=bench_args.warmup_steps,
             bench_steps=bench_args.bench_steps,
+            bench_args=bench_args,
+            rng=rng,
             tp_rank=tp_rank,
             stage=stage,  # type: ignore[arg-type]
         )
