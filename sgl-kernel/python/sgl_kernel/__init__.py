@@ -142,6 +142,12 @@ def create_greenctx_stream_by_value(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
+def create_greenctx_streams_by_value_enhanced(*args, **kwargs):
+    from sgl_kernel.spatial import create_greenctx_streams_by_value_enhanced as _impl
+
+    return _impl(*args, **kwargs)
+
+
 def get_sm_available(*args, **kwargs):
     from sgl_kernel.spatial import get_sm_available as _impl
 

@@ -24,6 +24,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("create_greenctx_stream_by_value(int smA, int smB, int device) -> int[]");
   m.impl("create_greenctx_stream_by_value", &create_greenctx_stream_by_value);
+  m.def(
+      "create_greenctx_streams_by_value_enhanced(int smA, int smB, int n_streams_a, int n_streams_b, int device) -> "
+      "int[]");
+  m.impl("create_greenctx_streams_by_value_enhanced", &create_greenctx_streams_by_value_enhanced);
 }
 
 REGISTER_EXTENSION(spatial_ops)

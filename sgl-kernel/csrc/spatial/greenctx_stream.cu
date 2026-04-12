@@ -16,21 +16,37 @@ auto probe_cuGreenCtxStreamCreate() -> PFN_cuGreenCtxStreamCreate {
   return pfn;
 }
 
-static std::vector<int64_t> create_greenctx_stream_fallback(CUgreenCtx gctx[2]) {
-  CUstream streamA, streamB;
+static std::vector<int64_t> create_streams_fallback_one_green(CUgreenCtx gctx, int64_t n_streams) {
   CUcontext ctx;
-
-  CUDA_DRV(cuCtxFromGreenCtx(&ctx, gctx[0]));
+  CUDA_DRV(cuCtxFromGreenCtx(&ctx, gctx));
   CUDA_DRV(cuCtxPushCurrent(ctx));
-  CUDA_DRV(cuStreamCreate(&streamA, CU_STREAM_NON_BLOCKING));
+  std::vector<int64_t> out;
+  out.reserve(static_cast<size_t>(n_streams));
+  for (int64_t i = 0; i < n_streams; ++i) {
+    CUstream stream{};
+    CUDA_DRV(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+    out.push_back(static_cast<int64_t>(reinterpret_cast<uintptr_t>(stream)));
+  }
   CUDA_DRV(cuCtxPopCurrent(nullptr));
+  return out;
+}
 
-  CUDA_DRV(cuCtxFromGreenCtx(&ctx, gctx[1]));
-  CUDA_DRV(cuCtxPushCurrent(ctx));
-  CUDA_DRV(cuStreamCreate(&streamB, CU_STREAM_NON_BLOCKING));
-  CUDA_DRV(cuCtxPopCurrent(nullptr));
-
-  return {(int64_t)streamA, (int64_t)streamB};
+static std::vector<int64_t> create_streams_on_green_ctx(
+    CUgreenCtx gctx,
+    int64_t n_streams,
+    PFN_cuGreenCtxStreamCreate pfn) {
+  TORCH_CHECK(n_streams >= 1, "n_streams must be >= 1");
+  if (!pfn) {
+    return create_streams_fallback_one_green(gctx, n_streams);
+  }
+  std::vector<int64_t> out;
+  out.reserve(static_cast<size_t>(n_streams));
+  for (int64_t i = 0; i < n_streams; ++i) {
+    CUstream stream{};
+    CUDA_DRV(pfn(&stream, gctx, CU_STREAM_NON_BLOCKING, 0));
+    out.push_back(static_cast<int64_t>(reinterpret_cast<uintptr_t>(stream)));
+  }
+  return out;
 }
 
 inline void destroy_green_context(CUgreenCtx gctx) {
@@ -38,24 +54,14 @@ inline void destroy_green_context(CUgreenCtx gctx) {
   CUDA_DRV(cuGreenCtxDestroy(gctx));
 }
 
-static std::vector<int64_t> create_greenctx_stream_direct_dynamic(CUgreenCtx gctx[2]) {
-  // This symbol is introduced in CUDA 12.5
-  const static auto pfn = probe_cuGreenCtxStreamCreate();
-  if (!pfn) {
-    TORCH_WARN("cuGreenCtxStreamCreate(cuda>=12.5) is not available, using fallback");
-    return create_greenctx_stream_fallback(gctx);
-  }
-
-  CUstream streamA, streamB;
-  CUDA_DRV(pfn(&streamA, gctx[0], CU_STREAM_NON_BLOCKING, 0));
-  CUDA_DRV(pfn(&streamB, gctx[1], CU_STREAM_NON_BLOCKING, 0));
-
-  return {(int64_t)streamA, (int64_t)streamB};
-}
-
-std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device) {
-  CUDA_DRV(cuDriverGetVersion(&CUDA_DRIVER_VERSION));
-
+static void create_two_partition_green_contexts(
+    int64_t smA,
+    int64_t smB,
+    int64_t device,
+    CUgreenCtx gctx_out[2],
+    CUgreenCtx* gctx_scratch,
+    int* sm_count_a,
+    int* sm_count_b) {
   CUgreenCtx gctx[3];
   CUdevResourceDesc desc[3];
   CUdevResource input;
@@ -81,18 +87,52 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
   CUDA_DRV(cuDevResourceGenerateDesc(&desc[1], &resources[1], 1));
   CUDA_DRV(cuGreenCtxCreate(&gctx[1], desc[1], (CUdevice)device, CU_GREEN_CTX_DEFAULT_STREAM));
 
-  const int smCountA = resources[0].sm.smCount;
-  const int smCountB = resources[1].sm.smCount;
+  *sm_count_a = resources[0].sm.smCount;
+  *sm_count_b = resources[1].sm.smCount;
 
-  std::vector<int64_t> streams = create_greenctx_stream_direct_dynamic(gctx);
+  gctx_out[0] = gctx[0];
+  gctx_out[1] = gctx[1];
+  *gctx_scratch = gctx[2];
+}
 
-  destroy_green_context(gctx[2]);
+std::vector<int64_t> create_greenctx_streams_by_value_enhanced(
+    int64_t smA,
+    int64_t smB,
+    int64_t n_streams_a,
+    int64_t n_streams_b,
+    int64_t device) {
+  CUDA_DRV(cuDriverGetVersion(&CUDA_DRIVER_VERSION));
 
-  std::vector<int64_t> vec = {
-      streams[0],  // streamA
-      streams[1],  // streamB
-      (int64_t)smCountA,
-      (int64_t)smCountB};
+  TORCH_CHECK(n_streams_a >= 1 && n_streams_b >= 1, "n_streams_a and n_streams_b must be >= 1");
 
+  CUgreenCtx gctx_pair[2];
+  CUgreenCtx gctx_scratch{};
+  int smCountA = 0;
+  int smCountB = 0;
+  create_two_partition_green_contexts(smA, smB, device, gctx_pair, &gctx_scratch, &smCountA, &smCountB);
+
+  const auto pfn = probe_cuGreenCtxStreamCreate();
+  if (!pfn) {
+    TORCH_WARN("cuGreenCtxStreamCreate(cuda>=12.5) is not available, using fallback");
+  }
+
+  std::vector<int64_t> streams_a = create_streams_on_green_ctx(gctx_pair[0], n_streams_a, pfn);
+  std::vector<int64_t> streams_b = create_streams_on_green_ctx(gctx_pair[1], n_streams_b, pfn);
+
+  destroy_green_context(gctx_scratch);
+
+  std::vector<int64_t> vec;
+  vec.reserve(streams_a.size() + streams_b.size() + 2);
+  vec.insert(vec.end(), streams_a.begin(), streams_a.end());
+  vec.insert(vec.end(), streams_b.begin(), streams_b.end());
+  vec.push_back(static_cast<int64_t>(smCountA));
+  vec.push_back(static_cast<int64_t>(smCountB));
   return vec;
+}
+
+std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device) {
+  std::vector<int64_t> full = create_greenctx_streams_by_value_enhanced(smA, smB, 1, 1, device);
+  const size_t n = full.size();
+  TORCH_INTERNAL_ASSERT(n >= 4, "expected at least 4 return values from create_greenctx_streams_by_value_enhanced");
+  return {full[0], full[1], full[n - 2], full[n - 1]};
 }

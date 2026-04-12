@@ -42,6 +42,55 @@ def create_greenctx_stream_by_value(
     return stream_a, stream_b
 
 
+def create_greenctx_streams_by_value_enhanced(
+    SM_a: int,
+    SM_b: int,
+    n_streams_a: int,
+    n_streams_b: int,
+    device_id: int = None,
+) -> tuple[tuple[ExternalStream, ...], tuple[ExternalStream, ...], int, int]:
+    """
+    Create two SM partitions (same split semantics as create_greenctx_stream_by_value) and attach
+    multiple CUDA streams per partition on the corresponding green contexts.
+
+    Args:
+        SM_a: Requested SM count for partition A (same meaning as create_greenctx_stream_by_value).
+        SM_b: Requested SM count for partition B.
+        n_streams_a: Number of streams to create on partition A (>= 1).
+        n_streams_b: Number of streams to create on partition B (>= 1).
+        device_id: CUDA device ordinal.
+
+    Returns:
+        streams_a: Tuple of ExternalStream for partition A.
+        streams_b: Tuple of ExternalStream for partition B.
+        actual_sm_a: SM count provisioned for partition A after driver alignment/split.
+        actual_sm_b: SM count provisioned for partition B.
+    """
+    if _spatial_import_error is not None:
+        raise _IMPORT_ERROR from _spatial_import_error
+    if device_id is None:
+        device_id = torch.cuda.current_device()
+
+    if n_streams_a < 1 or n_streams_b < 1:
+        raise ValueError("n_streams_a and n_streams_b must be >= 1")
+
+    res = torch.ops.sgl_kernel.create_greenctx_streams_by_value_enhanced(
+        SM_a, SM_b, n_streams_a, n_streams_b, device_id
+    )
+    dev = torch.device(f"cuda:{device_id}")
+    na = int(n_streams_a)
+    nb = int(n_streams_b)
+    streams_a = tuple(
+        ExternalStream(stream_ptr=res[i], device=dev) for i in range(na)
+    )
+    streams_b = tuple(
+        ExternalStream(stream_ptr=res[na + i], device=dev) for i in range(nb)
+    )
+    actual_sm_a = int(res[-2])
+    actual_sm_b = int(res[-1])
+    return streams_a, streams_b, actual_sm_a, actual_sm_b
+
+
 def get_sm_available(device_id: int = None) -> int:
     """
     Get the SMs available on the device.
