@@ -1213,6 +1213,16 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+                # if len(recv_reqs) > 0:
+                #     logger.info(f"in recv_reqs: got {len(recv_reqs)} reqs")
+                # else:
+                #     # Reduce logging frequency: only log at most once per second
+                #     if not hasattr(self, "_last_zero_reqs_log_time"):
+                #         self._last_zero_reqs_log_time = 0
+                #     now = time.time()
+                #     if now - self._last_zero_reqs_log_time > 1.0:
+                #         logger.info(f"in recv_reqs: got 0 reqs")
+                #         self._last_zero_reqs_log_time = now
             else:
                 recv_reqs = None
         else:
@@ -1923,6 +1933,7 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
+        # TODO: 这里为什么不区分 cache aware 和 cache agnostic 的调度策略? 如果已经计算 prefixmatch 后续应该可以减少计算？
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -1955,6 +1966,7 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            # 如果需要截断，则返回一个新的 chunked_req，否则返回 None，表示chunked prefill已经完成
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -2039,6 +2051,7 @@ class Scheduler(
 
         # Update chunked prefill
         if adder.new_chunked_req is not None:
+            # 如果引入了新的 chunked_req，表明原始的 chunked_req 已经完成，可以更新 schedule.chunked_req
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
@@ -2240,6 +2253,7 @@ class Scheduler(
                 future_indices = self.future_map.alloc_future_indices(bs)
 
                 with self.forward_stream_ctx:
+                    # TODO(lbz): 这里是要做什么? 保证default上面没有东西执行了??
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
                     with self.record_forward_metrics(batch):
@@ -2250,7 +2264,9 @@ class Scheduler(
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
+                        # TODO(lbz): store what to map? 这表示什么含义?
                         self.future_map.store_to_map(future_indices, batch_result)
+                        # TODO(lbz): copy what to cpu what? 这表示什么含义?
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
                     else:
                         batch_result.future_indices = future_indices
@@ -2277,6 +2293,7 @@ class Scheduler(
                 if batch.forward_mode.is_decode():
                     model_worker_batch = worker_batch_or_batch
                     self.record_batch_in_overlap(model_worker_batch)
+                    overlap_step = getattr(batch, "_pdmux_decode_step", None)
 
                     # Sampling info can be modified during forward. Keep a copy per step.
                     model_worker_batch.sampling_info = (
@@ -2290,7 +2307,26 @@ class Scheduler(
                         # TODO(lbz):
                         #  1. we need set forward stream here?
                         #  2. we need sync? wait default stream, but what is default stream?
+                        if overlap_step is not None:
+                            s = torch.cuda.current_stream()
+                            logger.info(
+                                f"[pdmux-overlap] run_batch(decode): resolve_future begin, step={overlap_step}, bs={len(model_worker_batch.seq_lens)}, current_stream={s}"
+                            )
+                            # Quick sanity check: resolve_future should eliminate negative placeholders.
+                            # Count negatives before/after to catch missing synchronization early.
+                            try:
+                                neg_before = int((model_worker_batch.input_ids < 0).sum().item())
+                            except Exception:
+                                neg_before = None
                         self.future_map.resolve_future(model_worker_batch)
+                        if overlap_step is not None:
+                            try:
+                                neg_after = int((model_worker_batch.input_ids < 0).sum().item())
+                            except Exception:
+                                neg_after = None
+                            logger.info(
+                                f"[pdmux-overlap] run_batch(decode): resolve_future done, step={overlap_step}, neg_before={neg_before}, neg_after={neg_after}"
+                            )
                         batch_result = self.model_worker.forward_batch_generation(
                             model_worker_batch
                         )
@@ -2299,10 +2335,26 @@ class Scheduler(
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+                        if overlap_step is not None:
+                            # copy_to_cpu() records copy_done at the end
+                            logger.info(
+                                f"[pdmux-overlap] run_batch(decode): copy_done.recorded, step={overlap_step}"
+                            )
                     else:
                         batch_result.future_indices = future_indices
+                    if overlap_step is not None:
+                        setattr(batch_result, "_pdmux_decode_step", overlap_step)
+                        # Record an event on the *actual* stream *after* store_to_map has been enqueued.
+                        # This is the real dependency needed by the next step's resolve_future.
+                        batch_result._pdmux_decode_run_done = self.device_module.Event()
+                        batch_result._pdmux_decode_run_done.record()
+                        logger.info(
+                            f"[pdmux-overlap] run_batch(decode): decode_run_done.recorded_after_store_to_map, step={overlap_step}, current_stream={torch.cuda.current_stream()}"
+                        )
 
-                    future_indices_or_next_token_ids = -future_indices.indices
+                    # for debug, we set all 0 tensor here;
+                    # future_indices_or_next_token_ids = -future_indices.indices
+                    future_indices_or_next_token_ids = torch.zeros(len(batch.reqs), dtype=torch.int32, device=future_indices.indices.device)
 
                     if batch.is_spec_v2:
                         batch.spec_info = batch_result.next_draft_input
@@ -3040,6 +3092,8 @@ def run_scheduler_process(
             if scheduler.enable_pdmux:
                 if server_args.enable_special_dp_attention:
                     scheduler.event_loop_pdmux_for_special_dp_attention()
+                elif scheduler.enable_overlap:
+                    scheduler.event_loop_overlap_pdmux()
                 else:
                     scheduler.event_loop_pdmux()
             elif server_args.pp_size > 1:

@@ -91,7 +91,16 @@ class SchedulerOutputProcessorMixin:
 
         if self.is_generation:
             if result.copy_done is not None:
+                step = getattr(result, "_pdmux_decode_step", None)
+                if step is not None:
+                    logger.info(
+                        f"[pdmux-overlap] copy_done.synchronize begin (prefill processor), step={step}"
+                    )
                 result.copy_done.synchronize()
+                if step is not None:
+                    logger.info(
+                        f"[pdmux-overlap] copy_done.synchronize end (prefill processor), step={step}"
+                    )
 
             (
                 logits_output,
@@ -240,7 +249,16 @@ class SchedulerOutputProcessorMixin:
 
         else:  # embedding or reward model
             if result.copy_done is not None:
+                step = getattr(result, "_pdmux_decode_step", None)
+                if step is not None:
+                    logger.info(
+                        f"[pdmux-overlap] copy_done.synchronize begin (prefill-emb processor), step={step}"
+                    )
                 result.copy_done.synchronize()
+                if step is not None:
+                    logger.info(
+                        f"[pdmux-overlap] copy_done.synchronize end (prefill-emb processor), step={step}"
+                    )
 
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
@@ -326,7 +344,16 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
+            step = getattr(result, "_pdmux_decode_step", None)
+            if step is not None:
+                logger.info(
+                    f"[pdmux-overlap] copy_done.synchronize begin (idle processor), step={step}"
+                )
             result.copy_done.synchronize()
+            if step is not None:
+                logger.info(
+                    f"[pdmux-overlap] copy_done.synchronize end (idle processor), step={step}"
+                )
 
         self.stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
@@ -338,7 +365,16 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
+            step = getattr(result, "_pdmux_decode_step", None)
+            if step is not None:
+                logger.info(
+                    f"[pdmux-overlap] copy_done.synchronize begin (dllm processor), step={step}"
+                )
             result.copy_done.synchronize()
+            if step is not None:
+                logger.info(
+                    f"[pdmux-overlap] copy_done.synchronize end (dllm processor), step={step}"
+                )
 
         next_token_ids = result.next_token_ids.tolist()
         self.num_generated_tokens += len(next_token_ids)
@@ -368,7 +404,16 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
+            step = getattr(result, "_pdmux_decode_step", None)
+            if step is not None:
+                logger.info(
+                    f"[pdmux-overlap] copy_done.synchronize begin (decode processor), step={step}"
+                )
             result.copy_done.synchronize()
+            if step is not None:
+                logger.info(
+                    f"[pdmux-overlap] copy_done.synchronize end (decode processor), step={step}"
+                )
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
