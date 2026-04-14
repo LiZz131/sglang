@@ -4805,9 +4805,9 @@ class ServerArgs:
             assert (
                 self.disaggregation_mode == "null"
             ), "PD-Multiplexing is not compatible with disaggregation mode."
-            assert (
-                self.disable_overlap_schedule
-            ), "PD-Multiplexing is not compatible with overlap schedule."
+            # assert (
+            #     self.disable_overlap_schedule
+            # ), "PD-Multiplexing is not compatible with overlap schedule."
 
             # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
             import torch

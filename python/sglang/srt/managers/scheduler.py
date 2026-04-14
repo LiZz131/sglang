@@ -2227,7 +2227,7 @@ class Scheduler(
                 # TODO(lsyin): delete this branch after unifying the abstraction.
                 worker_batch_or_batch = batch
 
-            if self.enable_overlap:
+            if self.enable_overlap and not self.enable_pdmux:
                 model_worker_batch = worker_batch_or_batch
                 self.record_batch_in_overlap(model_worker_batch)
 
@@ -2273,6 +2273,56 @@ class Scheduler(
                     # The future value, usually for next batch preparation
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+            if self.enable_overlap and self.enable_pdmux:
+                if batch.forward_mode.is_decode():
+                    model_worker_batch = worker_batch_or_batch
+                    self.record_batch_in_overlap(model_worker_batch)
+
+                    # Sampling info can be modified during forward. Keep a copy per step.
+                    model_worker_batch.sampling_info = (
+                        model_worker_batch.sampling_info.copy_for_forward()
+                    )
+
+                    bs = len(model_worker_batch.seq_lens)
+                    future_indices = self.future_map.alloc_future_indices(bs)
+
+                    with self.record_forward_metrics(batch):
+                        # TODO(lbz):
+                        #  1. we need set forward stream here?
+                        #  2. we need sync? wait default stream, but what is default stream?
+                        self.future_map.resolve_future(model_worker_batch)
+                        batch_result = self.model_worker.forward_batch_generation(
+                            model_worker_batch
+                        )
+
+                    batch_result.copy_done = self.device_module.Event()
+                    if batch_result.delay_sample_func is None:
+                        self.future_map.store_to_map(future_indices, batch_result)
+                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+                    else:
+                        batch_result.future_indices = future_indices
+
+                    future_indices_or_next_token_ids = -future_indices.indices
+
+                    if batch.is_spec_v2:
+                        batch.spec_info = batch_result.next_draft_input
+                        batch.spec_info.future_indices = future_indices
+                        batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                elif batch.forward_mode.is_split_prefill():
+                    batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                    future_indices_or_next_token_ids = batch_result.next_token_ids
+                else:
+                    kwargs = (
+                        {"pp_proxy_tensors": pp_proxy_tensors}
+                        if self.spec_algorithm.is_none()
+                        else {}
+                    )
+                    with self.record_forward_metrics(batch):
+                        batch_result = self.model_worker.forward_batch_generation(
+                            worker_batch_or_batch, **kwargs
+                        )
+                    future_indices_or_next_token_ids = batch_result.next_token_ids
+                    self.update_cache_from_scheduler(batch, batch_result)
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
