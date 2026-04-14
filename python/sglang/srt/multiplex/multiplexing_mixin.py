@@ -637,20 +637,11 @@ class SchedulerMultiplexMixin:
                     decode_step = decode_forward_count - 1
                     setattr(decode_batch, "_pdmux_decode_step", decode_step)
                     decode_result = self.run_batch(decode_batch)
-                    # Prefer the event recorded on the *actual* forward stream inside run_batch.
-                    forward_done_evt = getattr(decode_result, "_pdmux_decode_run_done", None)
-                    if forward_done_evt is not None:
-                        decode_run_done = forward_done_evt
-                        decode_run_done_step = decode_step
-                        overlap_log(
-                            f"decode_run_done <- forward_stream_event, step={decode_step}"
-                        )
-                    else:
-                        decode_run_done = decode_stream.record_event()
-                        decode_run_done_step = decode_step
-                        overlap_log(
-                            f"decode_run_done <- decode_stream.record_event (fallback), step={decode_step}"
-                        )
+                    decode_run_done = decode_stream.record_event()
+                    decode_run_done_step = decode_step
+                    overlap_log(
+                        f"decode_run_done <- decode_stream.record_event (fallback), step={decode_step}"
+                    )
                     decode_result_queue.append(
                         (decode_batch.copy(), decode_result, decode_gpu_handle)
                     )
@@ -762,6 +753,20 @@ class SchedulerMultiplexMixin:
                         )
                         # log prefill stats late
                         self.log_prefill_stats_late(self.split_prefill_batch)
+
+                        # before merge, clear decode_result_queue
+                        while decode_result_queue:
+                            (
+                                decode_batch_to_process,
+                                decode_result_to_process,
+                                decode_gpu_handle_to_process,
+                            ) = decode_result_queue.popleft()
+                            nvtx.range_end(decode_gpu_handle_to_process)
+                            self.process_batch_result(decode_batch_to_process, decode_result_to_process)
+                            overlap_log(
+                                f"before merge, clear decode_result_queue: bs={decode_batch_to_process.batch_size()}, queue_len_after={len(decode_result_queue)}"
+                            )
+
                         if self.running_batch and not self.running_batch.is_empty():
                             self.running_batch.merge_batch(self.split_prefill_batch)
                         else:

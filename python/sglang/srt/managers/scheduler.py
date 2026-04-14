@@ -2307,26 +2307,7 @@ class Scheduler(
                         # TODO(lbz):
                         #  1. we need set forward stream here?
                         #  2. we need sync? wait default stream, but what is default stream?
-                        if overlap_step is not None:
-                            s = torch.cuda.current_stream()
-                            logger.info(
-                                f"[pdmux-overlap] run_batch(decode): resolve_future begin, step={overlap_step}, bs={len(model_worker_batch.seq_lens)}, current_stream={s}"
-                            )
-                            # Quick sanity check: resolve_future should eliminate negative placeholders.
-                            # Count negatives before/after to catch missing synchronization early.
-                            try:
-                                neg_before = int((model_worker_batch.input_ids < 0).sum().item())
-                            except Exception:
-                                neg_before = None
                         self.future_map.resolve_future(model_worker_batch)
-                        if overlap_step is not None:
-                            try:
-                                neg_after = int((model_worker_batch.input_ids < 0).sum().item())
-                            except Exception:
-                                neg_after = None
-                            logger.info(
-                                f"[pdmux-overlap] run_batch(decode): resolve_future done, step={overlap_step}, neg_before={neg_before}, neg_after={neg_after}"
-                            )
                         batch_result = self.model_worker.forward_batch_generation(
                             model_worker_batch
                         )
@@ -2335,26 +2316,12 @@ class Scheduler(
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
-                        if overlap_step is not None:
-                            # copy_to_cpu() records copy_done at the end
-                            logger.info(
-                                f"[pdmux-overlap] run_batch(decode): copy_done.recorded, step={overlap_step}"
-                            )
                     else:
                         batch_result.future_indices = future_indices
-                    if overlap_step is not None:
-                        setattr(batch_result, "_pdmux_decode_step", overlap_step)
-                        # Record an event on the *actual* stream *after* store_to_map has been enqueued.
-                        # This is the real dependency needed by the next step's resolve_future.
-                        batch_result._pdmux_decode_run_done = self.device_module.Event()
-                        batch_result._pdmux_decode_run_done.record()
-                        logger.info(
-                            f"[pdmux-overlap] run_batch(decode): decode_run_done.recorded_after_store_to_map, step={overlap_step}, current_stream={torch.cuda.current_stream()}"
-                        )
 
                     # for debug, we set all 0 tensor here;
-                    # future_indices_or_next_token_ids = -future_indices.indices
-                    future_indices_or_next_token_ids = torch.zeros(len(batch.reqs), dtype=torch.int32, device=future_indices.indices.device)
+                    future_indices_or_next_token_ids = -future_indices.indices
+                    # future_indices_or_next_token_ids = torch.zeros(len(batch.reqs), dtype=torch.int32, device=future_indices.indices.device)
 
                     if batch.is_spec_v2:
                         batch.spec_info = batch_result.next_draft_input
