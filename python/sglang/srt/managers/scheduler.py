@@ -3060,7 +3060,10 @@ def run_scheduler_process(
                 if server_args.enable_special_dp_attention:
                     scheduler.event_loop_pdmux_for_special_dp_attention()
                 elif scheduler.enable_overlap:
-                    scheduler.event_loop_overlap_pdmux()
+                    if server_args.enable_clever_overlap:
+                        scheduler.event_loop_clever_overlap_pdmux()
+                    else:
+                        scheduler.event_loop_overlap_pdmux()
                 else:
                     scheduler.event_loop_pdmux()
             elif server_args.pp_size > 1:

@@ -643,6 +643,7 @@ class ServerArgs:
     enable_special_dp_attention_prefix_0: bool = False
     auto_adjust_stream_group: bool = True
     manual_stream_group_idx: int = 0
+    enable_clever_overlap: bool = False
 
     # For Multi-Modal
     mm_max_concurrent_calls: int = 32
@@ -4604,6 +4605,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.manual_stream_group_idx,
             help="Fixed stream_group index when auto_adjust_stream_group is disabled.",
+        )
+        parser.add_argument(
+            "--enable-clever-overlap",
+            action="store_true",
+            default=ServerArgs.enable_clever_overlap,
+            help="Enable clever overlap for pdmux. If not set, it is not overlap.",
         )
 
         # Configuration file support
