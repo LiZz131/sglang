@@ -827,10 +827,23 @@ class SchedulerMultiplexMixin:
         decode_run_done_step = None
         arm_decode_need_wait_after_prefill = False
 
-        # we can't launch too many decode batch, which cause prefill idle
+        # `max_overlap_decode_round` / `remain_overlap_decode_round`:
+        # - Decremented on every decode launch (first + optional double-launch); resets
+        #   when `adjust_stream_group` runs. While remain > 0, double-launch may queue a
+        #   second decode before prefill in the same loop iteration.
+        # - When remain_overlap_decode_round <= 0, we drain `decode_result_queue` fully
+        #   before any new decode launch (see decode block): no pending results while in
+        #   the "sync" regime — avoids stacking another async decode on top of queued
+        #   results from the last overlap burst.
         max_overlap_decode_round = 2
         remain_overlap_decode_round = max_overlap_decode_round
         last_stream_group_idx = len(self.stream_groups) - 1
+
+        # Second decode launch before prefill improves GPU utilization but can queue an
+        # extra decode after EOS; overlap skips those results on CPU — spill KV is trimmed
+        # in process_batch_result_decode via free_overlap_decode_kv_spill_before_finish.
+        enable_double_launch_before_prefill = True
+        double_launch_before_prefill = False
 
         def get_sg_msg():
             return f"stream_group: {stream_idx}, prefill sm: {self.sm_counts[stream_idx][0]}, decode sm: {self.sm_counts[stream_idx][1]}"
@@ -871,6 +884,20 @@ class SchedulerMultiplexMixin:
                     stream_idx > 0 and self.running_batch.is_empty()
                 )
                 if self.running_batch.is_empty() and self.split_prefill_batch is None:
+                    # Idle memory check assumes no in-flight decode results: each queued
+                    # decode still holds KV until process_batch_result runs. Double-launch
+                    # can also queue an extra step after EOS; draining avoids false "leak".
+                    while decode_result_queue:
+                        (
+                            decode_batch_to_process,
+                            decode_result_to_process,
+                            decode_gpu_handle_to_process,
+                        ) = decode_result_queue.popleft()
+                        nvtx.range_end(decode_gpu_handle_to_process)
+                        self.process_batch_result(
+                            decode_batch_to_process, decode_result_to_process
+                        )
+                    decode_last_batch = None
                     self.check_memory()
                     self.check_tree_cache()
                     self.new_token_ratio = self.init_new_token_ratio
@@ -915,6 +942,12 @@ class SchedulerMultiplexMixin:
                 last_stream_group_idx = len(self.stream_groups) - 1
                 # New stream group is a natural "safe point" to restart overlap budget.
                 remain_overlap_decode_round = max_overlap_decode_round
+                if (
+                    enable_double_launch_before_prefill
+                    and stream_idx != 0
+                    and stream_idx != last_stream_group_idx
+                ):
+                    double_launch_before_prefill = True
 
                 loop_range_handle = nvtx.range_start(get_sg_msg() + "adjust_stream_group")
 
@@ -932,6 +965,24 @@ class SchedulerMultiplexMixin:
             # run decode batch
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
+                # Overlap budget exhausted: require empty result queue before launching
+                # more decode (CPU has caught up; no async backlog from prior launches).
+                if stream_idx != last_stream_group_idx and remain_overlap_decode_round <= 0:
+                    while decode_result_queue:
+                        (
+                            decode_batch_to_process,
+                            decode_result_to_process,
+                            decode_gpu_handle_to_process,
+                        ) = decode_result_queue.popleft()
+                        nvtx.range_end(decode_gpu_handle_to_process)
+                        overlap_log(
+                            f"remain<=0: drain decode queue before launch, queue_len_after={len(decode_result_queue)}"
+                        )
+                        self.process_batch_result(
+                            decode_batch_to_process, decode_result_to_process
+                        )
+                    decode_last_batch = None
+
                 if self.running_batch and not self.running_batch.is_empty():
                     decode_batch = self.running_batch
                     decode_gpu_handle = nvtx.range_start(
@@ -963,6 +1014,65 @@ class SchedulerMultiplexMixin:
                     overlap_log(
                         f"launch decode batch#{decode_forward_count-1}, bs={decode_batch.batch_size()}, need_wait={decode_need_wait}, arm_after_prefill={arm_decode_need_wait_after_prefill}, queue_len={len(decode_result_queue)}"
                     )
+                    if double_launch_before_prefill and remain_overlap_decode_round > 0:
+                        # Opportunistic 2nd decode launch before prefill launch to reduce decode bubbles.
+                        # This is only safe if we:
+                        #  - update_running_batch() again to prepare next-step tensors (likely future placeholders)
+                        #  - honor decode_need_wait/decode_run_done before resolve_future+forward
+                        #  - do NOT exceed overlap budget
+                        #
+                        # NOTE: This does not require CPU postprocess of the previous step, because
+                        # ScheduleBatch.output_ids has already been updated to future indices by run_batch.
+                        double_launch_before_prefill = False
+
+                        # Prepare next decode step immediately.
+                        self.running_batch = self.update_running_batch(self.running_batch)
+                        if self.running_batch and (not self.running_batch.is_empty()):
+                            decode_batch2 = self.running_batch
+                            decode_gpu_handle2 = nvtx.range_start(
+                                "run decode batch"
+                                + f": {decode_forward_count} "
+                                + _pdmux_nvtx_len_list_str(
+                                    decode_batch2, add_decode_global_num_tokens=True
+                                )
+                            )
+                            decode_forward_count += 1
+
+                            # If the next step depends on previous decode (future placeholders),
+                            # wait for the event recorded after store_to_map.
+                            if decode_need_wait and decode_run_done is not None:
+                                overlap_log(
+                                    f"double-launch: decode wait event before launch, prev_step={decode_run_done_step}, queue_len={len(decode_result_queue)}"
+                                )
+                                decode_stream.wait_event(decode_run_done)
+
+                            decode_step2 = decode_forward_count - 1
+                            setattr(decode_batch2, "_pdmux_decode_step", decode_step2)
+                            decode_result2 = self.run_batch(decode_batch2)
+                            remain_overlap_decode_round -= 1
+
+                            forward_done_evt2 = getattr(
+                                decode_result2, "_pdmux_decode_run_done", None
+                            )
+                            if forward_done_evt2 is not None:
+                                decode_run_done = forward_done_evt2
+                                decode_run_done_step = decode_step2
+                                overlap_log(
+                                    f"double-launch: decode_run_done <- forward_done_evt, step={decode_step2}"
+                                )
+                            else:
+                                decode_run_done = decode_stream.record_event()
+                                decode_run_done_step = decode_step2
+                                overlap_log(
+                                    f"double-launch: decode_run_done <- decode_stream.record_event (fallback), step={decode_step2}"
+                                )
+
+                            decode_result_queue.append(
+                                (decode_batch2.copy(), decode_result2, decode_gpu_handle2)
+                            )
+                            overlap_log(
+                                f"double-launch decode batch#{decode_step2}, bs={decode_batch2.batch_size()}, need_wait={decode_need_wait}, queue_len={len(decode_result_queue)}, remain_budget={remain_overlap_decode_round}"
+                            )
                     if arm_decode_need_wait_after_prefill:
                         # Strict sync semantics: the 2nd decode after prefill must wait.
                         decode_need_wait = True
