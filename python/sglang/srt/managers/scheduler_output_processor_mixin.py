@@ -21,7 +21,10 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import (
+    free_overlap_decode_kv_spill_before_finish,
+    release_kv_cache,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
 
@@ -464,6 +467,9 @@ class SchedulerOutputProcessorMixin:
 
             if req.finished():
                 self.maybe_collect_routed_experts(req)
+
+                if self.enable_overlap and batch.spec_algorithm.is_none() and self.enable_pdmux:
+                    free_overlap_decode_kv_spill_before_finish(req, self.tree_cache)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes

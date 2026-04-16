@@ -522,6 +522,29 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
+def free_overlap_decode_kv_spill_before_finish(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Trim KV reserved for overlap decode steps that run ahead of CPU (e.g. pdmux
+    double-launch across EOS).
+
+    After this, ``kv_committed_len`` / ``kv_allocated_len`` match the logical sequence
+    length so ``cache_finished_req`` (Python RadixCache) can free the row without
+    relying on a global radix_cache change.
+    """
+    if req.req_pool_idx is None:
+        return
+    logical_len = len(req.origin_input_ids) + len(req.output_ids)
+    if req.kv_committed_len <= logical_len:
+        return
+    tail_start = logical_len
+    tail_end = req.kv_committed_len
+    indices = tree_cache.req_to_token_pool.req_to_token[
+        req.req_pool_idx, tail_start:tail_end
+    ]
+    tree_cache.token_to_kv_pool_allocator.free(indices)
+    req.kv_committed_len = logical_len
+    req.kv_allocated_len = logical_len
+
+
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
