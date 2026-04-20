@@ -66,6 +66,48 @@ def vocab_range_from_global_vocab_size(
     )
 
 
+def get_dp_attn_normal_tp_gather_reorder_index(
+    vocab_size: int,
+    full_tp_size: int,
+    attn_tp_size: int,
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """All-gather 后用于把 logits 重排为正确 vocab 顺序的索引.
+
+    当开启 dp-attn 且用 normal-tp 做第二次划分时, 权重复用为 [01],[23],[45],[67],
+    计算分配为 [0],[2],[4],[6],[1],[3],[5],[7]. 对 full_tp_size 做 all-gather 得到
+    的维度顺序是 rank0,rank1,...,rank7, 即 [shard0, shard0, shard1, shard1, ...].
+    需要重排为 [shard0, shard1, shard2, shard3], 即从每个逻辑 shard 取「第一个」
+    rank 的块 (rank 0, 2, 4, 6).
+
+    Args:
+        vocab_size: 全局 vocab 大小 (或 padded 大小).
+        full_tp_size: 完整 TP world size (例如 8).
+        attn_tp_size: attention TP 数 (逻辑 shard 数, 例如 4).
+        device: 返回 tensor 的 device.
+        dtype: 返回的 index 的 dtype, 默认 long.
+
+    Returns:
+        index tensor, shape (vocab_size,). 使用 gathered_logits[:, index] 得到
+        按 global vocab 顺序的 logits.
+    """
+    assert full_tp_size >= attn_tp_size and full_tp_size % attn_tp_size == 0
+    assert vocab_size % attn_tp_size == 0
+    attn_dp_size = full_tp_size // attn_tp_size
+    per_partition = vocab_size // attn_tp_size
+    if dtype is None:
+        dtype = torch.long
+    # 对全局位置 i: 属于逻辑 shard k = i // per_partition,
+    # 应取 rank k*attn_dp_size 的块, 在 gathered 中的下标为
+    # (k * attn_dp_size) * per_partition + (i % per_partition)
+    indices = [
+        (i // per_partition) * attn_dp_size * per_partition + (i % per_partition)
+        for i in range(vocab_size)
+    ]
+    return torch.tensor(indices, device=device, dtype=dtype)
+
+
 @dataclass
 class VocabParallelEmbeddingShardIndices:
     """Indices for a shard of a vocab parallel embedding."""
