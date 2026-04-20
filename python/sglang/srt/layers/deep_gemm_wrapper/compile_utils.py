@@ -27,6 +27,9 @@ _ENABLE_JIT_DEEPGEMM_PRECOMPILE = envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.get()
 _DO_COMPILE_ALL = True
 _IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
 _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
+# PDMux: JIT warmup over every distinct prefill SM (see pdmux_context.prefill_sm_counts_for_deepgemm_warmup)
+_ENABLE_PDMUX_DEEGEMM_COMPILE_WARMUP = False
+_DEEGEMM_WARMUP_GPU_ID = 0
 
 # Force redirect deep_gemm cache_dir
 os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
@@ -43,6 +46,8 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     global _BUILTIN_M_LIST
     global _DO_COMPILE_ALL
     global _IS_FIRST_RANK_ON_NODE
+    global _ENABLE_PDMUX_DEEGEMM_COMPILE_WARMUP
+    global _DEEGEMM_WARMUP_GPU_ID
 
     # Generate m_max
     m_max = 1024 * 16
@@ -61,6 +66,47 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     # Avoid loading symbols at the serving stages.
     _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE
 
+    _ENABLE_PDMUX_DEEGEMM_COMPILE_WARMUP = (
+        getattr(server_args, "enable_pdmux_deepgemm_compile_warmup", False)
+    )
+    _DEEGEMM_WARMUP_GPU_ID = gpu_id
+
+
+def _deepgemm_warmup_num_sms_list() -> List[int]:
+    """Return DeepGEMM ``num_sms`` values to run compile-only warmup for."""
+    if not ENABLE_JIT_DEEPGEMM:
+        return []
+    default_sms = int(deep_gemm.get_num_sms())
+    if not _ENABLE_PDMUX_DEEGEMM_COMPILE_WARMUP:
+        return [default_sms]
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+    except Exception:
+        return [default_sms]
+    if not getattr(server_args, "enable_pdmux", False):
+        return [default_sms]
+    try:
+        from sglang.srt.multiplex.pdmux_context import (
+            load_pdmux_config,
+            prefill_sm_counts_for_deepgemm_warmup,
+        )
+
+        cfg = load_pdmux_config(server_args.pdmux_config_path or "")
+        sms = prefill_sm_counts_for_deepgemm_warmup(_DEEGEMM_WARMUP_GPU_ID, cfg)
+    except Exception as e:
+        logger.warning(
+            "PDMux DeepGEMM warmup: failed to compute prefill SM list (%s); "
+            "using default num_sms=%s",
+            e,
+            default_sms,
+        )
+        return [default_sms]
+    if not sms:
+        return [default_sms]
+    return sms
+
 
 class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
@@ -69,6 +115,84 @@ class DeepGemmKernelType(IntEnum):
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
+
+
+def _log_deepgemm_jit_precompile_debug(
+    kernel_type: DeepGemmKernelType,
+    n: int,
+    k: int,
+    num_groups: int,
+) -> None:
+    """Log env + module state once when the JIT precompile branch runs (per query_key)."""
+    parts = [
+        "DeepGEMM JIT precompile debug snapshot",
+        f"query=({kernel_type.name}, N={n}, K={k}, num_groups={num_groups})",
+        f"ENABLE_JIT_DEEPGEMM={ENABLE_JIT_DEEPGEMM}",
+        f"module: _ENABLE_JIT_DEEPGEMM_PRECOMPILE={_ENABLE_JIT_DEEPGEMM_PRECOMPILE} "
+        f"_DO_COMPILE_ALL={_DO_COMPILE_ALL} _IS_FIRST_RANK_ON_NODE={_IS_FIRST_RANK_ON_NODE} "
+        f"_IN_PRECOMPILE_STAGE={_IN_PRECOMPILE_STAGE}",
+        f"module: _ENABLE_PDMUX_DEEGEMM_COMPILE_WARMUP={_ENABLE_PDMUX_DEEGEMM_COMPILE_WARMUP} "
+        f"_DEEGEMM_WARMUP_GPU_ID={_DEEGEMM_WARMUP_GPU_ID}",
+        f"m_list: len={len(_BUILTIN_M_LIST)} max_m={_BUILTIN_M_LIST[-1] if _BUILTIN_M_LIST else 0}",
+    ]
+    # Effective envs (may differ from os.environ if unset)
+    for env_field in (
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM,
+        envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE,
+        envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE,
+        envs.SGLANG_IS_FIRST_RANK_ON_NODE,
+        envs.SGLANG_DG_CACHE_DIR,
+        envs.SGLANG_DG_USE_NVRTC,
+    ):
+        parts.append(f"envs.{env_field.name}.get()={env_field.get()!r}")
+    # Process env strings often used for DeepGEMM JIT
+    for key in (
+        "SGLANG_ENABLE_JIT_DEEPGEMM",
+        "SGLANG_JIT_DEEPGEMM_PRECOMPILE",
+        "SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE",
+        "SGLANG_IS_FIRST_RANK_ON_NODE",
+        "SGLANG_DG_CACHE_DIR",
+        "SGL_DG_USE_NVRTC",
+        "DG_JIT_DEBUG",
+        "DG_PRINT_CONFIGS",
+        "DG_JIT_PRINT_COMPILER_COMMAND",
+        "DG_JIT_CACHE_DIR",
+        "DG_JIT_USE_NVRTC",
+    ):
+        if key in os.environ:
+            parts.append(f"os.environ[{key!r}]={os.environ[key]!r}")
+    if torch.cuda.is_available():
+        parts.append(
+            f"cuda: device={torch.cuda.current_device()} "
+            f"cap={torch.cuda.get_device_capability()} "
+            f"name={torch.cuda.get_device_name()!r}"
+        )
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        sa = get_global_server_args()
+        parts.append(
+            f"server_args: enable_pdmux={getattr(sa, 'enable_pdmux', None)} "
+            f"pdmux_config_path={getattr(sa, 'pdmux_config_path', None)!r} "
+            f"enable_pdmux_deepgemm_compile_warmup="
+            f"{getattr(sa, 'enable_pdmux_deepgemm_compile_warmup', None)} "
+            f"base_gpu_id={getattr(sa, 'base_gpu_id', None)}"
+        )
+    except Exception as e:
+        parts.append(f"server_args: unavailable ({e})")
+    if ENABLE_JIT_DEEPGEMM:
+        try:
+            parts.append(
+                f"deep_gemm: get_num_sms={deep_gemm.get_num_sms()} "
+                f"get_compile_mode={deep_gemm.get_compile_mode()}"
+            )
+            parts.append(f"warmup_num_sms_list(preflight)={_deepgemm_warmup_num_sms_list()}")
+        except Exception as e:
+            parts.append(f"deep_gemm introspection failed: {e}")
+    parts.append(
+        f"os.environ effective DG_JIT_CACHE_DIR={os.environ.get('DG_JIT_CACHE_DIR')!r}"
+    )
+    logger.info("%s", " | ".join(parts))
 
 
 # TODO improve code
@@ -88,6 +212,8 @@ def _maybe_compile_deep_gemm_one_type_all(
         and _INITIALIZATION_DICT.get(query_key) is None
     ):
         _INITIALIZATION_DICT[query_key] = True
+
+        _log_deepgemm_jit_precompile_debug(kernel_type, n, k, num_groups)
 
         # TODO maybe improve logs
         if not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
@@ -163,12 +289,31 @@ def _compile_deep_gemm_one_type_all(
             kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
         )
 
+        num_sms_list = _deepgemm_warmup_num_sms_list()
+        logger.info(f"DeepGEMM compile-only warmup: num_sms_list: {num_sms_list}")
+        if not num_sms_list:
+            num_sms_list = [int(deep_gemm.get_num_sms())]
+        if len(num_sms_list) > 1:
+            logger.info(
+                "DeepGEMM compile-only warmup: iterating num_sms=%s "
+                "(enable_pdmux_deepgemm_compile_warmup)",
+                num_sms_list,
+            )
+
+        saved_num_sms = deep_gemm.get_num_sms()
         old_compile_mode = deep_gemm.get_compile_mode()
-        deep_gemm.set_compile_mode(1)
-        # TODO can use multi thread
-        for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
-            executor.execute(m=m)
-        deep_gemm.set_compile_mode(old_compile_mode)
+        try:
+            deep_gemm.set_compile_mode(1)
+            for num_sms in num_sms_list:
+                deep_gemm.set_num_sms(num_sms)
+                for m in tqdm(
+                    m_list,
+                    desc=f"DeepGEMM warmup num_sms={num_sms}",
+                ):
+                    executor.execute(m=m)
+        finally:
+            deep_gemm.set_compile_mode(old_compile_mode)
+            deep_gemm.set_num_sms(saved_num_sms)
 
         # clean up input buffers
         torch.cuda.current_stream().synchronize()

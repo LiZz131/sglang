@@ -652,6 +652,8 @@ class ServerArgs:
     pdmux_offline_prefill_max_seq_len_tie_break: str = "down"
     # Clever-overlap pdmux: optional second decode launch before prefill (see multiplexing_mixin)
     pdmux_disable_double_launch_before_prefill: bool = False
+    # DeepGEMM JIT: compile-only warmup for each distinct PDMux prefill SM count (template num_sms)
+    enable_pdmux_deepgemm_compile_warmup: bool = False
 
     # For Multi-Modal
     mm_max_concurrent_calls: int = 32

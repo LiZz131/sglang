@@ -101,6 +101,36 @@ def divide_sm(total_sms, compute_capability, groups):
     return divisions
 
 
+def prefill_sm_counts_for_deepgemm_warmup(
+    gpu_id: int, config: PDMuxConfig
+) -> List[int]:
+    """Return sorted unique prefill SM counts (>0) matching ``initialize_stream_groups``.
+
+    Used by DeepGEMM compile-only warmup in the **model worker** process, where global
+    ``SM_COUNTS`` is not populated (scheduler initializes streams in another process).
+    The logic mirrors ``SM_COUNTS`` construction: full prefill slot, manual or
+    ``divide_sm`` partitions, then decode-only slot — taking the first element of each
+    pair when positive.
+    """
+    from sgl_kernel import spatial
+
+    device = torch.cuda.current_device()
+    total_sm_count = spatial.get_sm_available(gpu_id)
+    if config.manual_divisions:
+        divisions = [
+            (prefill_sm, decode_sm)
+            for prefill_sm, decode_sm, _ in config.manual_divisions
+        ]
+    else:
+        divisions = divide_sm(
+            total_sm_count,
+            torch.cuda.get_device_capability(device),
+            config.sm_group_num - 2,
+        )
+    sm_counts = [(total_sm_count, 0)] + list(divisions) + [(0, total_sm_count)]
+    return sorted({p for p, _ in sm_counts if p > 0})
+
+
 def initialize_stream_groups(gpu_id: int, config: PDMuxConfig):
     from sgl_kernel import spatial
 
