@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -22,6 +22,11 @@ from sglang.srt.multiplex.pdmux_context import (
     initialize_stream_groups,
     load_pdmux_config,
     set_current_stream_idx,
+)
+from sglang.srt.multiplex.pdmux_offline_tables import (
+    PDMuxOfflineTables,
+    load_pdmux_offline_tables,
+    normalize_tie_break,
 )
 from sglang.srt.multiplex.pdmux_time_model import (
     PDMuxTimePredictor,
@@ -161,6 +166,47 @@ class SchedulerMultiplexMixin:
                 "PDMux time predictor enabled: decode_budget_ms=%s",
                 budget_ms,
             )
+
+        self._pdmux_offline_tables: Optional[PDMuxOfflineTables] = None
+        offline_path = getattr(self.server_args, "pdmux_offline_tables_path", None)
+        if offline_path:
+            try:
+                self._pdmux_offline_tables = load_pdmux_offline_tables(
+                    offline_path,
+                    decode_bs_tie_break=normalize_tie_break(
+                        getattr(
+                            self.server_args,
+                            "pdmux_offline_decode_bs_tie_break",
+                            "up",
+                        ),
+                        "up",
+                    ),
+                    prefill_bs_tie_break=normalize_tie_break(
+                        getattr(
+                            self.server_args,
+                            "pdmux_offline_prefill_bs_tie_break",
+                            "down",
+                        ),
+                        "down",
+                    ),
+                    prefill_max_seq_len_tie_break=normalize_tie_break(
+                        getattr(
+                            self.server_args,
+                            "pdmux_offline_prefill_max_seq_len_tie_break",
+                            "down",
+                        ),
+                        "down",
+                    ),
+                )
+                logger.info(
+                    "PDMux offline timing tables loaded from %s", offline_path
+                )
+            except Exception as e:
+                logger.warning(
+                    "PDMux offline tables: failed to load %s (%s); overlap budget uses defaults",
+                    offline_path,
+                    e,
+                )
 
     def log_stream_groups(self: Scheduler):
         for i, stream_group in enumerate(self.stream_groups):
@@ -798,6 +844,122 @@ class SchedulerMultiplexMixin:
             # update decode last batch
             decode_last_batch = decode_batch
 
+    def _max_seq_len_for_offline_prefill(self: Scheduler, prefill_batch: "ScheduleBatch") -> int:
+        """Match bench_replay keys: max per-request length in the extend/prefill batch."""
+        n = len(prefill_batch.reqs)
+        slc = prefill_batch.seq_lens_cpu
+        if slc is not None and slc.numel() == n:
+            return int(max(int(x) for x in slc.tolist()))
+        if n > 0:
+            return max(int(req.extend_input_len) for req in prefill_batch.reqs)
+        return 0
+
+    def _predict_decode_run_time_from_map(
+        self: Scheduler,
+        stream_idx: int,
+        decode_batch: Optional["ScheduleBatch"],
+    ) -> Optional[float]:
+        tables = getattr(self, "_pdmux_offline_tables", None)
+        if tables is None or decode_batch is None or decode_batch.is_empty():
+            return None
+        return tables.lookup_decode(stream_idx, decode_batch.batch_size())
+
+    def _predict_prefill_run_time_from_map(
+        self: Scheduler,
+        stream_idx: int,
+        prefill_batch: Optional["ScheduleBatch"],
+    ) -> Optional[float]:
+        tables = getattr(self, "_pdmux_offline_tables", None)
+        if tables is None or prefill_batch is None or prefill_batch.is_empty():
+            return None
+        bs = prefill_batch.batch_size()
+        max_len = self._max_seq_len_for_offline_prefill(prefill_batch)
+        return tables.lookup_prefill(stream_idx, bs, max_len)
+
+    def _compute_max_overlap_decode_round(
+        self: Scheduler,
+        stream_idx: int,
+        decode_batch: Optional["ScheduleBatch"] = None,
+        prefill_batch: Optional["ScheduleBatch"] = None,
+    ) -> int:
+        """
+        Compute the maximum overlap decode round for the given stream index.
+        Uses offline table lookup: floor(prefill_ms / decode_ms), clamped.
+        Stream group 0 (prefill-only) and last (decode-only) skip table lookup and return default.
+        """
+        last_sg = len(self.stream_groups) - 1
+        default_rounds = 2
+        if stream_idx == 0 or stream_idx == last_sg:
+            return default_rounds
+        if getattr(self, "_pdmux_offline_tables", None) is None:
+            return default_rounds
+        pre_ms = self._predict_prefill_run_time_from_map(stream_idx, prefill_batch)
+        dec_ms = self._predict_decode_run_time_from_map(stream_idx, decode_batch)
+        if pre_ms is None or dec_ms is None or dec_ms <= 0:
+            return default_rounds
+        ratio = pre_ms / dec_ms
+        rounds = max(1, int(ratio))
+        return min(rounds, 64)
+
+    def _overlap_latency_prefill_plan(
+        self: Scheduler,
+        stream_idx: int,
+        split_batch: Optional["ScheduleBatch"],
+        decode_batch: Optional["ScheduleBatch"],
+    ) -> Optional[Dict[str, Any]]:
+        """Offline plan for split-prefill layer count (no-double-launch loop).
+
+        Match bench identity (ms):
+
+            decode_gpu_run_ms ≈ L * per_layer_prefill_cpu_launch_only_ms
+                + decode_cpu_prepare_and_launch_ms
+
+        with ``per_layer = prefill_cpu_launch_only_full_model_ms / num_hidden_layers``.
+        """
+        tables: Optional[PDMuxOfflineTables] = getattr(self, "_pdmux_offline_tables", None)
+        if (
+            tables is None
+            or split_batch is None
+            or split_batch.is_empty()
+            or decode_batch is None
+            or decode_batch.is_empty()
+        ):
+            return None
+        H = int(self.model_config.num_hidden_layers)
+        if H <= 0:
+            return None
+        dec_bs = decode_batch.batch_size()
+        dec_gpu = tables.lookup_decode_gpu_run(stream_idx, dec_bs)
+        dec_cpu_pl = tables.lookup_decode(stream_idx, dec_bs)
+        if dec_gpu is None or dec_cpu_pl is None:
+            return None
+        p_bs = split_batch.batch_size()
+        p_msl = self._max_seq_len_for_offline_prefill(split_batch)
+        full_lo = tables.lookup_prefill_launch_only(stream_idx, p_bs, p_msl)
+        if full_lo is None or full_lo <= 0:
+            return None
+        per_layer_lo = float(full_lo) / float(H)
+        if per_layer_lo <= 0:
+            return None
+        budget = float(dec_gpu) - float(dec_cpu_pl)
+        if budget <= 0:
+            L = 1
+        else:
+            L = max(1, int(budget / per_layer_lo))
+        remain = H - int(split_batch.split_index)
+        if remain <= 0:
+            return None
+        L = min(int(L), int(remain))
+        return {
+            "L": int(L),
+            "dec_gpu_ms": float(dec_gpu),
+            "dec_cpu_pl_ms": float(dec_cpu_pl),
+            "prefill_lo_full_ms": float(full_lo),
+            "per_layer_lo_ms": float(per_layer_lo),
+            "budget_ms": float(budget),
+            "remain_layers": int(remain),
+        }
+
     @torch.inference_mode()
     def event_loop_clever_overlap_pdmux(self: Scheduler):
         """A scheduler loop for pd multiplexing with overlap."""
@@ -817,6 +979,8 @@ class SchedulerMultiplexMixin:
         prefill_forward_count = 0
         prefill_gpu_handle = None
         prefill_launch_handle = None
+        # Recorded on prefill_stream after the last split-prefill layer; used with .query().
+        prefill_exe_done = None
 
         decode_result_queue = deque()
         # Keep compatibility with shared overlap checks (e.g. flush_cache/_is_no_request).
@@ -842,7 +1006,9 @@ class SchedulerMultiplexMixin:
         # Second decode launch before prefill improves GPU utilization but can queue an
         # extra decode after EOS; overlap skips those results on CPU — spill KV is trimmed
         # in process_batch_result_decode via free_overlap_decode_kv_spill_before_finish.
-        enable_double_launch_before_prefill = True
+        enable_double_launch_before_prefill = not getattr(
+            self.server_args, "pdmux_disable_double_launch_before_prefill", False
+        )
         double_launch_before_prefill = False
 
         def get_sg_msg():
@@ -879,7 +1045,47 @@ class SchedulerMultiplexMixin:
             # decode update batch
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
-                self.running_batch = self.update_running_batch(self.running_batch)
+                # Order decode work before drain / prefill_exe_done.query(): run on
+                # decode_stream so synchronize + query reflect real GPU state (not stale
+                # vs in-flight decode kernels from prior iterations).
+                need_decode_sync_before_skip = (
+                    stream_idx != last_stream_group_idx
+                    and remain_overlap_decode_round <= 0
+                ) or (
+                    self.split_prefill_batch is not None
+                    and self.split_prefill_batch.split_prefill_finished
+                    and prefill_exe_done is not None
+                )
+                if need_decode_sync_before_skip:
+                    decode_stream.synchronize()
+                # Overlap budget exhausted: drain pending decode results before launch.
+                if stream_idx != last_stream_group_idx and remain_overlap_decode_round <= 0:
+                    while decode_result_queue:
+                        (
+                            decode_batch_to_process,
+                            decode_result_to_process,
+                            decode_gpu_handle_to_process,
+                        ) = decode_result_queue.popleft()
+                        nvtx.range_end(decode_gpu_handle_to_process)
+                        overlap_log(
+                            f"remain<=0: drain decode queue before update, queue_len_after={len(decode_result_queue)}"
+                        )
+                        self.process_batch_result(
+                            decode_batch_to_process, decode_result_to_process
+                        )
+                    decode_last_batch = None
+                # Last split-prefill layer done on GPU: skip decode this iteration to merge
+                # next — must not prepare_for_decode(); same flag gates update + run_batch.
+                skip_decode_before_prefill_merge = (
+                    self.split_prefill_batch is not None
+                    and self.split_prefill_batch.split_prefill_finished
+                    and prefill_exe_done is not None
+                    and prefill_exe_done.query()
+                )
+                self.running_batch = self.update_running_batch(
+                    self.running_batch,
+                    skip_prepare_decode=skip_decode_before_prefill_merge,
+                )
                 adjust_stream_group = adjust_stream_group or (
                     stream_idx > 0 and self.running_batch.is_empty()
                 )
@@ -940,7 +1146,18 @@ class SchedulerMultiplexMixin:
 
                 stream_idx, stream_group = self.adjust_stream_groups()
                 last_stream_group_idx = len(self.stream_groups) - 1
+                decode_for_pred = (
+                    self.running_batch
+                    if self.running_batch is not None
+                    and not self.running_batch.is_empty()
+                    else None
+                )
                 # New stream group is a natural "safe point" to restart overlap budget.
+                max_overlap_decode_round = self._compute_max_overlap_decode_round(
+                    stream_idx,
+                    decode_batch=decode_for_pred,
+                    prefill_batch=self.split_prefill_batch,
+                )
                 remain_overlap_decode_round = max_overlap_decode_round
                 if (
                     enable_double_launch_before_prefill
@@ -1160,22 +1377,300 @@ class SchedulerMultiplexMixin:
                             decode_gpu_handle_to_process,
                         ) = decode_result_queue.popleft()
                         nvtx.range_end(decode_gpu_handle_to_process)
+                        overlap_log(
+                            f"remain<=0: drain decode queue before update, queue_len_after={len(decode_result_queue)}"
+                        )
+                        self.process_batch_result(
+                            decode_batch_to_process, decode_result_to_process
+                        )
+                    # sync decode_stream after drain decode_result_queue, save the time for decode process_batch_result
+                    decode_stream.synchronize()
+                    decode_last_batch = None
+                # Last split-prefill layer done on GPU: skip decode this iteration to merge
+                # next — must not prepare_for_decode(); same flag gates update + run_batch.
+                skip_decode_before_prefill_merge = (
+                    self.split_prefill_batch is not None
+                    and self.split_prefill_batch.split_prefill_finished
+                    and prefill_exe_done is not None
+                    and prefill_exe_done.query()
+                )
+                self.running_batch = self.update_running_batch(
+                    self.running_batch,
+                    skip_prepare_decode=skip_decode_before_prefill_merge,
+                )
+                adjust_stream_group = adjust_stream_group or (
+                    stream_idx > 0 and self.running_batch.is_empty()
+                )
+                if self.running_batch.is_empty() and self.split_prefill_batch is None:
+                    # Idle: drain queued decode results before memory checks.
+                    while decode_result_queue:
+                        (
+                            decode_batch_to_process,
+                            decode_result_to_process,
+                            decode_gpu_handle_to_process,
+                        ) = decode_result_queue.popleft()
+                        nvtx.range_end(decode_gpu_handle_to_process)
                         self.process_batch_result(
                             decode_batch_to_process, decode_result_to_process
                         )
                     decode_last_batch = None
-                
-                all_req_finished = (
-                    len(decode_batch_to_process.reqs) > 0
-                    and all(req.finished() for req in decode_batch_to_process.reqs)
-                )
-                if all_req_finished:
-                    decode_need_wait = False
-                    decode_run_done = None
-                    arm_decode_need_wait_after_prefill = False
-                    overlap_log(
-                        "process decode result: all req finished, set decode_need_wait=False"
+                    self.check_memory()
+                    self.check_tree_cache()
+                    self.new_token_ratio = self.init_new_token_ratio
+                    self.maybe_sleep_on_idle()
+
+            # adjust stream group (no_double_launch loop)
+            if adjust_stream_group:
+                while decode_result_queue:
+                    (
+                        decode_batch_to_process,
+                        decode_result_to_process,
+                        decode_gpu_handle_to_process,
+                    ) = decode_result_queue.popleft()
+                    nvtx.range_end(decode_gpu_handle_to_process)
+                    self.process_batch_result(
+                        decode_batch_to_process, decode_result_to_process
                     )
+                    all_req_finished = (
+                        len(decode_batch_to_process.reqs) > 0
+                        and all(req.finished() for req in decode_batch_to_process.reqs)
+                    )
+                    if all_req_finished:
+                        decode_need_wait = False
+                        decode_run_done = None
+                        arm_decode_need_wait_after_prefill = False
+                        overlap_log(
+                            "drain decode queue: all req finished, set decode_need_wait=False"
+                        )
+                # sync prefill_stream and decode_stream after drain decode_result_queue, save the time for process_batch_result
+                prefill_stream.synchronize()
+                decode_stream.synchronize()
+                # Drain already processed all pending results from previous loops.
+                # Reset decode_last_batch so the pop-and-process guard below does not
+                # fire on the batch we are about to launch in this same loop.
+                decode_last_batch = None
+                overlap_log("drain done: reset decode_last_batch=None")
+
+                nvtx.range_end(loop_range_handle)
+                loop_range_handle = None
+
+                stream_idx, stream_group = self.adjust_stream_groups()
+                last_stream_group_idx = len(self.stream_groups) - 1
+                decode_for_pred = (
+                    self.running_batch
+                    if self.running_batch is not None
+                    and not self.running_batch.is_empty()
+                    else None
+                )
+                # New stream group is a natural "safe point" to restart overlap budget.
+                max_overlap_decode_round = self._compute_max_overlap_decode_round(
+                    stream_idx,
+                    decode_batch=decode_for_pred,
+                    prefill_batch=self.split_prefill_batch,
+                )
+                remain_overlap_decode_round = max_overlap_decode_round
+
+                loop_range_handle = nvtx.range_start(get_sg_msg() + "adjust_stream_group")
+
+                prefill_stream = stream_group[0]
+                decode_stream = stream_group[1]
+                adjust_stream_group = False
+                logger.debug(
+                    f"Adjusting stream groups: {stream_idx}, prefill sm: {self.sm_counts[stream_idx][0]}, decode sm: {self.sm_counts[stream_idx][1]}"
+                )
+                overlap_log(
+                    f"adjust stream group -> idx={stream_idx}, prefill_sm={self.sm_counts[stream_idx][0]}, decode_sm={self.sm_counts[stream_idx][1]}"
+                )
+
+            decode_batch = None
+            overlap_prefill_plan: Optional[Dict[str, Any]] = None
+            # run decode batch
+            with torch.cuda.stream(decode_stream):
+                set_pdmux_status(False)
+                if (
+                    self.running_batch
+                    and not self.running_batch.is_empty()
+                    and not skip_decode_before_prefill_merge
+                ):
+                    # skip_decode_before_prefill_merge: see flag above (no prepare, no launch).
+                    decode_batch = self.running_batch
+                    overlap_prefill_plan = self._overlap_latency_prefill_plan(
+                        stream_idx,
+                        self.split_prefill_batch,
+                        decode_batch,
+                    )
+                    plan_nvtx = ""
+                    if overlap_prefill_plan is not None:
+                        p = overlap_prefill_plan
+                        plan_nvtx = (
+                            f" | tbl dec_gpu_ms={p['dec_gpu_ms']:.3f}"
+                            f" dec_cpu_pl_ms={p['dec_cpu_pl_ms']:.3f}"
+                            f" prefill_lo_full_ms={p['prefill_lo_full_ms']:.3f}"
+                            f" per_layer_lo_ms={p['per_layer_lo_ms']:.4f}"
+                            f" budget_ms={p['budget_ms']:.3f}"
+                            f" planned_prefill_L={p['L']}"
+                        )
+                    decode_gpu_handle = nvtx.range_start(
+                        "launch decode "
+                        + f"step={decode_forward_count} bs={decode_batch.batch_size()}"
+                        + plan_nvtx
+                        + " | "
+                        + _pdmux_nvtx_len_list_str(
+                            decode_batch, add_decode_global_num_tokens=True
+                        )
+                    )
+                    decode_forward_count += 1
+                    if decode_need_wait and decode_run_done is not None:
+                        overlap_log(
+                            f"decode wait event before launch, prev_step={decode_run_done_step}, queue_len={len(decode_result_queue)}"
+                        )
+                        decode_stream.wait_event(decode_run_done)
+                    # Attach a stable step id for cross-module logging (run_batch/copy_done).
+                    decode_step = decode_forward_count - 1
+                    setattr(decode_batch, "_pdmux_decode_step", decode_step)
+                    rb_decode = nvtx.range_start(
+                        "run_batch decode forward" + plan_nvtx
+                    )
+                    decode_result = self.run_batch(decode_batch)
+                    nvtx.range_end(rb_decode)
+                    remain_overlap_decode_round -= 1
+                    decode_run_done = decode_stream.record_event()
+                    decode_run_done_step = decode_step
+                    overlap_log(
+                        f"decode_run_done <- decode_stream.record_event (fallback), step={decode_step}"
+                    )
+                    decode_result_queue.append(
+                        (decode_batch.copy(), decode_result, decode_gpu_handle)
+                    )
+                    overlap_log(
+                        f"launch decode batch#{decode_forward_count-1}, bs={decode_batch.batch_size()}, need_wait={decode_need_wait}, arm_after_prefill={arm_decode_need_wait_after_prefill}, queue_len={len(decode_result_queue)}"
+                    )
+                    if arm_decode_need_wait_after_prefill:
+                        # Strict sync semantics: the 2nd decode after prefill must wait.
+                        decode_need_wait = True
+                        arm_decode_need_wait_after_prefill = False
+                        overlap_log(
+                            "launch decode batch: consume arm_after_prefill, set decode_need_wait=True"
+                        )
+
+            # run prefill batch
+            with torch.cuda.stream(prefill_stream):
+                set_pdmux_status(True)
+                if (
+                    self.split_prefill_batch
+                    and not self.split_prefill_batch.is_empty()
+                    and not wait_prefill_kernel_done
+                ):
+                    prefill_done = True
+                    H = int(self.model_config.num_hidden_layers)
+                    idx = int(self.split_prefill_batch.split_index)
+                    remain_layers = max(0, H - idx)
+                    forward_count_base = (
+                        max(
+                            1,
+                            self.pdmux_config.split_forward_token_budget
+                            // self.split_prefill_batch.extend_num_tokens,
+                        )
+                        if self.split_prefill_batch.extend_num_tokens > 0
+                        else H
+                    )
+                    forward_count = min(forward_count_base, remain_layers) if remain_layers > 0 else 0
+                    if forward_count <= 0:
+                        forward_count = min(H, remain_layers) if remain_layers > 0 else 1
+                    if overlap_prefill_plan is not None:
+                        forward_count = min(
+                            forward_count,
+                            int(overlap_prefill_plan["L"]),
+                            remain_layers,
+                        )
+                    forward_count = max(1, forward_count)
+                    next_split_index = min(idx + forward_count, H)
+                    forward_count = next_split_index - idx
+
+                    self.split_prefill_batch.split_forward_count = forward_count
+                    prefill_nvtx_plan = ""
+                    if overlap_prefill_plan is not None:
+                        p = overlap_prefill_plan
+                        prefill_nvtx_plan = (
+                            f" | tbl L={p['L']} dec_gpu={p['dec_gpu_ms']:.3f}"
+                            f" dec_cpu_pl={p['dec_cpu_pl_ms']:.3f} lo/L={p['per_layer_lo_ms']:.4f}"
+                        )
+                    if prefill_gpu_handle is None:
+                        prefill_gpu_handle = nvtx.range_start(
+                            "run prefill batch"
+                            + f": {prefill_whole_batch_count} "
+                            + _pdmux_nvtx_len_list_str(self.split_prefill_batch)
+                        )
+                        prefill_whole_batch_count += 1
+                    prefill_launch_handle = nvtx.range_start(
+                        "launch prefill split_forward "
+                        + f": {prefill_forward_count} L={forward_count}{prefill_nvtx_plan} | "
+                        + _pdmux_nvtx_len_list_str(self.split_prefill_batch)
+                    )
+                    prefill_forward_count += 1
+                    rb_prefill = nvtx.range_start(
+                        "run_batch prefill forward "
+                        + f"L={forward_count}{prefill_nvtx_plan}"
+                    )
+                    prefill_result = self.run_batch(self.split_prefill_batch)
+                    nvtx.range_end(rb_prefill)
+                    nvtx.range_end(prefill_launch_handle)
+                    prefill_launch_handle = None
+                    if next_split_index == self.model_config.num_hidden_layers:
+                        self.split_prefill_batch.split_prefill_finished = True
+                        prefill_exe_done = prefill_stream.record_event()
+                    self.split_prefill_batch.split_index = next_split_index
+
+                elif wait_prefill_kernel_done:
+                    prefill_done = True
+                else:
+                    prefill_done = False
+
+            # process decode result
+            with torch.cuda.stream(decode_stream):
+                set_pdmux_status(False)
+                if decode_last_batch and len(decode_result_queue) > 0:
+                    (
+                        decode_batch_to_process,
+                        decode_result_to_process,
+                        decode_gpu_handle_to_process,
+                    ) = decode_result_queue.popleft()
+                    nvtx.range_end(decode_gpu_handle_to_process)
+                    overlap_log(
+                        f"process decode result: bs={decode_batch_to_process.batch_size()}, queue_len_after={len(decode_result_queue)}"
+                    )
+                    self.process_batch_result(decode_batch_to_process, decode_result_to_process)
+                    
+                    is_all_decode_group = stream_idx == last_stream_group_idx
+                    if (not is_all_decode_group) and (remain_overlap_decode_round <= 0) and decode_result_queue:
+                        # force sync decode_stream before drain decode_result_queue
+                        overlap_log(
+                            f"force_sync_decode: drain decode queue before launch, queue_len={len(decode_result_queue)}"
+                        )
+                        while decode_result_queue:
+                            (
+                                decode_batch_to_process,
+                                decode_result_to_process,
+                                decode_gpu_handle_to_process,
+                            ) = decode_result_queue.popleft()
+                            nvtx.range_end(decode_gpu_handle_to_process)
+                            self.process_batch_result(
+                                decode_batch_to_process, decode_result_to_process
+                            )
+                        decode_stream.synchronize()
+                        decode_last_batch = None
+                    
+                    all_req_finished = (
+                        len(decode_batch_to_process.reqs) > 0
+                        and all(req.finished() for req in decode_batch_to_process.reqs)
+                    )
+                    if all_req_finished:
+                        decode_need_wait = False
+                        decode_run_done = None
+                        arm_decode_need_wait_after_prefill = False
+                        overlap_log(
+                            "process decode result: all req finished, set decode_need_wait=False"
+                        )
 
             # process prefill result and merge prefill batch into running batch
             with torch.cuda.stream(prefill_stream):

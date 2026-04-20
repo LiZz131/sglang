@@ -644,6 +644,14 @@ class ServerArgs:
     auto_adjust_stream_group: bool = True
     manual_stream_group_idx: int = 0
     enable_clever_overlap: bool = False
+    # Offline lookup tables (JSON from bench_replay_requests_pdmux) for clever-overlap budget
+    pdmux_offline_tables_path: Optional[str] = None
+    # Nearest-key tie-break when query falls between two table buckets (see pdmux_offline_tables)
+    pdmux_offline_decode_bs_tie_break: str = "up"
+    pdmux_offline_prefill_bs_tie_break: str = "down"
+    pdmux_offline_prefill_max_seq_len_tie_break: str = "down"
+    # Clever-overlap pdmux: optional second decode launch before prefill (see multiplexing_mixin)
+    pdmux_disable_double_launch_before_prefill: bool = False
 
     # For Multi-Modal
     mm_max_concurrent_calls: int = 32
@@ -4611,6 +4619,54 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_clever_overlap,
             help="Enable clever overlap for pdmux. If not set, it is not overlap.",
+        )
+        parser.add_argument(
+            "--pdmux-offline-tables-path",
+            type=str,
+            default=ServerArgs.pdmux_offline_tables_path,
+            help=(
+                "JSON from bench_replay_requests_pdmux (prefill_table/decode_table). "
+                "Loaded at init_pdmux for overlap decode-round prediction when stream group is mixed."
+            ),
+        )
+        parser.add_argument(
+            "--pdmux-offline-decode-bs-tie-break",
+            type=str,
+            choices=["up", "down"],
+            default=ServerArgs.pdmux_offline_decode_bs_tie_break,
+            help=(
+                "When query bs is equidistant from two table buckets, pick larger bs (up) or smaller (down). "
+                "Default: up."
+            ),
+        )
+        parser.add_argument(
+            "--pdmux-offline-prefill-bs-tie-break",
+            type=str,
+            choices=["up", "down"],
+            default=ServerArgs.pdmux_offline_prefill_bs_tie_break,
+            help=(
+                "When query bs has no exact row, nearest bs tie-break: larger (up) or smaller (down). "
+                "Default: down."
+            ),
+        )
+        parser.add_argument(
+            "--pdmux-offline-prefill-max-seq-len-tie-break",
+            type=str,
+            choices=["up", "down"],
+            default=ServerArgs.pdmux_offline_prefill_max_seq_len_tie_break,
+            help=(
+                "When choosing max_seq_len among rows with fixed bs, nearest tie-break: up or down. "
+                "Default: down."
+            ),
+        )
+        parser.add_argument(
+            "--pdmux-disable-double-launch-before-prefill",
+            action="store_true",
+            default=ServerArgs.pdmux_disable_double_launch_before_prefill,
+            help=(
+                "In clever-overlap pdmux, disable the opportunistic second decode launch before prefill "
+                "(double-launch)."
+            ),
         )
 
         # Configuration file support

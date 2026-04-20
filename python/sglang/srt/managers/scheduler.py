@@ -2117,8 +2117,17 @@ class Scheduler(
 
         return new_batch
 
-    def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
-        """Update the current running decoding batch."""
+    def update_running_batch(
+        self,
+        batch: ScheduleBatch,
+        skip_prepare_decode: bool = False,
+    ) -> Optional[ScheduleBatch]:
+        """Update the current running decoding batch.
+
+        If ``skip_prepare_decode`` is True, skip ``prepare_for_decode()`` (KV alloc /
+        seq bookkeeping for the next decode step). Callers that skip ``run_batch`` for
+        the same iteration must set this to avoid allocating KV without a forward.
+        """
         initial_bs = batch.batch_size()
 
         batch.filter_batch(v1_spec_info_filtered=True)
@@ -2194,7 +2203,8 @@ class Scheduler(
             batch.batch_is_full = False
 
         # Update batch tensors
-        batch.prepare_for_decode()
+        if not skip_prepare_decode:
+            batch.prepare_for_decode()
         return batch
 
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
@@ -3061,7 +3071,10 @@ def run_scheduler_process(
                     scheduler.event_loop_pdmux_for_special_dp_attention()
                 elif scheduler.enable_overlap:
                     if server_args.enable_clever_overlap:
-                        scheduler.event_loop_clever_overlap_pdmux()
+                        if server_args.pdmux_disable_double_launch_before_prefill:
+                            scheduler.event_loop_clever_overlap_pdmux_no_double_launch()
+                        else:
+                            scheduler.event_loop_clever_overlap_pdmux()
                     else:
                         scheduler.event_loop_overlap_pdmux()
                 else:
