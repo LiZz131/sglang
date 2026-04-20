@@ -4670,6 +4670,14 @@ class ServerArgs:
                 "(double-launch)."
             ),
         )
+        parser.add_argument(
+            "--enable-pdmux-deepgemm-compile-warmup",
+            action="store_true",
+            help=(
+                "With --enable-pdmux, run DeepGEMM compile-only warmup for each prefill SM count "
+                "from the PD-Mux config (num_sms template / JIT cache), not just the default."
+            ),
+        )
 
         # Configuration file support
         parser.add_argument(
