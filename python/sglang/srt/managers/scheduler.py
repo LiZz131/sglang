@@ -2331,8 +2331,6 @@ class Scheduler(
 
                     # for debug, we set all 0 tensor here;
                     future_indices_or_next_token_ids = -future_indices.indices
-                    # future_indices_or_next_token_ids = torch.zeros(len(batch.reqs), dtype=torch.int32, device=future_indices.indices.device)
-
                     if batch.is_spec_v2:
                         batch.spec_info = batch_result.next_draft_input
                         batch.spec_info.future_indices = future_indices
