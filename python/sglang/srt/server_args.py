@@ -643,13 +643,6 @@ class ServerArgs:
     enable_special_dp_attention_prefix_0: bool = False
     auto_adjust_stream_group: bool = True
     manual_stream_group_idx: int = 0
-    # PD-Multiplexing time model (special-DP event loop): choose stream group by predicted decode run
-    enable_pdmux_time_predictor: bool = False
-    pdmux_decode_budget_ms: float = 25.0
-    # Fitted linear coeffs YAML (prefill_sm/decode_sm per entry); see pdmux_time_model.load_pdmux_fitted_coefficients_yaml
-    pdmux_fitted_coefficients_path: Optional[str] = None
-    # Verbose pdmux / MLP-sync diagnostics (cross-DP prediction consistency)
-    enable_pdmux_diag_log: bool = False
     enable_clever_overlap: bool = False
     # Offline lookup tables (JSON from bench_replay_requests_pdmux) for clever-overlap budget
     pdmux_offline_tables_path: Optional[str] = None
@@ -4622,37 +4615,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.manual_stream_group_idx,
             help="Fixed stream_group index when auto_adjust_stream_group is disabled.",
-        )
-        parser.add_argument(
-            "--enable-pdmux-time-predictor",
-            action="store_true",
-            help=(
-                "Use fitted linear time model to pick stream_group in "
-                "event_loop_pdmux_for_special_dp_attention (min decode SM subject to decode-run budget)."
-            ),
-        )
-        parser.add_argument(
-            "--pdmux-decode-budget-ms",
-            type=float,
-            default=ServerArgs.pdmux_decode_budget_ms,
-            help="Max predicted decode run time (ms) for stream group selection when time predictor is enabled.",
-        )
-        parser.add_argument(
-            "--pdmux-fitted-coefficients-path",
-            type=str,
-            default=ServerArgs.pdmux_fitted_coefficients_path,
-            help=(
-                "YAML with fitted time coefficients per (prefill_sm, decode_sm). "
-                "Runtime stream groups are matched by sm_counts; YAML may list more entries."
-            ),
-        )
-        parser.add_argument(
-            "--enable-pdmux-diag-log",
-            action="store_true",
-            help=(
-                "Log MLP sync all-gather outputs (global_num_tokens, global_seq_lens_sum_per_dp) "
-                "and per-rank pdmux time predictor inputs; use to verify DP ranks match."
-            ),
         )
         parser.add_argument(
             "--enable-clever-overlap",

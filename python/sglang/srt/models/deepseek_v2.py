@@ -20,7 +20,6 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import os
-import time
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -236,109 +235,6 @@ else:
 _is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
 
 logger = logging.getLogger(__name__)
-
-# Set SGLANG_DEBUG_SAVE_LAYER_HIDDENS=1 to dump per-layer hidden_states + residual + token
-# metadata for offline comparison (normal forward vs forward_split_prefill / pdmux).
-_DEBUG_LAYER_HIDDENS_RUN_ID: Optional[str] = None
-normal_forward_tag = "normal_forward"
-
-
-def _get_debug_layer_hiddens_run_id() -> str:
-    global _DEBUG_LAYER_HIDDENS_RUN_ID
-    if _DEBUG_LAYER_HIDDENS_RUN_ID is None:
-        _DEBUG_LAYER_HIDDENS_RUN_ID = os.environ.get(
-            "SGLANG_DEBUG_SAVE_LAYER_HIDDENS_RUN_ID"
-        ) or f"{os.getpid()}_{int(time.time() * 1000)}"
-    return _DEBUG_LAYER_HIDDENS_RUN_ID
-
-
-def _debug_save_layer_hidden_if_enabled(
-    path_tag: str,
-    layer_id: int,
-    stage: str,
-    hidden_states: torch.Tensor,
-    residual: Optional[torch.Tensor],
-    forward_batch: ForwardBatch,
-    input_ids: torch.Tensor,
-    positions: torch.Tensor,
-    split_interval: Optional[Tuple[int, int]] = None,
-) -> None:
-    """Save layer output tensors for A/B (normal vs split-prefill) debugging.
-
-    Enable with: ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS=1`` (or ``true``/``yes``/``on``).
-
-    **Decode batches are never saved**: decode forward typically uses CUDA graph; dumping
-    would sync/copy inside the graph path and is disabled by design.
-
-    Optional env:
-    - ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DIR`` (default ``/tmp/sglang_layer_hiddens``)
-    - ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_RUN_ID`` — same value for two runs to align names
-    - ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_SYNC=1`` — ``torch.cuda.synchronize()`` before copy
-    """
-    v = (os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS", "") or "").lower()
-    if v not in ("1", "true", "yes", "on"):
-        return
-    forward_mode = getattr(forward_batch, "forward_mode", None)
-    if forward_mode is not None and forward_mode.is_decode():
-        return
-    if is_in_piecewise_cuda_graph():
-        return
-    if os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS_SYNC", "0") == "1":
-        torch.cuda.synchronize()
-    dump_root = os.environ.get(
-        "SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DIR", "/tmp/sglang_layer_hiddens"
-    )
-    run_id = _get_debug_layer_hiddens_run_id()
-    out_dir = os.path.join(dump_root, f"run_{run_id}", path_tag)
-    os.makedirs(out_dir, exist_ok=True)
-    tp_r = int(get_tensor_model_parallel_rank())
-    try:
-        adp_r = int(get_attention_dp_rank())
-    except Exception:
-        adp_r = -1
-    # NOTE: stage is part of filename so multiple dumps per layer don't overwrite.
-    # Keep it filesystem-friendly.
-    stage = (stage or "layer_out").replace(os.sep, "_").replace(" ", "_")
-    fname = f"layer_{layer_id:04d}_{stage}_tp{tp_r}.pt"
-    out_path = os.path.join(out_dir, fname)
-    slc = getattr(forward_batch, "seq_lens_cpu", None)
-    if slc is None:
-        slc_cpu = None
-    elif isinstance(slc, torch.Tensor):
-        slc_cpu = slc.detach().contiguous().cpu()
-    else:
-        slc_cpu = torch.tensor(slc, dtype=torch.int32)
-    seq_lens_gpu = getattr(forward_batch, "seq_lens", None)
-    seq_lens_t = (
-        seq_lens_gpu.detach().contiguous().cpu() if seq_lens_gpu is not None else None
-    )
-    fm_str = str(forward_mode) if forward_mode is not None else None
-    payload: Dict[str, Any] = {
-        "version": 1,
-        "path_tag": path_tag,
-        "layer_id": layer_id,
-        "stage": stage,
-        "split_interval": split_interval,
-        "input_ids": input_ids.detach().contiguous().cpu(),
-        "positions": positions.detach().contiguous().cpu(),
-        "seq_lens_cpu": slc_cpu,
-        "seq_lens": seq_lens_t,
-        "tp_rank": tp_r,
-        "attn_dp_rank": adp_r,
-        "forward_mode": fm_str,
-        "global_num_tokens": list(getattr(forward_batch, "global_num_tokens", []) or []),
-        "global_seq_lens_sum_per_dp": list(
-            getattr(forward_batch, "global_seq_lens_sum_per_dp", []) or []
-        ),
-        "hidden_states": hidden_states.detach().contiguous().cpu(),
-        "residual": None
-        if residual is None
-        else residual.detach().contiguous().cpu(),
-    }
-    try:
-        torch.save(payload, out_path)
-    except Exception as e:
-        logger.warning("SGLANG_DEBUG_SAVE_LAYER_HIDDENS: failed to save %s: %s", out_path, e)
 
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
@@ -2814,30 +2710,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             # Save latent cache
             # slice kv_a and k_pe according to forward_batch.dp_local_token_start and forward_batch.dp_local_token_end
             # out_cache_loc has been sliced
-            local_tok_n = forward_batch.dp_local_token_end - forward_batch.dp_local_token_start
-            oc_n = forward_batch.out_cache_loc.shape[0]
-            if oc_n != local_tok_n:
-                ggpu = forward_batch.global_num_tokens_gpu
-                ggpu_list = (
-                    ggpu.detach().cpu().tolist()
-                    if isinstance(ggpu, torch.Tensor)
-                    else ggpu
-                )
-                raise AssertionError(
-                    "_set_mla_kv_buffer_for_dp: out_cache_loc length != dp local token span.\n"
-                    f"  out_cache_loc.shape[0]={oc_n}, local_tok_n={local_tok_n}\n"
-                    f"  dp_local_token_start={forward_batch.dp_local_token_start}, "
-                    f"dp_local_token_end={forward_batch.dp_local_token_end}\n"
-                    f"  forward_mode={forward_batch.forward_mode}, batch_size={forward_batch.batch_size}, "
-                    f"seq_lens_sum={forward_batch.seq_lens_sum}\n"
-                    f"  global_num_tokens_cpu={forward_batch.global_num_tokens_cpu}, "
-                    f"global_num_tokens_gpu={ggpu_list}\n"
-                    f"  is_extend_in_batch={forward_batch.is_extend_in_batch}, "
-                    f"extend_num_tokens={forward_batch.extend_num_tokens}\n"
-                    f"  out_cache_loc: shape={tuple(forward_batch.out_cache_loc.shape)}, "
-                    f"dtype={forward_batch.out_cache_loc.dtype}, device={forward_batch.out_cache_loc.device}"
-                )
-            if local_tok_n == 0:
+            assert forward_batch.out_cache_loc.shape[0] == forward_batch.dp_local_token_end - forward_batch.dp_local_token_start
+            if forward_batch.dp_local_token_end - forward_batch.dp_local_token_start == 0:
                 return
             kv_a_sliced = kv_a[forward_batch.dp_local_token_start:forward_batch.dp_local_token_end]
             k_pe_sliced = k_pe[forward_batch.dp_local_token_start:forward_batch.dp_local_token_end]
@@ -3138,18 +3012,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 )
                 get_attn_tp_context().set_attn_inputs(attn_inputs)
             # logger.debug(f"after set_attn_inputs, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
-            
-            # TODO: before attn: dump hidden_states and residual
-            _debug_save_layer_hidden_if_enabled(
-                "split_prefill",
-                self.layer_id,
-                "pre_attn",
-                hidden_states,
-                residual,
-                forward_batch,
-                forward_batch.input_ids,
-                positions,
-            )
 
             # Attention 操作
             hidden_states = self.self_attn(
@@ -3160,17 +3022,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 llama_4_scaling=llama_4_scaling,
             )
             # logger.debug(f"after self_attn, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
-            # TODO: after attn: dump hidden_states and residual
-            _debug_save_layer_hidden_if_enabled(
-                "split_prefill",
-                self.layer_id,
-                "post_attn",
-                hidden_states,
-                residual,
-                forward_batch,
-                forward_batch.input_ids,
-                positions,
-            )
 
             # 此时 hidden_states 形状完整, 值不完整, 需要通过 all-reduce 变成完整数据
             # post-attention-layernorm 操作, 
@@ -3182,42 +3033,18 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(hidden_states)
             # logger.debug(f"after post_attention_layernorm, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
 
-            # TODO: before mlp: dump hidden_states and residual
-            _debug_save_layer_hidden_if_enabled(
-                "split_prefill",
-                self.layer_id,
-                "pre_mlp",
-                hidden_states,
-                residual,
-                forward_batch,
-                forward_batch.input_ids,
-                positions,
-            )
             # MLP 操作
             if isinstance(self.mlp, DeepseekV2MLP):
                 gemm_output_zero_allocator = None
             
-            skip_all_reduce_in_mlp = True
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
-                skip_all_reduce_in_mlp,
+                False,
                 False,
                 gemm_output_zero_allocator,
             )
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             # logger.debug(f"after mlp, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
-            # TODO: after mlp: dump hidden_states and residual
-            _debug_save_layer_hidden_if_enabled(
-                "split_prefill",
-                self.layer_id,
-                "post_mlp",
-                hidden_states,
-                residual,
-                forward_batch,
-                forward_batch.input_ids,
-                positions,
-            )
             return hidden_states, residual
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -3225,17 +3052,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             residual,
             forward_batch,
             quant_format,
-        )
-        # TODO: before attn: dump hidden_states and residual
-        _debug_save_layer_hidden_if_enabled(
-            normal_forward_tag,
-            self.layer_id,
-            "pre_attn",
-            hidden_states,
-            residual,
-            forward_batch,
-            forward_batch.input_ids,
-            positions,
         )
 
         hidden_states = self.self_attn(
@@ -3245,33 +3061,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
         )
-        # TODO: after attn: dump hidden_states and residual
-        _debug_save_layer_hidden_if_enabled(
-            normal_forward_tag,
-            self.layer_id,
-            "post_attn",
-            hidden_states,
-            residual,
-            forward_batch,
-            forward_batch.input_ids,
-            positions,
-        )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
 
-        # TODO: before mlp: dump hidden_states and residual
-        _debug_save_layer_hidden_if_enabled(
-            normal_forward_tag,
-            self.layer_id,
-            "pre_mlp",
-            hidden_states,
-            residual,
-            forward_batch,
-            forward_batch.input_ids,
-            positions,
-        )
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
@@ -3292,17 +3086,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             should_allreduce_fusion,
             use_reduce_scatter,
             gemm_output_zero_allocator,
-        )
-        # TODO: after mlp: dump hidden_states and residual
-        _debug_save_layer_hidden_if_enabled(
-            normal_forward_tag,
-            self.layer_id,
-            "post_mlp",
-            hidden_states,
-            residual,
-            forward_batch,
-            forward_batch.input_ids,
-            positions,
         )
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
@@ -3607,16 +3390,6 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                 )
-                _debug_save_layer_hidden_if_enabled(
-                    normal_forward_tag,
-                    i,
-                    "layer_out",
-                    hidden_states,
-                    residual,
-                    forward_batch,
-                    input_ids,
-                    positions,
-                )
 
         # logger.info(f"after end layer, hidden_states: {hidden_states.shape}, residual: {residual.shape}")
         if normal_end_layer != self.end_layer:
@@ -3880,17 +3653,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                         llama_4_scaling,
                     )
                     logger.debug(f"causal split prefill, layer {i}, hidden_states: {forward_batch.hidden_states.shape}, residual: {forward_batch.residual.shape if forward_batch.residual is not None else None}")
-                    _debug_save_layer_hidden_if_enabled(
-                        "split_prefill",
-                        i,
-                        "layer_out",
-                        forward_batch.hidden_states,
-                        forward_batch.residual,
-                        forward_batch,
-                        input_ids,
-                        positions,
-                        split_interval=split_interval,
-                    )
 
                 nvtx.range_end(layer_gpu_handle)
         if end == self.model.num_hidden_layers and self.pp_group.is_last_rank:

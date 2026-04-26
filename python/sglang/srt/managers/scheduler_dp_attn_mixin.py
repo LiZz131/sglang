@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -18,7 +17,6 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -143,7 +141,6 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
     enable_special_dp_attention: bool = False,
-    enable_pdmux_diag_log: bool = False,
 ):
     # Check if other DP workers have running batches
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
@@ -213,15 +210,6 @@ def prepare_mlp_sync_batch_raw(
             )
         )
 
-        if enable_pdmux_diag_log and enable_special_dp_attention:
-            logger.info(
-                "pdmux MLP sync post-all_gather (collectives finished): "
-                "global_num_tokens=%s global_seq_lens_sum_per_dp=%s local_seq_lens_sum=%s",
-                mlp_sync_info.global_num_tokens,
-                mlp_sync_info.global_seq_lens_sum_per_dp,
-                local_seq_lens_sum,
-            )
-
     need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
     if need_idle_batch:
         batch_to_gather = local_batch
@@ -236,22 +224,6 @@ def prepare_mlp_sync_batch_raw(
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
-
-    if enable_pdmux_diag_log and enable_special_dp_attention and local_batch is not None:
-        gnt = getattr(local_batch, "global_num_tokens", None)
-        gss = getattr(local_batch, "global_seq_lens_sum_per_dp", None)
-        logger.info(
-            "pdmux MLP sync done: skip_all_gather=%s forward_mode=%s batch_size=%s "
-            "num_tokens(local)=%s local_seq_lens_sum=%s global_num_tokens=%s "
-            "global_seq_lens_sum_per_dp=%s",
-            skip_all_gather,
-            local_batch.forward_mode.name if local_batch.forward_mode else None,
-            local_batch.batch_size(),
-            num_tokens,
-            local_seq_lens_sum,
-            gnt,
-            gss,
-        )
 
     return local_batch
 
@@ -269,9 +241,6 @@ class SchedulerDPAttnMixin:
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
             enable_special_dp_attention=self.server_args.enable_special_dp_attention,
-            enable_pdmux_diag_log=getattr(
-                self.server_args, "enable_pdmux_diag_log", False
-            ),
         )
 
     def maybe_prepare_mlp_sync_batch_and_log_stats(
