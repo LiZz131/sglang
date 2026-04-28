@@ -11,6 +11,7 @@ _PREFILL_KEY_RE = re.compile(r"^bs=(\d+),max_seq_len=(\d+)$")
 _DECODE_KEY_RE = re.compile(r"^bs=(\d+)$")
 
 TieBreak = Literal["up", "down"]
+MetricKind = Literal["gpu_run_ms", "cpu_prepare_and_launch_ms", "cpu_launch_only_ms"]
 
 
 def _tie_pick(target: int, candidates: Sequence[int], tie: TieBreak) -> Optional[int]:
@@ -99,26 +100,36 @@ def _lookup_decode_like(
 
 
 class PDMuxOfflineTables:
-    """Lookup prefill/decode times (ms) per stream_group_idx from offline JSON (CPU ms from bench)."""
+    """Lookup prefill/decode times (ms) per stream_group_idx from offline JSON.
+
+    Each of prefill/decode supports three metric kinds:
+    - ``gpu_run_ms``: CUDA-event elapsed time of ``forward`` (bench key: ``*_gpu_run_ms``)
+    - ``cpu_prepare_and_launch_ms``: CPU interval including prepare+launch (bench key: ``*_cpu_prepare_and_launch_ms``)
+    - ``cpu_launch_only_ms``: CPU launch-only interval (bench key: ``*_cpu_launch_only_ms``)
+    """
 
     def __init__(
         self,
-        prefill: Dict[int, Dict[str, float]],
-        decode: Dict[int, Dict[str, float]],
+        prefill_gpu_run: Dict[int, Dict[str, float]],
+        prefill_cpu_prepare_and_launch: Dict[int, Dict[str, float]],
+        prefill_cpu_launch_only: Dict[int, Dict[str, float]],
+        decode_gpu_run: Dict[int, Dict[str, float]],
+        decode_cpu_prepare_and_launch: Dict[int, Dict[str, float]],
+        decode_cpu_launch_only: Dict[int, Dict[str, float]],
         *,
         decode_bs_tie_break: TieBreak = "up",
         prefill_bs_tie_break: TieBreak = "down",
         prefill_max_seq_len_tie_break: TieBreak = "down",
-        prefill_launch_only: Optional[Dict[int, Dict[str, float]]] = None,
-        decode_gpu_run: Optional[Dict[int, Dict[str, float]]] = None,
     ):
-        self.prefill = prefill
-        self.decode = decode
+        self.prefill_gpu_run = prefill_gpu_run
+        self.prefill_cpu_prepare_and_launch = prefill_cpu_prepare_and_launch
+        self.prefill_cpu_launch_only = prefill_cpu_launch_only
+        self.decode_gpu_run = decode_gpu_run
+        self.decode_cpu_prepare_and_launch = decode_cpu_prepare_and_launch
+        self.decode_cpu_launch_only = decode_cpu_launch_only
         self.decode_bs_tie_break = decode_bs_tie_break
         self.prefill_bs_tie_break = prefill_bs_tie_break
         self.prefill_max_seq_len_tie_break = prefill_max_seq_len_tie_break
-        self.prefill_launch_only = prefill_launch_only or {}
-        self.decode_gpu_run = decode_gpu_run or {}
 
     @staticmethod
     def from_json(
@@ -129,47 +140,54 @@ class PDMuxOfflineTables:
         prefill_max_seq_len_tie_break: TieBreak = "down",
     ) -> PDMuxOfflineTables:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
-        pre = _parse_stream_group_table(
+
+        # Primary schema (bench_replay_requests_pdmux)
+        pre_gpu = _parse_stream_group_table(raw.get("prefill_gpu_run_ms") or {})
+        pre_pl = _parse_stream_group_table(
             raw.get("prefill_cpu_prepare_and_launch_ms")
             or raw.get("prefill_table")
             or {}
         )
-        dec = _parse_stream_group_table(
+        pre_lo = _parse_stream_group_table(raw.get("prefill_cpu_launch_only_ms") or {})
+        dec_gpu = _parse_stream_group_table(raw.get("decode_gpu_run_ms") or {})
+        dec_pl = _parse_stream_group_table(
             raw.get("decode_cpu_prepare_and_launch_ms")
             or raw.get("decode_table")
             or {}
         )
-        pre_lo = _parse_stream_group_table(
-            raw.get("prefill_cpu_launch_only_ms") or {}
-        )
-        dec_gpu = _parse_stream_group_table(raw.get("decode_gpu_run_ms") or {})
+        dec_lo = _parse_stream_group_table(raw.get("decode_cpu_launch_only_ms") or {})
+
         return PDMuxOfflineTables(
-            pre,
-            dec,
+            pre_gpu,
+            pre_pl,
+            pre_lo,
+            dec_gpu,
+            dec_pl,
+            dec_lo,
             decode_bs_tie_break=decode_bs_tie_break,
             prefill_bs_tie_break=prefill_bs_tie_break,
             prefill_max_seq_len_tie_break=prefill_max_seq_len_tie_break,
-            prefill_launch_only=pre_lo,
-            decode_gpu_run=dec_gpu,
         )
 
-    def lookup_prefill(self, stream_group_idx: int, bs: int, max_seq_len: int) -> Optional[float]:
-        """Nearest-neighbor prefill time (ms): exact key, else same-bs nearest max_seq_len, else nearest bs then max_seq_len."""
-        return _lookup_prefill_like(
-            self.prefill,
-            stream_group_idx,
-            bs,
-            max_seq_len,
-            self.prefill_bs_tie_break,
-            self.prefill_max_seq_len_tie_break,
-        )
-
-    def lookup_prefill_launch_only(
-        self, stream_group_idx: int, bs: int, max_seq_len: int
+    def lookup_prefill(
+        self,
+        stream_group_idx: int,
+        bs: int,
+        max_seq_len: int,
+        *,
+        metric: MetricKind = "gpu_run_ms",
     ) -> Optional[float]:
-        """CPU launch-only segment for full-model prefill (ms); same keys as ``lookup_prefill``."""
+        """Nearest-neighbor prefill time (ms) for a given metric kind."""
+        if metric == "gpu_run_ms":
+            table = self.prefill_gpu_run
+        elif metric == "cpu_prepare_and_launch_ms":
+            table = self.prefill_cpu_prepare_and_launch
+        elif metric == "cpu_launch_only_ms":
+            table = self.prefill_cpu_launch_only
+        else:
+            return None
         return _lookup_prefill_like(
-            self.prefill_launch_only,
+            table,
             stream_group_idx,
             bs,
             max_seq_len,
@@ -177,17 +195,23 @@ class PDMuxOfflineTables:
             self.prefill_max_seq_len_tie_break,
         )
 
-    def lookup_decode(self, stream_group_idx: int, bs: int) -> Optional[float]:
-        """Nearest-neighbor decode **CPU prepare+launch** (ms) by ``bs``."""
-        return _lookup_decode_like(
-            self.decode, stream_group_idx, bs, self.decode_bs_tie_break
-        )
-
-    def lookup_decode_gpu_run(self, stream_group_idx: int, bs: int) -> Optional[float]:
-        """Nearest-neighbor decode **GPU run** (ms) by ``bs`` (CUDA event window from bench)."""
-        return _lookup_decode_like(
-            self.decode_gpu_run, stream_group_idx, bs, self.decode_bs_tie_break
-        )
+    def lookup_decode(
+        self,
+        stream_group_idx: int,
+        bs: int,
+        *,
+        metric: MetricKind = "gpu_run_ms",
+    ) -> Optional[float]:
+        """Nearest-neighbor decode time (ms) for a given metric kind."""
+        if metric == "gpu_run_ms":
+            table = self.decode_gpu_run
+        elif metric == "cpu_prepare_and_launch_ms":
+            table = self.decode_cpu_prepare_and_launch
+        elif metric == "cpu_launch_only_ms":
+            table = self.decode_cpu_launch_only
+        else:
+            return None
+        return _lookup_decode_like(table, stream_group_idx, bs, self.decode_bs_tie_break)
 
 
 def _parse_stream_group_table(raw: dict) -> Dict[int, Dict[str, float]]:
