@@ -73,6 +73,7 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import (
     AttentionInputs,
+    FUSE_ALLREDUCE_MAX_BATCH_SIZE,
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
@@ -169,8 +170,11 @@ from sglang.srt.utils import (
     add_prefix,
     bind_or_assign,
     get_bool_env_var,
+    is_flashinfer_available,
     is_non_idle_and_non_empty,
     is_nvidia_cublas_cu12_version_ge_12_9,
+    is_sm100_supported,
+    is_sm90_supported,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -234,6 +238,9 @@ else:
     pass
 
 _is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
+_is_flashinfer_available = is_flashinfer_available()
+_is_sm90_supported_cuda = _is_cuda and is_sm90_supported()
+_is_sm100_supported_cuda = _is_cuda and is_sm100_supported()
 
 logger = logging.getLogger(__name__)
 
@@ -3078,6 +3085,61 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
+    @staticmethod
+    def _prepare_mlp_tp_only_maybe_fusion(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        layernorm: torch.nn.Module,
+        *,
+        npu_mlp_weight_cache: Optional[Any] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pure-TP slice of ``LayerCommunicator.prepare_mlp`` (attn_dp_size==1, no scattered input).
+
+        Mirrors ``CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual``
+        final ``else`` branch: optional flashinfer allreduce+LN fusion, else AR then RMSNorm.
+        """
+        if (
+            (_is_sm100_supported_cuda or _is_sm90_supported_cuda)
+            and _is_flashinfer_available
+            and hasattr(layernorm, "forward_with_allreduce_fusion")
+            and get_global_server_args().enable_flashinfer_allreduce_fusion
+            and hidden_states.shape[0] <= 2048
+        ):
+            return layernorm.forward_with_allreduce_fusion(hidden_states, residual)
+
+        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    def _should_fuse_mlp_allreduce_with_next_layer(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        is_last_layer = self.is_nextn or (
+            self.layer_id == self.config.num_hidden_layers - 1
+        )
+        batch_size = (
+            forward_batch.input_ids.shape[0]
+            if hasattr(forward_batch, "input_ids")
+            else 0
+        )
+        if batch_size > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
+            return False
+        
+        static_conditions_met = (
+            (not is_last_layer)
+            and get_global_server_args().enable_flashinfer_allreduce_fusion
+            and _is_flashinfer_available
+        )
+
+        if not static_conditions_met:
+            return False
+
+        return (
+            batch_size > 0
+            and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
+            and (not is_last_layer)
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -3126,9 +3188,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
             else:
-                hidden_states += residual
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
             # logger.debug(f"after input_layernorm, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
             
             # set attn inputs
@@ -3172,16 +3232,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                 positions,
             )
 
-            # 此时 hidden_states 形状完整, 值不完整, 需要通过 all-reduce 变成完整数据
-            # post-attention-layernorm 操作, 
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-            # logger.info(f"layer id: {self.layer_id}, after tensor_model_parallel_all_reduce, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
-            # logger.info(f"layer id: {self.layer_id}, after tensor_model_parallel_all_reduce, hidden_states mean is: {hidden_states.mean()}")
-            hidden_states += residual
-            residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            # logger.debug(f"after post_attention_layernorm, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
-
+            # post-attn: TP all-reduce (+ optional flashinfer fusion) + post_attention_layernorm,
+            # aligned with LayerCommunicator.prepare_mlp when only the pure-TP branch applies.
+            hidden_states, residual = self._prepare_mlp_tp_only_maybe_fusion(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm,
+            )
+            
             # TODO: before mlp: dump hidden_states and residual
             _debug_save_layer_hidden_if_enabled(
                 "split_prefill",
@@ -3197,6 +3255,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             if isinstance(self.mlp, DeepseekV2MLP):
                 gemm_output_zero_allocator = None
             
+            should_allreduce_fusion = self._should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
             skip_all_reduce_in_mlp = True
             hidden_states = self.mlp(
                 hidden_states,
@@ -3205,9 +3266,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 False,
                 gemm_output_zero_allocator,
             )
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             # logger.debug(f"after mlp, hidden_states: {hidden_states.shape}, residual: {residual.shape if residual is not None else None}")
             # TODO: after mlp: dump hidden_states and residual
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             _debug_save_layer_hidden_if_enabled(
                 "split_prefill",
                 self.layer_id,
