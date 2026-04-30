@@ -3,9 +3,10 @@
 Compare per-layer debug dumps from SGLANG_DEBUG_SAVE_LAYER_HIDDENS (normal_forward vs split_prefill).
 
 Usage:
-  python compare_tensor.py \\
-    --a /path/to/run_1/normal_forward \\
-    --b /path/to/run_1/split_prefill
+ python compare_tensor.py \
+ --a run_add_logit/normal_forward \
+ --b run_add_logit/split_prefill \
+    --half > run_add_logit.diff
 
 Or with defaults under this script's sibling ``run_1/`` layout.
 

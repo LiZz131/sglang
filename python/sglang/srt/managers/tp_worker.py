@@ -48,6 +48,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils.debug_sampling_dump import dump_next_token_logits_topk
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -452,6 +453,15 @@ class TpModelWorker(BaseTpWorker):
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            # Debug-only: attach req ids for offline dump alignment.
+            try:
+                forward_batch._debug_req_ids = (
+                    [str(r.rid) for r in (model_worker_batch.reqs or [])]
+                    if model_worker_batch.reqs is not None
+                    else []
+                )
+            except Exception:
+                forward_batch._debug_req_ids = []
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -466,6 +476,38 @@ class TpModelWorker(BaseTpWorker):
                 skip_attn_backend_init=skip_attn_backend_init,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+
+            # Debug dump: raw next_token_logits + sampling_info (prefill & decode).
+            if logits_output is not None and model_worker_batch is not None:
+                try:
+                    req_ids = (
+                        [str(r.rid) for r in (model_worker_batch.reqs or [])]
+                        if model_worker_batch.reqs is not None
+                        else []
+                    )
+                    if req_ids and logits_output.next_token_logits is not None:
+                        phase = (
+                            "decode"
+                            if forward_batch.forward_mode.is_decode()
+                            else "prefill"
+                        )
+                        pos = (
+                            forward_batch.positions
+                            if forward_batch.forward_mode.is_decode()
+                            else (forward_batch.seq_lens - 1)
+                        )
+                        dump_next_token_logits_topk(
+                            req_ids=req_ids,
+                            phase=phase,
+                            positions=pos,
+                            next_token_logits=logits_output.next_token_logits,
+                            sampling_info=model_worker_batch.sampling_info,
+                            stage="raw",
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[debug_dump_sampling] failed to dump raw logits: {e}"
+                    )
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
@@ -533,15 +575,35 @@ class TpModelWorker(BaseTpWorker):
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
             batch.split_forward_batch = forward_batch
             batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
+            # Align with forward_batch_generation: sample() and debug dumps expect ForwardBatch.
+            try:
+                forward_batch._debug_req_ids = (
+                    [str(r.rid) for r in (model_worker_batch.reqs or [])]
+                    if model_worker_batch.reqs is not None
+                    else []
+                )
+            except Exception:
+                forward_batch._debug_req_ids = []
         else:
             model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)
+            # Keep req ids aligned with the current worker batch (same order as seq_lens).
+            try:
+                batch.split_forward_batch._debug_req_ids = (
+                    [str(r.rid) for r in (model_worker_batch.reqs or [])]
+                    if model_worker_batch.reqs is not None
+                    else []
+                )
+            except Exception:
+                batch.split_forward_batch._debug_req_ids = []
 
         out = self.model_runner.forward(
             batch.split_forward_batch, split_forward_count=batch.split_forward_count
         )
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
         if logits_output:
-            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+            next_token_ids = self.model_runner.sample(
+                logits_output, batch.split_forward_batch
+            )
         else:
             next_token_ids = None
         batch_result = GenerationBatchResult(

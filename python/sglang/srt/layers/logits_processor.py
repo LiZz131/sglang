@@ -15,6 +15,8 @@
 
 import dataclasses
 import logging
+import os
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -65,6 +67,75 @@ from sglang.srt.utils import is_npu, use_intel_amx_backend
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+# Debug dump: only intended for offline correctness investigation.
+_DEBUG_DUMP_PREFILL_FULL_LOGITS_RUN_ID: Optional[str] = None
+
+
+def _get_debug_dump_prefill_full_logits_run_id() -> str:
+    global _DEBUG_DUMP_PREFILL_FULL_LOGITS_RUN_ID
+    if _DEBUG_DUMP_PREFILL_FULL_LOGITS_RUN_ID is None:
+        # Reuse the same run-id as hidden-state dumps when available, so A/B/C file names align.
+        _DEBUG_DUMP_PREFILL_FULL_LOGITS_RUN_ID = (
+            os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS_RUN_ID")
+            or os.environ.get("SGLANG_DEBUG_DUMP_PREFILL_FULL_LOGITS_RUN_ID")
+            or f"{os.getpid()}_{int(time.time() * 1000)}"
+        )
+    return _DEBUG_DUMP_PREFILL_FULL_LOGITS_RUN_ID
+
+
+def _debug_dump_prefill_full_logits_if_enabled(
+    *,
+    input_ids: torch.Tensor,
+    full_logits: torch.Tensor,
+    logits_metadata: Any,
+    special_dp_attention: bool,
+) -> None:
+    v = (os.environ.get("SGLANG_DEBUG_DUMP_PREFILL_FULL_LOGITS", "") or "").lower()
+    if v not in ("1", "true", "yes", "on"):
+        return
+
+    # Only dump prefill split-prefill batches (decode typically runs in CUDA graph path).
+    if not logits_metadata.forward_mode.is_split_prefill():
+        return
+
+    dump_root = (
+        os.environ.get("SGLANG_DEBUG_DUMP_PREFILL_FULL_LOGITS_DIR")
+        or os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DIR")
+        or "/tmp/sglang_layer_hiddens"
+    )
+    run_id = _get_debug_dump_prefill_full_logits_run_id()
+    out_dir = os.path.join(dump_root, f"run_{run_id}", "prefill_full_logits")
+    os.makedirs(out_dir, exist_ok=True)
+
+    tp_r = int(get_tensor_model_parallel_rank())
+    try:
+        adp_r = int(get_attention_dp_rank())
+    except Exception:
+        adp_r = -1
+
+    fwd_tag = str(logits_metadata.forward_mode)
+    fname = f"logits_{fwd_tag}_tp{tp_r}.pt"
+    out_path = os.path.join(out_dir, fname.replace(os.sep, "_").replace(" ", "_"))
+
+    # NOTE: keep tensors on GPU; torch.save will serialize device tensors for later offline loading.
+    payload = {
+        "full_logits": full_logits,
+        "input_ids": input_ids,
+        "forward_mode": logits_metadata.forward_mode,
+        "special_dp_attention": special_dp_attention,
+        "tp_rank": tp_r,
+        "attention_dp_rank": adp_r,
+        "shapes": {
+            "full_logits": tuple(full_logits.shape),
+            "input_ids": tuple(input_ids.shape),
+        },
+    }
+    torch.save(payload, out_path)
+    logger.info(
+        f"[debug_dump_prefill_full_logits] saved prefill full logits to: {out_path} "
+        f"shape={tuple(full_logits.shape)} dtype={full_logits.dtype}"
+    )
 
 
 @dataclasses.dataclass
@@ -530,11 +601,28 @@ class LogitsProcessor(nn.Module):
                 input_logprob_indices, device=pruned_states.device, dtype=torch.int64
             )
 
-        full_logits = (
-            self._get_logits(hidden_states, lm_head, logits_metadata, special_dp_attention=special_dp_attention)
-            if self.return_full_logits
-            else None
+        dump_prefill_full_logits = (
+            (os.environ.get("SGLANG_DEBUG_DUMP_PREFILL_FULL_LOGITS", "") or "").lower()
+            in ("1", "true", "yes", "on")
         )
+
+        computed_full_logits = None
+        if self.return_full_logits or dump_prefill_full_logits:
+            computed_full_logits = self._get_logits(
+                hidden_states,
+                lm_head,
+                logits_metadata,
+                special_dp_attention=special_dp_attention,
+            )
+            if dump_prefill_full_logits:
+                _debug_dump_prefill_full_logits_if_enabled(
+                    input_ids=input_ids,
+                    full_logits=computed_full_logits,
+                    logits_metadata=logits_metadata,
+                    special_dp_attention=special_dp_attention,
+                )
+
+        full_logits = computed_full_logits if self.return_full_logits else None
 
         hidden_states_to_store: Optional[torch.Tensor] = None
         hidden_states_to_store_before_norm: Optional[torch.Tensor] = None
@@ -581,6 +669,13 @@ class LogitsProcessor(nn.Module):
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata, special_dp_attention=special_dp_attention)
+            # dump logits
+            _debug_dump_prefill_full_logits_if_enabled(
+                input_ids=input_ids,
+                full_logits=logits,
+                logits_metadata=logits_metadata,
+                special_dp_attention=special_dp_attention,
+            )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -880,7 +975,6 @@ class LogitsProcessor(nn.Module):
                 weight = lm_head.weight
             else:
                 weight = lm_head.weight
-            logger.debug(f"in get_logits, special_dp_attention: {special_dp_attention}, weight shape: {weight.shape}")
             if self.use_fp32_lm_head:
                 logits = torch.matmul(
                     hidden_states.to(torch.float32), weight.to(torch.float32).T

@@ -100,6 +100,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+from sglang.srt.utils.debug_sampling_dump import dump_next_token_logits_topk
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -2264,6 +2265,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
+            logger.debug(f"model runner _forward_raw prepare mlp sync batch, global_num_tokens_cpu: {forward_batch.global_num_tokens_cpu}, global_num_tokens_for_logprob_cpu: {forward_batch.global_num_tokens_for_logprob_cpu}")
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
@@ -2341,7 +2343,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 axis=-1,
             )
 
+        # Debug dump: sampler input (after logits bias/regex mask, before sampling).
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        try:
+            req_ids = list(getattr(forward_batch, "_debug_req_ids", []) or [])
+            if req_ids and logits_output.next_token_logits is not None:
+                phase = "decode" if forward_batch.forward_mode.is_decode() else "prefill"
+                pos = (
+                    forward_batch.positions
+                    if forward_batch.forward_mode.is_decode()
+                    else (forward_batch.seq_lens - 1)
+                )
+                dump_next_token_logits_topk(
+                    req_ids=req_ids,
+                    phase=phase,
+                    positions=pos,
+                    next_token_logits=logits_output.next_token_logits,
+                    sampling_info=forward_batch.sampling_info,
+                    stage="pre_sampler",
+                )
+        except Exception as e:
+            logger.warning(f"[debug_dump_sampling] failed to dump pre_sampler logits: {e}")
+
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
@@ -2356,6 +2379,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else forward_batch.seq_lens - 1
             ),
         )
+        # Debug dump: sampler output token ids can be compared offline against pre_sampler top-k.
+        try:
+            req_ids = list(getattr(forward_batch, "_debug_req_ids", []) or [])
+            if req_ids and logits_output.next_token_logits is not None:
+                phase = "decode" if forward_batch.forward_mode.is_decode() else "prefill"
+                pos = (
+                    forward_batch.positions
+                    if forward_batch.forward_mode.is_decode()
+                    else (forward_batch.seq_lens - 1)
+                )
+                # Save the same logits again with a different stage to align timelines if needed.
+                dump_next_token_logits_topk(
+                    req_ids=req_ids,
+                    phase=phase,
+                    positions=pos,
+                    next_token_logits=logits_output.next_token_logits,
+                    sampling_info=forward_batch.sampling_info,
+                    stage="post_sampler",
+                )
+        except Exception as e:
+            logger.warning(f"[debug_dump_sampling] failed to dump post_sampler logits: {e}")
         return next_token_ids
 
     def compute_logprobs_only(

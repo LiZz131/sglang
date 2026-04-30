@@ -246,6 +246,13 @@ logger = logging.getLogger(__name__)
 
 # Set SGLANG_DEBUG_SAVE_LAYER_HIDDENS=1 to dump per-layer hidden_states + residual + token
 # metadata for offline comparison (normal forward vs forward_split_prefill / pdmux).
+#
+# Decode dumps (normally skipped because CUDA graph; use non-graph decode for this):
+#   SGLANG_DEBUG_SAVE_LAYER_HIDDENS=1
+#   SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE=1
+# and ``server_args.enable_special_dp_attention``, OR set
+#   SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE_FORCE=1
+# to dump decode on TP baselines without special_dp.
 _DEBUG_LAYER_HIDDENS_RUN_ID: Optional[str] = None
 normal_forward_tag = "normal_forward"
 
@@ -257,6 +264,58 @@ def _get_debug_layer_hiddens_run_id() -> str:
             "SGLANG_DEBUG_SAVE_LAYER_HIDDENS_RUN_ID"
         ) or f"{os.getpid()}_{int(time.time() * 1000)}"
     return _DEBUG_LAYER_HIDDENS_RUN_ID
+
+
+def _debug_layer_hiddens_decode_dump_enabled() -> bool:
+    w = (os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE", "") or "").lower()
+    return w in ("1", "true", "yes", "on")
+
+
+def _debug_layer_hiddens_decode_dump_allowed_for_server() -> bool:
+    """Gate decode-side dumps so normal TP+graph workloads are unaffected."""
+    try:
+        if get_global_server_args().enable_special_dp_attention:
+            return True
+    except Exception:
+        pass
+    fb = (
+        os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE_FORCE", "") or ""
+    ).lower()
+    return fb in ("1", "true", "yes", "on")
+
+
+def _debug_decode_dump_filename_suffix(
+    forward_batch: ForwardBatch,
+    positions: torch.Tensor,
+) -> str:
+    req_keys = list(getattr(forward_batch, "_debug_req_ids", None) or [])
+    pos_flat = positions.detach().contiguous().reshape(-1).cpu()
+    if pos_flat.numel() == 0:
+        pos_part = "nopos"
+    elif pos_flat.numel() == 1:
+        pos_part = f"pos{int(pos_flat.item())}"
+    else:
+        shown = "_".join(str(int(x)) for x in pos_flat.tolist()[:8])
+        if pos_flat.numel() > 8:
+            shown += f"_etc{pos_flat.numel()}"
+        pos_part = f"npos{pos_flat.numel()}_{shown}"
+    pos_part = pos_part.replace(os.sep, "_").replace(" ", "_")
+
+    if not req_keys:
+        rpart = "noreq"
+    elif len(req_keys) == 1:
+        rpart = str(req_keys[0])[:56]
+    else:
+        tail = "_".join(str(x)[:10] for x in req_keys[:4])
+        rpart = f"nreq{len(req_keys)}_{tail}"
+        if len(req_keys) > 4:
+            rpart += "_etc"
+    rpart = (
+        rpart.replace(os.sep, "_")
+        .replace(" ", "_")
+        .replace("/", "_")
+    )
+    return f"_decode_{pos_part}_req{rpart}"
 
 
 def _debug_save_layer_hidden_if_enabled(
@@ -281,13 +340,20 @@ def _debug_save_layer_hidden_if_enabled(
     - ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DIR`` (default ``/tmp/sglang_layer_hiddens``)
     - ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_RUN_ID`` — same value for two runs to align names
     - ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_SYNC=1`` — ``torch.cuda.synchronize()`` before copy
+    - ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE=1`` — also dump decode steps when
+      ``enable_special_dp_attention`` or ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE_FORCE=1``
     """
     v = (os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS", "") or "").lower()
     if v not in ("1", "true", "yes", "on"):
         return
     forward_mode = getattr(forward_batch, "forward_mode", None)
-    if forward_mode is not None and forward_mode.is_decode():
-        return
+    is_decode = forward_mode is not None and forward_mode.is_decode()
+    if is_decode:
+        if not (
+            _debug_layer_hiddens_decode_dump_enabled()
+            and _debug_layer_hiddens_decode_dump_allowed_for_server()
+        ):
+            return
     if is_in_piecewise_cuda_graph():
         return
     if os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS_SYNC", "0") == "1":
@@ -305,8 +371,13 @@ def _debug_save_layer_hidden_if_enabled(
         adp_r = -1
     # NOTE: stage is part of filename so multiple dumps per layer don't overwrite.
     # Keep it filesystem-friendly.
-    stage = (stage or "layer_out").replace(os.sep, "_").replace(" ", "_")
-    fname = f"layer_{layer_id:04d}_{stage}_tp{tp_r}.pt"
+    stage_clean = (stage or "layer_out").replace(os.sep, "_").replace(" ", "_")
+    decode_suffix = (
+        _debug_decode_dump_filename_suffix(forward_batch, positions)
+        if is_decode
+        else ""
+    )
+    fname = f"layer_{layer_id:04d}_{stage_clean}_tp{tp_r}{decode_suffix}.pt"
     out_path = os.path.join(out_dir, fname)
     slc = getattr(forward_batch, "seq_lens_cpu", None)
     if slc is None:
@@ -320,11 +391,14 @@ def _debug_save_layer_hidden_if_enabled(
         seq_lens_gpu.detach().contiguous().cpu() if seq_lens_gpu is not None else None
     )
     fm_str = str(forward_mode) if forward_mode is not None else None
+    debug_req_ids = list(getattr(forward_batch, "_debug_req_ids", None) or [])
     payload: Dict[str, Any] = {
         "version": 1,
         "path_tag": path_tag,
         "layer_id": layer_id,
-        "stage": stage,
+        "stage": stage_clean,
+        "decode_dump": is_decode,
+        "debug_req_ids": debug_req_ids,
         "split_interval": split_interval,
         "input_ids": input_ids.detach().contiguous().cpu(),
         "positions": positions.detach().contiguous().cpu(),
