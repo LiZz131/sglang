@@ -320,6 +320,7 @@ def _debug_decode_dump_filename_suffix(
 
 _DEBUG_KVCACHE_RUN_ID: Optional[str] = None
 _DEBUG_KVCACHE_SEEN_REQS: set[str] = set()
+_DEBUG_KVCACHE_VERBOSE_LOGGED: set[str] = set()
 
 
 def _debug_kvcache_enabled() -> bool:
@@ -358,6 +359,22 @@ def _debug_kvcache_topn() -> int:
         return 4
 
 
+def _debug_kvcache_verbose() -> bool:
+    v = (os.environ.get("SGLANG_DEBUG_DUMP_KVCACHE_VERBOSE", "") or "").lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _debug_kvcache_log_once(key: str, msg: str) -> None:
+    """Log a debug message once per process to avoid spamming."""
+    if not _debug_kvcache_verbose():
+        return
+    global _DEBUG_KVCACHE_VERBOSE_LOGGED
+    if key in _DEBUG_KVCACHE_VERBOSE_LOGGED:
+        return
+    _DEBUG_KVCACHE_VERBOSE_LOGGED.add(key)
+    logger.info(msg)
+
+
 def _debug_dump_kvcache_fingerprint_if_enabled(
     *,
     layer_id: int,
@@ -374,34 +391,176 @@ def _debug_dump_kvcache_fingerprint_if_enabled(
         return
     forward_mode = getattr(forward_batch, "forward_mode", None)
     if forward_mode is None or not forward_mode.is_decode():
+        _debug_kvcache_log_once(
+            "skip_not_decode",
+            "[debug_kvcache] skip: forward_mode is None or not decode",
+        )
         return
     # Keep overhead low: focus on the first decoder layer by default.
     if layer_id != 0:
+        _debug_kvcache_log_once(
+            "skip_not_layer0",
+            f"[debug_kvcache] skip: layer_id={layer_id} (only layer0 enabled by default)",
+        )
         return
 
     if is_in_piecewise_cuda_graph():
+        _debug_kvcache_log_once(
+            "skip_piecewise_graph",
+            "[debug_kvcache] skip: in piecewise cuda graph",
+        )
         return
 
     req_ids = list(getattr(forward_batch, "_debug_req_ids", None) or [])
     if not req_ids:
+        _debug_kvcache_log_once(
+            "skip_no_req_ids",
+            "[debug_kvcache] skip: forward_batch._debug_req_ids is empty; ensure tp_worker sets it",
+        )
         return
 
     # If requested, dump only the first decode step for each req id.
     if _debug_kvcache_first_decode_only():
         # best-effort: if any req in batch is new, we'll dump those rows; else skip.
         if all(rid in _DEBUG_KVCACHE_SEEN_REQS for rid in req_ids):
+            _debug_kvcache_log_once(
+                "skip_seen_reqs",
+                "[debug_kvcache] skip: first_decode_only enabled and all reqs already dumped",
+            )
             return
 
+    # Extract kv_indptr / kv_indices across different attention backends.
+    kv_indptr = None
+    kv_indices = None
     try:
-        attn_md = getattr(getattr(forward_batch, "attn_backend", None), "forward_metadata", None)
-        if attn_md is None or not isinstance(attn_md, (tuple, list)) or len(attn_md) < 4:
+        attn_backend = getattr(forward_batch, "attn_backend", None)
+        if attn_backend is None:
+            _debug_kvcache_log_once(
+                "skip_no_attn_backend",
+                "[debug_kvcache] skip: forward_batch.attn_backend is None (metadata not initialized?)",
+            )
             return
-        _attn_logits, _unused, kv_indptr, kv_indices, *_rest = attn_md
-        if kv_indptr is None or kv_indices is None:
+        attn_md = getattr(attn_backend, "forward_metadata", None)
+        if attn_md is None:
+            _debug_kvcache_log_once(
+                "skip_no_forward_metadata",
+                f"[debug_kvcache] skip: attn_backend.forward_metadata is None (backend={type(attn_backend).__name__})",
+            )
             return
-        if not torch.is_tensor(kv_indptr) or not torch.is_tensor(kv_indices):
-            return
+        # Many backends store forward_metadata as a tuple:
+        # (attn_logits, ..., kv_indptr, kv_indices, ...)
+        if isinstance(attn_md, (tuple, list)) and len(attn_md) >= 4:
+            _attn_logits, _unused, kv_indptr, kv_indices, *_rest = attn_md
+        # FlashAttention-style: forward_metadata is FlashAttentionMetadata.
+        # It doesn't provide kv_indptr/kv_indices directly; build an equivalent packed view
+        # from req_to_token + cache_seqlens.
+        elif (
+            type(attn_md).__name__ == "FlashAttentionMetadata"
+            or hasattr(attn_md, "cache_seqlens_int32")
+        ):
+            try:
+                _debug_kvcache_log_once(
+                    "fa_branch_enter",
+                    f"[debug_kvcache] FlashAttentionMetadata branch (type={type(attn_md).__name__})",
+                )
+                seqlens = attn_md.cache_seqlens_int32
+                # seqlens: [B] int32
+                if torch.is_tensor(seqlens):
+                    seqlens_cpu = seqlens.detach().contiguous().cpu().to(torch.int64)
+                else:
+                    seqlens_cpu = None
+                req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
+                req_to_token = getattr(getattr(forward_batch, "req_to_token_pool", None), "req_to_token", None)
+                if seqlens_cpu is None or req_pool_indices is None or req_to_token is None:
+                    _debug_kvcache_log_once(
+                        "fa_missing_req_to_token",
+                        "[debug_kvcache] skip: FlashAttentionMetadata present but missing seqlens/req_pool_indices/req_to_token",
+                    )
+                else:
+                    # Build a packed kv_indices buffer and indptr on CPU.
+                    rp_cpu = (
+                        req_pool_indices.detach().contiguous().cpu().to(torch.int64)
+                        if torch.is_tensor(req_pool_indices)
+                        else torch.tensor(list(req_pool_indices), dtype=torch.int64)
+                    )
+                    b_local = int(rp_cpu.numel())
+                    indptr = torch.zeros((b_local + 1,), dtype=torch.int64)
+                    # clamp to valid table width
+                    max_w = int(req_to_token.shape[1])
+                    for i2 in range(b_local):
+                        ln = int(seqlens_cpu[i2].item()) if i2 < int(seqlens_cpu.numel()) else 0
+                        ln = max(0, min(ln, max_w))
+                        indptr[i2 + 1] = indptr[i2] + ln
+                    total = int(indptr[-1].item())
+                    indices = torch.empty((total,), dtype=torch.int64)
+                    # Fill indices per row.
+                    # NOTE: req_to_token is a 2D table mapping (req_pool_idx, token_pos) -> cache_loc.
+                    # We copy on CPU for stability; this is debug-only.
+                    for i2 in range(b_local):
+                        ln = int(indptr[i2 + 1].item() - indptr[i2].item())
+                        if ln <= 0:
+                            continue
+                        rpi = int(rp_cpu[i2].item())
+                        row = req_to_token[rpi, :ln]
+                        indices[int(indptr[i2].item()) : int(indptr[i2 + 1].item())] = (
+                            row.detach().contiguous().cpu().to(torch.int64)
+                        )
+                    kv_indptr = indptr
+                    kv_indices = indices
+                    _debug_kvcache_log_once(
+                        "fa_kv_built",
+                        f"[debug_kvcache] FlashAttentionBackend: built kv_indices from req_to_token (B={b_local}, total={total})",
+                    )
+            except Exception as e:
+                _debug_kvcache_log_once(
+                    "fa_build_failed",
+                    f"[debug_kvcache] skip: failed to build kv_indices for FlashAttentionBackend: {e}",
+                )
+        else:
+            # FlashInfer-style: forward_metadata is a dataclass with decode_wrappers.
+            # kv_indptr is stored on backend; kv_indices buffer is typically on wrapper.
+            kv_indptr = getattr(attn_backend, "kv_indptr", None)
+            if isinstance(kv_indptr, (list, tuple)) and kv_indptr:
+                kv_indptr = kv_indptr[0]
+            wrappers = getattr(attn_md, "decode_wrappers", None)
+            wrapper0 = wrappers[0] if isinstance(wrappers, list) and wrappers else None
+            if wrapper0 is not None:
+                for attr in (
+                    "_paged_kv_indices_buf",
+                    "paged_kv_indices_buf",
+                    "paged_kv_indices_buffer",
+                    "kv_indices",
+                ):
+                    cand = getattr(wrapper0, attr, None)
+                    if torch.is_tensor(cand):
+                        kv_indices = cand
+                        break
+            else:
+                _debug_kvcache_log_once(
+                    "no_decode_wrappers",
+                    f"[debug_kvcache] info: forward_metadata has no decode_wrappers (type={type(attn_md).__name__})",
+                )
+            # Fallback: some backends keep a cached kv-indices buffer on backend.
+            if kv_indices is None:
+                cand = getattr(attn_backend, "cuda_graph_kv_indices", None)
+                if isinstance(cand, (list, tuple)) and cand and torch.is_tensor(cand[0]):
+                    kv_indices = cand[0]
+                elif torch.is_tensor(cand):
+                    kv_indices = cand
     except Exception:
+        kv_indptr, kv_indices = None, None
+
+    if kv_indptr is None or kv_indices is None:
+        _debug_kvcache_log_once(
+            "skip_no_kv_indices",
+            f"[debug_kvcache] skip: cannot extract kv_indptr/kv_indices (backend={type(getattr(forward_batch,'attn_backend',None)).__name__})",
+        )
+        return
+    if not torch.is_tensor(kv_indptr) or not torch.is_tensor(kv_indices):
+        _debug_kvcache_log_once(
+            "skip_kv_not_tensor",
+            "[debug_kvcache] skip: kv_indptr/kv_indices are not torch.Tensor",
+        )
         return
 
     tp_r = int(get_tensor_model_parallel_rank())
@@ -414,6 +573,10 @@ def _debug_dump_kvcache_fingerprint_if_enabled(
     base_dir = _debug_kvcache_dir()
     out_dir = os.path.join(base_dir, f"run_{run_id}", "kvcache_fingerprint")
     os.makedirs(out_dir, exist_ok=True)
+    _debug_kvcache_log_once(
+        "dump_dir",
+        f"[debug_kvcache] enabled: dumping to {out_dir} (run_id={run_id})",
+    )
 
     # Cache buffers for this layer (best effort). Layout depends on backend/pool.
     key_cache = None
@@ -1857,6 +2020,18 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+
+        # Debug: dump KV-cache fingerprint as close as possible to decode cache-read.
+        # This is a low-overhead, best-effort dump (decode-only, layer0-only by default).
+        try:
+            _debug_dump_kvcache_fingerprint_if_enabled(
+                layer_id=int(getattr(self, "layer_id", getattr(self.attn_mha, "layer_id", 0))),
+                stage="attn_prepare",
+                forward_batch=forward_batch,
+                positions=positions,
+            )
+        except Exception:
+            pass
         
         if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention and self.enable_pdmux and attn_forward_method not in [
             AttnForwardMethod.MHA, AttnForwardMethod.MHA_ONE_SHOT, AttnForwardMethod.MLA
