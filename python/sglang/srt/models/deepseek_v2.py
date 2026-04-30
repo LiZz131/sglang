@@ -318,6 +318,212 @@ def _debug_decode_dump_filename_suffix(
     return f"_decode_{pos_part}_req{rpart}"
 
 
+_DEBUG_KVCACHE_RUN_ID: Optional[str] = None
+_DEBUG_KVCACHE_SEEN_REQS: set[str] = set()
+
+
+def _debug_kvcache_enabled() -> bool:
+    v = (os.environ.get("SGLANG_DEBUG_DUMP_KVCACHE", "") or "").lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _debug_kvcache_dir() -> str:
+    return (
+        os.environ.get("SGLANG_DEBUG_DUMP_KVCACHE_DIR")
+        or os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DIR")
+        or "/tmp/sglang_layer_hiddens"
+    )
+
+
+def _debug_kvcache_run_id() -> str:
+    global _DEBUG_KVCACHE_RUN_ID
+    if _DEBUG_KVCACHE_RUN_ID is None:
+        _DEBUG_KVCACHE_RUN_ID = (
+            os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS_RUN_ID")
+            or os.environ.get("SGLANG_DEBUG_DUMP_KVCACHE_RUN_ID")
+            or f"{os.getpid()}_{int(time.time() * 1000)}"
+        )
+    return _DEBUG_KVCACHE_RUN_ID
+
+
+def _debug_kvcache_first_decode_only() -> bool:
+    v = (os.environ.get("SGLANG_DEBUG_DUMP_KVCACHE_FIRST_DECODE_ONLY", "1") or "").lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _debug_kvcache_topn() -> int:
+    try:
+        return int(os.environ.get("SGLANG_DEBUG_DUMP_KVCACHE_TOPN", "4"))
+    except Exception:
+        return 4
+
+
+def _debug_dump_kvcache_fingerprint_if_enabled(
+    *,
+    layer_id: int,
+    stage: str,
+    forward_batch: ForwardBatch,
+    positions: torch.Tensor,
+) -> None:
+    """Dump a small KV-cache fingerprint for decode debugging.
+
+    Designed for offline A/B comparison across servers whose request ids differ.
+    Saves one file per (req, pos, tp_rank, layer, stage).
+    """
+    if not _debug_kvcache_enabled():
+        return
+    forward_mode = getattr(forward_batch, "forward_mode", None)
+    if forward_mode is None or not forward_mode.is_decode():
+        return
+    # Keep overhead low: focus on the first decoder layer by default.
+    if layer_id != 0:
+        return
+
+    if is_in_piecewise_cuda_graph():
+        return
+
+    req_ids = list(getattr(forward_batch, "_debug_req_ids", None) or [])
+    if not req_ids:
+        return
+
+    # If requested, dump only the first decode step for each req id.
+    if _debug_kvcache_first_decode_only():
+        # best-effort: if any req in batch is new, we'll dump those rows; else skip.
+        if all(rid in _DEBUG_KVCACHE_SEEN_REQS for rid in req_ids):
+            return
+
+    try:
+        attn_md = getattr(getattr(forward_batch, "attn_backend", None), "forward_metadata", None)
+        if attn_md is None or not isinstance(attn_md, (tuple, list)) or len(attn_md) < 4:
+            return
+        _attn_logits, _unused, kv_indptr, kv_indices, *_rest = attn_md
+        if kv_indptr is None or kv_indices is None:
+            return
+        if not torch.is_tensor(kv_indptr) or not torch.is_tensor(kv_indices):
+            return
+    except Exception:
+        return
+
+    tp_r = int(get_tensor_model_parallel_rank())
+    try:
+        adp_r = int(get_attention_dp_rank())
+    except Exception:
+        adp_r = -1
+
+    run_id = _debug_kvcache_run_id()
+    base_dir = _debug_kvcache_dir()
+    out_dir = os.path.join(base_dir, f"run_{run_id}", "kvcache_fingerprint")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Cache buffers for this layer (best effort). Layout depends on backend/pool.
+    key_cache = None
+    val_cache = None
+    try:
+        key_cache, val_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+    except Exception:
+        try:
+            key_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)
+            val_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer_id)
+        except Exception:
+            key_cache, val_cache = None, None
+
+    pos_cpu = positions.detach().contiguous().reshape(-1).cpu().to(torch.int64)
+    b = int(len(req_ids))
+    if pos_cpu.numel() < b:
+        b = int(pos_cpu.numel())
+        req_ids = req_ids[:b]
+
+    # kv_indptr should be length b+1 for ragged decode batches.
+    try:
+        indptr_cpu = kv_indptr.detach().contiguous().cpu().to(torch.int64)
+        indices_cpu = kv_indices.detach().contiguous().cpu().to(torch.int64)
+    except Exception:
+        return
+    if indptr_cpu.numel() < b + 1:
+        return
+
+    topn = _debug_kvcache_topn()
+
+    for i in range(b):
+        rid = str(req_ids[i])
+        pos_i = int(pos_cpu[i].item())
+
+        s = int(indptr_cpu[i].item())
+        e = int(indptr_cpu[i + 1].item())
+        if s < 0 or e < s or e > int(indices_cpu.numel()):
+            continue
+        seg = indices_cpu[s:e]
+        # Take a small, stable subset for fingerprint: head N and tail N.
+        head = seg[:topn]
+        tail = seg[-topn:] if seg.numel() > topn else seg
+        sample_idx = torch.unique(torch.cat([head, tail], dim=0)).to(torch.int64)
+
+        k_sample = None
+        v_sample = None
+        k_stats = None
+        v_stats = None
+        try:
+            if key_cache is not None and torch.is_tensor(key_cache):
+                # Try direct indexing (works if first dim is pool index).
+                k_sample = key_cache.index_select(0, sample_idx.to(key_cache.device))
+            if val_cache is not None and torch.is_tensor(val_cache):
+                v_sample = val_cache.index_select(0, sample_idx.to(val_cache.device))
+        except Exception:
+            k_sample, v_sample = None, None
+
+        def _stats(t: Optional[torch.Tensor]) -> Optional[Dict[str, float]]:
+            if t is None or not torch.is_tensor(t) or t.numel() == 0:
+                return None
+            tf = t.detach().float()
+            return {
+                "max_abs": float(tf.abs().max().item()),
+                "mean": float(tf.mean().item()),
+                "std": float(tf.std().item()),
+            }
+
+        k_stats = _stats(k_sample)
+        v_stats = _stats(v_sample)
+
+        payload = {
+            "version": 1,
+            "phase": "decode",
+            "layer_id": int(layer_id),
+            "stage": str(stage),
+            "tp_rank": int(tp_r),
+            "attn_dp_rank": int(adp_r),
+            "req_id": rid,
+            "pos": pos_i,
+            "kv_indptr": indptr_cpu,  # full indptr helps verify ragged packing
+            "kv_indices_head": head,
+            "kv_indices_tail": tail,
+            "kv_indices_sample": sample_idx,
+            "kv_len": int(seg.numel()),
+            "out_cache_loc": (
+                forward_batch.out_cache_loc.detach().contiguous().cpu()
+                if getattr(forward_batch, "out_cache_loc", None) is not None
+                and torch.is_tensor(forward_batch.out_cache_loc)
+                else None
+            ),
+            "key_cache_shape": tuple(key_cache.shape) if torch.is_tensor(key_cache) else None,
+            "val_cache_shape": tuple(val_cache.shape) if torch.is_tensor(val_cache) else None,
+            "key_sample": (k_sample.detach().contiguous().cpu() if torch.is_tensor(k_sample) else None),
+            "val_sample": (v_sample.detach().contiguous().cpu() if torch.is_tensor(v_sample) else None),
+            "key_stats": k_stats,
+            "val_stats": v_stats,
+        }
+
+        fname = (
+            f"kvcache_layer{layer_id:04d}_{stage}_tp{tp_r}_pos{pos_i}_req{rid[:56]}.pt"
+        )
+        try:
+            torch.save(payload, os.path.join(out_dir, fname))
+        except Exception:
+            pass
+
+    for rid in req_ids:
+        _DEBUG_KVCACHE_SEEN_REQS.add(str(rid))
+
+
 def _debug_save_layer_hidden_if_enabled(
     path_tag: str,
     layer_id: int,
@@ -3372,6 +3578,17 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch.input_ids,
             positions,
         )
+
+        # Debug: KV cache fingerprint (decode, layer0) right before attention reads cache.
+        try:
+            _debug_dump_kvcache_fingerprint_if_enabled(
+                layer_id=self.layer_id,
+                stage="pre_attn",
+                forward_batch=forward_batch,
+                positions=positions,
+            )
+        except Exception:
+            pass
 
         hidden_states = self.self_attn(
             positions=positions,
