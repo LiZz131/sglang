@@ -1591,7 +1591,9 @@ class ServerArgs:
             and not is_h20_device
             and self.moe_a2a_backend == "none"
         ):
-            self.enable_flashinfer_allreduce_fusion = True
+            # DEBUG(lbz): for correctness, disable it by default
+            # self.enable_flashinfer_allreduce_fusion = True
+            pass
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
