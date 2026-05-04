@@ -5,8 +5,8 @@ stored in different base folders, where request ids differ between servers.
 
 Run layouts:
   - TP run:        <tp_run>/tp/<req_id>/<phase>/pos_<n>/tp<r>_<stage>.pt
-  - DP-attn run:   <dp_run>/special_dp_attention/<req_id>/<phase>/pos_<n>/tp<r>_<stage>.pt
-                  (also accepts special-dp-attention variants)
+  - DP-attn run:   <dp_run>/(special_dp_attention|dp_attention)/<req_id>/...
+                  (``special_dp_*`` name variants accepted; standard dp-attn uses ``dp_attention/``)
 
 This script auto-maps req ids across runs by a signature derived from file-tree stats:
   signature(req) = (prefill_max_pos, decode_min_pos, decode_max_pos, decode_pos_count)
@@ -205,7 +205,11 @@ def compare_payload(pa: str, pb: str) -> List[str]:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--tp-run", required=True, help="Base dir containing tp/ (TP server run)")
-    p.add_argument("--dp-run", required=True, help="Base dir containing special_dp_attention/ (DP-attn server run)")
+    p.add_argument(
+        "--dp-run",
+        required=True,
+        help="Base dir containing special_dp_attention/ or dp_attention/ (decode sampling tree)",
+    )
     p.add_argument("-o", "--output", default="", help="Write report to file (and tee to stdout if TTY)")
     p.add_argument("--limit", type=int, default=0, help="Compare at most N paired files (0 = no limit)")
     args = p.parse_args(list(argv) if argv is not None else None)
@@ -214,7 +218,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dp_base = os.path.abspath(os.path.expanduser(args.dp_run))
 
     tp_root = _mode_dir_under(tp_base, ["tp"])
-    dp_root = _mode_dir_under(dp_base, ["special_dp_attention", "special-dp-attention", "special_dp-attention"])
+    dp_root = _mode_dir_under(
+        dp_base,
+        [
+            "special_dp_attention",
+            "special-dp-attention",
+            "special_dp-attention",
+            "dp_attention",
+        ],
+    )
 
     out_path = os.path.abspath(os.path.expanduser(args.output)) if args.output else ""
 

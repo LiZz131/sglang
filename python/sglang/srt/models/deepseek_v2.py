@@ -22,7 +22,7 @@ import logging
 import os
 import time
 from contextlib import nullcontext
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -250,9 +250,10 @@ logger = logging.getLogger(__name__)
 # Decode dumps (normally skipped because CUDA graph; use non-graph decode for this):
 #   SGLANG_DEBUG_SAVE_LAYER_HIDDENS=1
 #   SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE=1
-# and ``server_args.enable_special_dp_attention``, OR set
-#   SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE_FORCE=1
-# to dump decode on TP baselines without special_dp.
+# and server_args must indicate a decode path where dumping is intended (see
+# ``_debug_layer_hiddens_decode_dump_allowed_for_server``), OR set
+#   ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE_FORCE=1``
+# for pure-TP baselines (neither dp-attn flag set).
 _DEBUG_LAYER_HIDDENS_RUN_ID: Optional[str] = None
 normal_forward_tag = "normal_forward"
 
@@ -272,9 +273,21 @@ def _debug_layer_hiddens_decode_dump_enabled() -> bool:
 
 
 def _debug_layer_hiddens_decode_dump_allowed_for_server() -> bool:
-    """Gate decode-side dumps so normal TP+graph workloads are unaffected."""
+    """Gate decode-side dumps so normal TP+graph workloads are unaffected.
+
+    Server-args layouts (see ``ServerArgs``):
+
+    - **Special DP attention** (custom): ``enable_special_dp_attention`` is True; in
+      practice the same server also has ``enable_dp_attention`` True.
+    - **Standard DP attention only**: ``enable_dp_attention`` True and
+      ``enable_special_dp_attention`` False.
+
+    Either DP-attn flag is sufficient to allow decode dumps (same hooks / stage
+    names, e.g. ``pre_mlp``). Pure TP keeps dumps off unless ``DECODE_FORCE``.
+    """
     try:
-        if get_global_server_args().enable_special_dp_attention:
+        sa = get_global_server_args()
+        if sa.enable_special_dp_attention or sa.enable_dp_attention:
             return True
     except Exception:
         pass
@@ -288,6 +301,10 @@ def _debug_decode_dump_filename_suffix(
     forward_batch: ForwardBatch,
     positions: torch.Tensor,
 ) -> str:
+    """Build ``_decode_*_req*`` suffix for decode dump filenames.
+
+    Mirrored by ``fa_backend_decode_dump._fa_decode_dump_filename_suffix``; keep in sync.
+    """
     req_keys = list(getattr(forward_batch, "_debug_req_ids", None) or [])
     pos_flat = positions.detach().contiguous().reshape(-1).cpu()
     if pos_flat.numel() == 0:
@@ -710,7 +727,8 @@ def _debug_save_layer_hidden_if_enabled(
     - ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_RUN_ID`` — same value for two runs to align names
     - ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_SYNC=1`` — ``torch.cuda.synchronize()`` before copy
     - ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE=1`` — also dump decode steps when
-      ``enable_special_dp_attention`` or ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE_FORCE=1``
+      ``enable_special_dp_attention``, ``enable_dp_attention``, or
+      ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE_FORCE=1``
     """
     v = (os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS", "") or "").lower()
     if v not in ("1", "true", "yes", "on"):
@@ -789,6 +807,1045 @@ def _debug_save_layer_hidden_if_enabled(
         torch.save(payload, out_path)
     except Exception as e:
         logger.warning("SGLANG_DEBUG_SAVE_LAYER_HIDDENS: failed to save %s: %s", out_path, e)
+
+
+# MLP/MoE *inner* checkpoints (inside gate_up/down_proj/router), orthogonal to boundary dumps above.
+#
+# Typical decode A/B usage (aligned with ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS`` decode semantics):
+#
+# - ``SGLANG_DEBUG_DUMP_MLP_INNER=1``
+# - ``SGLANG_DEBUG_DUMP_MLP_INNER_DECODE_ONLY=1`` (default): decode steps only + same gates as
+#   ``SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE`` / server dp-attn flags / ``DECODE_FORCE``.
+#
+# Outputs live under ``$SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DIR/run_<RUN_ID>/<path_tag>/`` with filenames
+# ``mlpinner_layer_XXXX_<stage>_tp<R>_decode_<...>.pt``.
+#
+# Optional:
+# - ``SGLANG_DEBUG_DUMP_MLP_INNER_LAYERS``: comma ints, e.g. ``8,9`` — limit layers (default all).
+# - ``SGLANG_DEBUG_DUMP_MLP_INNER_SAVE_DOWNPROJ=1`` — Dense MLP: also dump after ``down_proj`` (heavy).
+# - ``SGLANG_DEBUG_MLP_BRANCH_LOG=1`` — ``logger.info`` router branch id each time (decode batches can be chatty).
+# - ``SGLANG_DEBUG_DUMP_MLP_INNER_VERBOSE=1`` — log each *skip* reason once per process when inner dumps
+#   are blocked (also logs skips when ``SGLANG_DEBUG_DUMP_MLP_INNER=1`` but a gate fails).
+_DEBUG_MLP_INNER_SKIP_LOGGED: set[str] = set()
+_DEBUG_MLP_INNER_GLANG_TYPO_WARNED: bool = False
+_DEBUG_MLP_INNER_FIRST_SAVE_LOGGED: bool = False
+
+
+def _debug_warn_glang_mlp_inner_typo_once() -> None:
+    """Catch common typo ``GLANG_*`` instead of ``SGLANG_*`` (silently ignored otherwise)."""
+
+    global _DEBUG_MLP_INNER_GLANG_TYPO_WARNED
+    if _DEBUG_MLP_INNER_GLANG_TYPO_WARNED:
+        return
+    v = (os.environ.get("GLANG_DEBUG_DUMP_MLP_INNER", "") or "").lower()
+    if v in ("1", "true", "yes", "on"):
+        logger.warning(
+            "Env GLANG_DEBUG_DUMP_MLP_INNER is set but is a typo (missing leading 'S'). "
+            "It has no effect. Use SGLANG_DEBUG_DUMP_MLP_INNER=1."
+        )
+    _DEBUG_MLP_INNER_GLANG_TYPO_WARNED = True
+
+
+def _debug_mlp_inner_verbose() -> bool:
+    v = (os.environ.get("SGLANG_DEBUG_DUMP_MLP_INNER_VERBOSE", "") or "").lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _debug_mlp_inner_should_log_skip_reasons() -> bool:
+    return _debug_mlp_inner_verbose() or _debug_mlp_inner_enabled()
+
+
+def _debug_mlp_inner_log_skip_once(key: str, msg: str) -> None:
+    if not _debug_mlp_inner_should_log_skip_reasons():
+        return
+    global _DEBUG_MLP_INNER_SKIP_LOGGED
+    if key in _DEBUG_MLP_INNER_SKIP_LOGGED:
+        return
+    _DEBUG_MLP_INNER_SKIP_LOGGED.add(key)
+    logger.info("[mlp_inner] %s", msg)
+
+
+def _debug_mlp_inner_enabled() -> bool:
+    v = (os.environ.get("SGLANG_DEBUG_DUMP_MLP_INNER", "") or "").lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _debug_mlp_inner_branch_log_enabled() -> bool:
+    v = (os.environ.get("SGLANG_DEBUG_MLP_BRANCH_LOG", "") or "").lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _debug_mlp_inner_save_dense_down_proj() -> bool:
+    v = (os.environ.get("SGLANG_DEBUG_DUMP_MLP_INNER_SAVE_DOWNPROJ", "") or "").lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _debug_mlp_inner_layer_allowed(layer_id: int) -> bool:
+    raw = (os.environ.get("SGLANG_DEBUG_DUMP_MLP_INNER_LAYERS", "") or "").strip()
+    if not raw:
+        return True
+    try:
+        allowed = {int(x.strip()) for x in raw.split(",") if x.strip()}
+        return layer_id in allowed
+    except Exception:
+        return True
+
+
+def _debug_moe_capture_mode() -> bool:
+    """True during CUDA graph capture (distinct from ``is_in_piecewise_cuda_graph()``)."""
+
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        return bool(get_is_capture_mode())
+    except Exception:
+        return False
+
+
+def _debug_mlp_inner_skip_reason(
+    forward_batch: ForwardBatch, positions: Optional[torch.Tensor]
+) -> Optional[str]:
+    """Return a human-readable skip reason, or ``None`` if inner dump may proceed."""
+
+    if not _debug_mlp_inner_enabled():
+        return "SGLANG_DEBUG_DUMP_MLP_INNER is off"
+    if _debug_moe_capture_mode():
+        return "blocked: CUDA graph capture mode (get_is_capture_mode)"
+    if is_in_piecewise_cuda_graph():
+        return "blocked: is_in_piecewise_cuda_graph()"
+
+    fm = getattr(forward_batch, "forward_mode", None)
+
+    decode_only = (
+        os.environ.get("SGLANG_DEBUG_DUMP_MLP_INNER_DECODE_ONLY", "1") or ""
+    ).lower()
+    decode_only_flag = decode_only in ("1", "true", "yes", "on")
+
+    if decode_only_flag:
+        if fm is None or not fm.is_decode():
+            return "decode_only=1 but forward_mode is not decode"
+        if not _debug_layer_hiddens_decode_dump_enabled():
+            return "SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE is off (required with decode_only=1)"
+        if not _debug_layer_hiddens_decode_dump_allowed_for_server():
+            return (
+                "decode dump not allowed for this server_args "
+                "(need dp/special-dp attention or SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE_FORCE=1)"
+            )
+    elif fm is None or not fm.is_decode():
+        # Prefill/other: allow dumping without DP-attn decode gates (heavy; opt-in decode_only=0).
+        pass
+
+    if positions is None or not torch.is_tensor(positions):
+        return "forward_batch.positions is missing or not a tensor"
+    return None
+
+
+def _debug_mlp_inner_should_dump(forward_batch: ForwardBatch, positions: Optional[torch.Tensor]) -> bool:
+    return _debug_mlp_inner_skip_reason(forward_batch, positions) is None
+
+
+def _debug_mlp_inner_path_tag(forward_batch: ForwardBatch) -> str:
+    fm = getattr(forward_batch, "forward_mode", None)
+    if fm is not None and fm.is_split_prefill():
+        return "split_prefill"
+    return normal_forward_tag
+
+
+def _debug_resolve_mlp_inner_layer_id(module: nn.Module) -> int:
+    lid = getattr(module, "layer_id", None)
+    if lid is not None:
+        return int(lid)
+    lx = getattr(module, "_sglang_decoder_layer_id", None)
+    return int(lx) if lx is not None else -1
+
+
+def _debug_router_logits_meta(logits: torch.Tensor, top_k_probe: int = 4) -> Dict[str, Any]:
+    """Small summary — never stores full router logits."""
+
+    meta: Dict[str, Any] = {
+        "shape": tuple(logits.shape),
+        "dtype": str(logits.dtype),
+    }
+    if logits.numel() == 0 or logits.ndim < 2:
+        return meta
+    try:
+        row0 = logits.detach()[0].float().cpu()
+        amax_idx = int(row0.argmax().item())
+        meta["row0_argmax_idx"] = amax_idx
+        meta["row0_argmax_val"] = float(row0[amax_idx].item())
+        meta["row0_mean"] = float(row0.mean().item())
+        n = row0.numel()
+        kk = max(1, min(int(top_k_probe), int(n)))
+        topv, topi = torch.topk(row0, kk)
+        meta["row0_topk_idx"] = [int(i) for i in topi.tolist()]
+        meta["row0_topk_val"] = [float(v) for v in topv.tolist()]
+    except Exception as e:
+        meta["router_meta_error"] = str(e)
+    return meta
+
+
+def _debug_mlp_inner_maybe_log_router_branch(
+    *, layer_id: int, forward_batch: ForwardBatch, extra: Dict[str, Any]
+) -> None:
+    if not _debug_mlp_inner_branch_log_enabled():
+        return
+    branch = extra.get("moe_gate_branch")
+    logits_shape = extra.get("router_logits_shape")
+    fm = getattr(forward_batch, "forward_mode", None)
+    pos_flat = getattr(forward_batch, "positions", None)
+    if torch.is_tensor(pos_flat) and pos_flat.numel():
+        pk = ",".join(
+            str(int(x)) for x in pos_flat.detach().reshape(-1)[:8].cpu().tolist()
+        )
+        if pos_flat.numel() > 8:
+            pk = f"{pk}..n{int(pos_flat.numel())}"
+    else:
+        pk = "nopos"
+    logger.info(
+        "[mlp_inner] layer=%s positions=%s forward_mode=%s gate_branch=%s router_shape=%s",
+        layer_id,
+        pk,
+        fm,
+        branch,
+        logits_shape,
+    )
+
+
+def _debug_save_mlp_inner_if_enabled(
+    layer_id: int,
+    inner_stage: str,
+    *,
+    tensor: Optional[torch.Tensor],
+    residual: Optional[torch.Tensor],
+    forward_batch: Optional[ForwardBatch],
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    global _DEBUG_MLP_INNER_FIRST_SAVE_LOGGED
+
+    _debug_warn_glang_mlp_inner_typo_once()
+
+    if forward_batch is None:
+        _debug_mlp_inner_log_skip_once(
+            "no_forward_batch",
+            f"skip inner dump stage={inner_stage!r} layer={layer_id}: forward_batch is None",
+        )
+        return
+
+    if not _debug_mlp_inner_enabled():
+        return
+
+    positions = getattr(forward_batch, "positions", None)
+    skip = _debug_mlp_inner_skip_reason(forward_batch, positions)
+    if skip is not None:
+        _debug_mlp_inner_log_skip_once(
+            skip,
+            f"skip inner dump stage={inner_stage!r} layer={layer_id}: {skip}",
+        )
+        return
+
+    if not _debug_mlp_inner_layer_allowed(layer_id):
+        _debug_mlp_inner_log_skip_once(
+            f"layer_filtered:{layer_id}",
+            f"skip inner dump stage={inner_stage!r} layer={layer_id}: "
+            f"not in SGLANG_DEBUG_DUMP_MLP_INNER_LAYERS allowlist",
+        )
+        return
+
+    fm = getattr(forward_batch, "forward_mode", None)
+    decode = fm is not None and fm.is_decode()
+
+    path_tag = _debug_mlp_inner_path_tag(forward_batch)
+
+    if os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS_SYNC", "0") == "1":
+        torch.cuda.synchronize()
+
+    dump_root = os.environ.get(
+        "SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DIR", "/tmp/sglang_layer_hiddens"
+    )
+    run_id = _get_debug_layer_hiddens_run_id()
+    out_dir = os.path.join(dump_root, f"run_{run_id}", path_tag)
+    os.makedirs(out_dir, exist_ok=True)
+
+    tp_r = int(get_tensor_model_parallel_rank())
+    try:
+        adp_r = int(get_attention_dp_rank())
+    except Exception:
+        adp_r = -1
+
+    stage_clean = (inner_stage or "inner").replace(os.sep, "_").replace(" ", "_")
+    decode_suffix = (
+        _debug_decode_dump_filename_suffix(forward_batch, positions) if decode else ""
+    )
+
+    fname = f"mlpinner_layer_{layer_id:04d}_{stage_clean}_tp{tp_r}{decode_suffix}.pt"
+    out_path = os.path.join(out_dir, fname)
+
+    dbg_req_ids = list(getattr(forward_batch, "_debug_req_ids", None) or [])
+
+    pos_cpu = positions.detach().contiguous().cpu() if torch.is_tensor(positions) else None
+
+    fm_str = str(fm) if fm is not None else None
+
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "dump_kind": "mlp_inner",
+        "path_tag": path_tag,
+        "layer_id": int(layer_id),
+        "stage": stage_clean,
+        "decode_dump": decode,
+        "debug_req_ids": dbg_req_ids,
+        "positions": pos_cpu,
+        "tp_rank": tp_r,
+        "attn_dp_rank": adp_r,
+        "forward_mode": fm_str,
+        "meta": meta or {},
+        "tensor": None
+        if tensor is None
+        else tensor.detach().contiguous().cpu(),
+        "residual": None
+        if residual is None
+        else residual.detach().contiguous().cpu(),
+    }
+    try:
+        torch.save(payload, out_path)
+    except Exception as e:
+        logger.warning("SGLANG_DEBUG_DUMP_MLP_INNER: failed to save %s: %s", out_path, e)
+    else:
+        if _debug_mlp_inner_verbose() and not _DEBUG_MLP_INNER_FIRST_SAVE_LOGGED:
+            _DEBUG_MLP_INNER_FIRST_SAVE_LOGGED = True
+            logger.info(
+                "[mlp_inner] first checkpoint written (stage=%s): %s",
+                stage_clean,
+                out_path,
+            )
+
+
+# Decode attention probes: branch metadata + small tensor statistics (head/tail of a flat prefix).
+#
+#   SGLANG_DEBUG_DUMP_ATTN_INNER=1
+#   SGLANG_DEBUG_DUMP_ATTN_INNER_LAYERS=0,1,2,3   (default when unset: layers 0–3 only)
+#   SGLANG_DEBUG_DUMP_ATTN_INNER_SAMPLE_ELEMS=8192
+#   SGLANG_DEBUG_DUMP_ATTN_INNER_VERBOSE=1
+#
+# MLA absorb (``forward_absorb_prepare`` / ``forward_absorb_core`` boundaries, decode-only):
+#
+#   SGLANG_DEBUG_DUMP_ATTN_INNER_MLA_ABSORB=1
+#   SGLANG_DEBUG_DUMP_ATTN_INNER_MLA_STAGES=   (optional comma list; empty = all stages; includes
+#       ``mla_core_attn_mqa_inputs`` — tensors passed into ``attn_mqa`` / ``attn_mqa_normal_tp``)
+#   SGLANG_DEBUG_DUMP_ATTN_INNER_SAVE_FULL=1   (optional; saves CPU tensors for keys listed in FULL_KEYS only)
+#   SGLANG_DEBUG_DUMP_ATTN_INNER_FULL_KEYS=q_nope,q_nope_out,attn_mqa_q,attn_mqa_k,w_kc   (required non-empty when using SAVE_FULL;
+#       comma-separated probe names; ``w_kc`` is written once per (layer,tp) to ``attninner_static_*_w_kc_*.pt``;
+#       ``attn_mqa_q``/``attn_mqa_k`` are legacy-path concat inputs at stage ``mla_core_attn_mqa_inputs``)
+#
+# Same decode gates as ``SGLANG_DEBUG_DUMP_MLP_INNER`` / layer-hiddens DECODE + dp-attn or DECODE_FORCE.
+_DEBUG_ATTN_INNER_FIRST_SAVE_LOGGED = False
+_DEBUG_ATTN_INNER_SKIP_LOGGED: set[str] = set()
+_DEBUG_ATTN_INNER_STATIC_W_KC_SAVED: Set[Tuple[int, int]] = set()
+
+
+def _debug_attn_inner_enabled() -> bool:
+    v = (os.environ.get("SGLANG_DEBUG_DUMP_ATTN_INNER", "") or "").lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _debug_attn_inner_verbose() -> bool:
+    v = (os.environ.get("SGLANG_DEBUG_DUMP_ATTN_INNER_VERBOSE", "") or "").lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _debug_attn_inner_should_log_skip_reasons() -> bool:
+    return _debug_attn_inner_verbose() or _debug_attn_inner_enabled()
+
+
+def _debug_attn_inner_log_skip_once(key: str, msg: str) -> None:
+    if not _debug_attn_inner_should_log_skip_reasons():
+        return
+    global _DEBUG_ATTN_INNER_SKIP_LOGGED
+    if key in _DEBUG_ATTN_INNER_SKIP_LOGGED:
+        return
+    _DEBUG_ATTN_INNER_SKIP_LOGGED.add(key)
+    logger.info("[attn_inner] %s", msg)
+
+
+def _debug_attn_inner_sample_elems() -> int:
+    try:
+        return max(64, int(os.environ.get("SGLANG_DEBUG_DUMP_ATTN_INNER_SAMPLE_ELEMS", "8192")))
+    except Exception:
+        return 8192
+
+
+def _debug_attn_inner_mla_absorb_enabled() -> bool:
+    if not _debug_attn_inner_enabled():
+        return False
+    v = (os.environ.get("SGLANG_DEBUG_DUMP_ATTN_INNER_MLA_ABSORB", "") or "").lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _debug_attn_inner_save_full() -> bool:
+    v = (os.environ.get("SGLANG_DEBUG_DUMP_ATTN_INNER_SAVE_FULL", "") or "").lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _debug_attn_inner_full_key_allowed(key: str) -> bool:
+    """Non-empty ``FULL_KEYS`` required: ``SAVE_FULL`` alone does not write any full tensors."""
+
+    raw = (os.environ.get("SGLANG_DEBUG_DUMP_ATTN_INNER_FULL_KEYS", "") or "").strip()
+    if not raw:
+        return False
+    allowed = {x.strip() for x in raw.split(",") if x.strip()}
+    return key in allowed
+
+
+def _debug_attn_inner_mla_stage_allowed(stage: str) -> bool:
+    raw = (os.environ.get("SGLANG_DEBUG_DUMP_ATTN_INNER_MLA_STAGES", "") or "").strip()
+    if not raw:
+        return True
+    allowed = {x.strip() for x in raw.split(",") if x.strip()}
+    return stage in allowed
+
+
+def _debug_attn_inner_layer_allowed(layer_id: int) -> bool:
+    raw = (os.environ.get("SGLANG_DEBUG_DUMP_ATTN_INNER_LAYERS", "") or "").strip()
+    if not raw:
+        return 0 <= layer_id <= 3
+    try:
+        allowed = {int(x.strip()) for x in raw.split(",") if x.strip()}
+        return layer_id in allowed
+    except Exception:
+        return 0 <= layer_id <= 3
+
+
+def _debug_attn_inner_skip_reason(
+    forward_batch: ForwardBatch, positions: Optional[torch.Tensor]
+) -> Optional[str]:
+    if not _debug_attn_inner_enabled():
+        return "SGLANG_DEBUG_DUMP_ATTN_INNER is off"
+    if _debug_moe_capture_mode():
+        return "blocked: CUDA graph capture mode (get_is_capture_mode)"
+    if is_in_piecewise_cuda_graph():
+        return "blocked: is_in_piecewise_cuda_graph()"
+    fm = getattr(forward_batch, "forward_mode", None)
+    decode_only = (
+        os.environ.get("SGLANG_DEBUG_DUMP_ATTN_INNER_DECODE_ONLY", "1") or ""
+    ).lower()
+    decode_only_flag = decode_only in ("1", "true", "yes", "on")
+    if decode_only_flag:
+        if fm is None or not fm.is_decode():
+            return "decode_only=1 but forward_mode is not decode"
+        if not _debug_layer_hiddens_decode_dump_enabled():
+            return (
+                "SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE is off "
+                "(required with decode_only=1)"
+            )
+        if not _debug_layer_hiddens_decode_dump_allowed_for_server():
+            return (
+                "decode dump not allowed for this server_args "
+                "(need dp/special-dp attention or "
+                "SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DECODE_FORCE=1)"
+            )
+    if positions is None or not torch.is_tensor(positions):
+        return "positions missing or not a tensor"
+    return None
+
+
+def _debug_tensor_probe_flat(
+    t: Optional[torch.Tensor],
+    *,
+    max_elems: int,
+    label: str = "t",
+) -> Dict[str, Any]:
+    """Lightweight probe: sample the first ``max_elems`` of ``reshape(-1)`` on CPU float."""
+
+    out: Dict[str, Any] = {"label": label, "present": False}
+    if t is None:
+        return out
+    if not torch.is_tensor(t):
+        out["present"] = False
+        out["note"] = "not_tensor"
+        return out
+    t0 = t.detach()
+    out["present"] = True
+    out["shape"] = tuple(t0.shape)
+    out["dtype"] = str(t0.dtype)
+    out["device"] = str(t0.device)
+    flat = t0.reshape(-1)
+    n = min(int(flat.numel()), max_elems)
+    out["total_numel"] = int(flat.numel())
+    if n <= 0:
+        out["stats"] = {}
+        return out
+    sample = flat[:n].float().cpu()
+    sample_d = flat[:n].double().cpu()
+    head_n = min(16, int(sample.numel()))
+    tail_n = min(16, int(sample.numel()))
+    out["stats"] = {
+        "sample_len": n,
+        "max_abs": float(sample.abs().max().item()),
+        "mean": float(sample.mean().item()),
+        "std": float(sample.std().item()),
+        "head_f32": [float(sample[i].item()) for i in range(head_n)],
+        "tail_f32": [
+            float(sample[i].item()) for i in range(max(0, n - tail_n), n)
+        ],
+        # fp64 head/tail: bf16/fp16 等低精度张量在 fp32 上对齐后仍可能掩盖 A/B 微差，对比脚本优先用此做逐元差分
+        "head_f64": [float(sample_d[i].item()) for i in range(head_n)],
+        "tail_f64": [
+            float(sample_d[i].item()) for i in range(max(0, n - tail_n), n)
+        ],
+    }
+    return out
+
+
+def _debug_attn_inner_base_meta(
+    attn_module: nn.Module,
+    forward_batch: ForwardBatch,
+    attn_forward_method: Any,
+    *,
+    stage: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    sa = get_global_server_args()
+    fm = getattr(forward_batch, "forward_mode", None)
+    md: Dict[str, Any] = {
+        "dump_kind": "attn_inner",
+        "stage": stage,
+        "layer_id": int(getattr(attn_module, "layer_id", -1)),
+        "attn_forward_method": getattr(
+            attn_forward_method, "name", str(attn_forward_method)
+        ),
+        "attention_backend": getattr(attn_module, "current_attention_backend", None),
+        "enable_special_dp_attention": bool(
+            getattr(attn_module, "enable_special_dp_attention", False)
+        ),
+        "enable_pdmux": bool(getattr(attn_module, "enable_pdmux", False)),
+        "use_nsa": bool(getattr(attn_module, "use_nsa", False)),
+        "nsa_enable_prefill_cp": bool(
+            getattr(attn_module, "nsa_enable_prefill_cp", False)
+        ),
+        "enable_dp_attention": bool(getattr(sa, "enable_dp_attention", False)),
+        "forward_mode_repr": str(fm) if fm is not None else None,
+        "is_decode": bool(fm is not None and fm.is_decode()),
+        "attn_tp_rank": int(getattr(attn_module, "attn_tp_rank", -1)),
+        "attn_tp_size": int(getattr(attn_module, "attn_tp_size", -1)),
+        "tp_rank": int(getattr(attn_module, "tp_rank", -1)),
+        "tp_size": int(getattr(attn_module, "tp_size", -1)),
+    }
+    if extra:
+        md.update(extra)
+    return md
+
+
+def _debug_save_attn_inner_if_enabled(
+    attn_module: nn.Module,
+    stage: str,
+    forward_batch: ForwardBatch,
+    positions: torch.Tensor,
+    *,
+    meta: Dict[str, Any],
+    probes: Dict[str, Any],
+    full_tensors: Optional[Dict[str, torch.Tensor]] = None,
+) -> None:
+    global _DEBUG_ATTN_INNER_FIRST_SAVE_LOGGED
+
+    layer_id = int(getattr(attn_module, "layer_id", -1))
+    if not _debug_attn_inner_layer_allowed(layer_id):
+        return
+
+    skip = _debug_attn_inner_skip_reason(forward_batch, positions)
+    if skip is not None:
+        _debug_attn_inner_log_skip_once(
+            skip,
+            f"skip attn_inner stage={stage!r} layer={layer_id}: {skip}",
+        )
+        return
+
+    fm = getattr(forward_batch, "forward_mode", None)
+    decode = fm is not None and fm.is_decode()
+    path_tag = _debug_mlp_inner_path_tag(forward_batch)
+
+    if os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS_SYNC", "0") == "1":
+        torch.cuda.synchronize()
+
+    dump_root = os.environ.get(
+        "SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DIR", "/tmp/sglang_layer_hiddens"
+    )
+    run_id = _get_debug_layer_hiddens_run_id()
+    out_dir = os.path.join(dump_root, f"run_{run_id}", path_tag)
+    os.makedirs(out_dir, exist_ok=True)
+
+    tp_r = int(get_tensor_model_parallel_rank())
+    try:
+        adp_r = int(get_attention_dp_rank())
+    except Exception:
+        adp_r = -1
+
+    stage_clean = (stage or "attn_inner").replace(os.sep, "_").replace(" ", "_")
+    decode_suffix = (
+        _debug_decode_dump_filename_suffix(forward_batch, positions) if decode else ""
+    )
+    fname = f"attninner_layer_{layer_id:04d}_{stage_clean}_tp{tp_r}{decode_suffix}.pt"
+    out_path = os.path.join(out_dir, fname)
+
+    dbg_req_ids = list(getattr(forward_batch, "_debug_req_ids", None) or [])
+    pos_cpu = (
+        positions.detach().contiguous().cpu()
+        if torch.is_tensor(positions)
+        else None
+    )
+
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "dump_kind": "attn_inner",
+        "path_tag": path_tag,
+        "layer_id": layer_id,
+        "stage": stage_clean,
+        "decode_dump": decode,
+        "debug_req_ids": dbg_req_ids,
+        "positions": pos_cpu,
+        "tp_rank": tp_r,
+        "attn_dp_rank": adp_r,
+        "meta": meta,
+        "probes": probes,
+    }
+    if full_tensors and _debug_attn_inner_save_full():
+        saved_ft: Dict[str, torch.Tensor] = {}
+        for name, t in full_tensors.items():
+            if not _debug_attn_inner_full_key_allowed(name):
+                continue
+            if torch.is_tensor(t):
+                saved_ft[name] = t.detach().contiguous().cpu()
+        if saved_ft:
+            payload["full_tensors"] = saved_ft
+            payload["has_full_tensors"] = True
+    else:
+        payload["has_full_tensors"] = False
+
+    try:
+        torch.save(payload, out_path)
+    except Exception as e:
+        logger.warning("SGLANG_DEBUG_DUMP_ATTN_INNER: failed to save %s: %s", out_path, e)
+    else:
+        if _debug_attn_inner_verbose() and not _DEBUG_ATTN_INNER_FIRST_SAVE_LOGGED:
+            _DEBUG_ATTN_INNER_FIRST_SAVE_LOGGED = True
+            logger.info(
+                "[attn_inner] first checkpoint written (stage=%s): %s",
+                stage_clean,
+                out_path,
+            )
+
+
+def _debug_attn_inner_save_w_kc_static_once(
+    attn_module: nn.Module,
+    forward_batch: ForwardBatch,
+    positions: torch.Tensor,
+) -> None:
+    """Save ``w_kc`` once per (layer_id, tp_rank) when ``SAVE_FULL`` and ``FULL_KEYS`` contains ``w_kc``."""
+
+    global _DEBUG_ATTN_INNER_STATIC_W_KC_SAVED
+    if not _debug_attn_inner_enabled() or not _debug_attn_inner_save_full():
+        return
+    if not _debug_attn_inner_full_key_allowed("w_kc"):
+        return
+    layer_id = int(getattr(attn_module, "layer_id", -1))
+    if not _debug_attn_inner_layer_allowed(layer_id):
+        return
+    if _debug_attn_inner_skip_reason(forward_batch, positions) is not None:
+        return
+
+    tp_r = int(get_tensor_model_parallel_rank())
+    key = (layer_id, tp_r)
+    if key in _DEBUG_ATTN_INNER_STATIC_W_KC_SAVED:
+        return
+
+    w_kc = getattr(attn_module, "w_kc", None)
+    if w_kc is None or not torch.is_tensor(w_kc):
+        return
+
+    fm = getattr(forward_batch, "forward_mode", None)
+    decode = fm is not None and fm.is_decode()
+    path_tag = _debug_mlp_inner_path_tag(forward_batch)
+    if os.environ.get("SGLANG_DEBUG_SAVE_LAYER_HIDDENS_SYNC", "0") == "1":
+        torch.cuda.synchronize()
+
+    dump_root = os.environ.get(
+        "SGLANG_DEBUG_SAVE_LAYER_HIDDENS_DIR", "/tmp/sglang_layer_hiddens"
+    )
+    run_id = _get_debug_layer_hiddens_run_id()
+    out_dir = os.path.join(dump_root, f"run_{run_id}", path_tag)
+    os.makedirs(out_dir, exist_ok=True)
+
+    fname = f"attninner_static_layer_{layer_id:04d}_w_kc_tp{tp_r}.pt"
+    out_path = os.path.join(out_dir, fname)
+    try:
+        adp_r = int(get_attention_dp_rank())
+    except Exception:
+        adp_r = -1
+
+    meta = _debug_attn_inner_base_meta(
+        attn_module,
+        forward_batch,
+        AttnForwardMethod.MLA,
+        stage="w_kc_static",
+        extra={
+            "static_dump": True,
+            "w_kc_shape": tuple(w_kc.shape),
+            "w_kc_dtype": str(w_kc.dtype),
+        },
+    )
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "dump_kind": "attn_inner_static",
+        "path_tag": path_tag,
+        "layer_id": layer_id,
+        "tp_rank": tp_r,
+        "attn_dp_rank": adp_r,
+        "decode_dump": decode,
+        "meta": meta,
+        "w_kc": w_kc.detach().contiguous().cpu(),
+    }
+    try:
+        torch.save(payload, out_path)
+    except Exception as e:
+        logger.warning(
+            "SGLANG_DEBUG_DUMP_ATTN_INNER: failed to save static w_kc %s: %s",
+            out_path,
+            e,
+        )
+    else:
+        _DEBUG_ATTN_INNER_STATIC_W_KC_SAVED.add(key)
+        if _debug_attn_inner_verbose():
+            logger.info("[attn_inner] static w_kc saved: %s", out_path)
+
+
+def _debug_attn_inner_log_line(
+    attn_module: nn.Module,
+    tag: str,
+    forward_batch: ForwardBatch,
+    attn_forward_method: Any,
+    *,
+    extra: str = "",
+) -> None:
+    if not _debug_attn_inner_enabled():
+        return
+    layer_id = int(getattr(attn_module, "layer_id", -1))
+    if not _debug_attn_inner_layer_allowed(layer_id):
+        return
+    positions = getattr(forward_batch, "positions", None)
+    if _debug_attn_inner_skip_reason(forward_batch, positions) is not None:
+        return
+    meth = getattr(attn_forward_method, "name", str(attn_forward_method))
+    bk = getattr(attn_module, "current_attention_backend", None)
+    fm = getattr(forward_batch, "forward_mode", None)
+    logger.info(
+        "[attn_inner] %s layer=%s method=%s backend=%s special_dp=%s "
+        "dp_attn=%s fm=%s %s",
+        tag,
+        layer_id,
+        meth,
+        bk,
+        getattr(attn_module, "enable_special_dp_attention", False),
+        get_global_server_args().enable_dp_attention,
+        fm,
+        extra,
+    )
+
+
+def _debug_attn_inner_on_dispatch(
+    attn_module: nn.Module,
+    forward_batch: ForwardBatch,
+    positions: torch.Tensor,
+    attn_forward_method: Any,
+    hidden_states: Any,
+) -> None:
+    if not _debug_attn_inner_enabled():
+        return
+    layer_id = int(getattr(attn_module, "layer_id", -1))
+    if not _debug_attn_inner_layer_allowed(layer_id):
+        return
+    hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+    if not torch.is_tensor(hs):
+        return
+    me = _debug_attn_inner_sample_elems()
+    meta = _debug_attn_inner_base_meta(
+        attn_module, forward_batch, attn_forward_method, stage="attn_dispatch"
+    )
+    probes = {"hidden_in": _debug_tensor_probe_flat(hs, max_elems=me, label="hidden_in")}
+    _debug_save_attn_inner_if_enabled(
+        attn_module,
+        "attn_dispatch",
+        forward_batch,
+        positions,
+        meta=meta,
+        probes=probes,
+    )
+    _debug_attn_inner_log_line(
+        attn_module,
+        "dispatch",
+        forward_batch,
+        attn_forward_method,
+        extra=f"hidden_in_shape={tuple(hs.shape)}",
+    )
+
+
+def _debug_attn_inner_mha_qkv(
+    attn_module: nn.Module,
+    forward_batch: ForwardBatch,
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> None:
+    if not _debug_attn_inner_enabled():
+        return
+    layer_id = int(getattr(attn_module, "layer_id", -1))
+    if not _debug_attn_inner_layer_allowed(layer_id):
+        return
+    if _debug_attn_inner_skip_reason(forward_batch, positions) is not None:
+        return
+    me = _debug_attn_inner_sample_elems()
+    meta = _debug_attn_inner_base_meta(
+        attn_module,
+        forward_batch,
+        "MHA_STYLE_QKV",
+        stage="MHA_qkv",
+        extra={"prepare_branch": "forward_normal_prepare"},
+    )
+    probes = {
+        "q": _debug_tensor_probe_flat(q, max_elems=me, label="q"),
+        "k": _debug_tensor_probe_flat(k, max_elems=me, label="k"),
+        "v": _debug_tensor_probe_flat(v, max_elems=me, label="v"),
+    }
+    _debug_save_attn_inner_if_enabled(
+        attn_module,
+        "MHA_qkv",
+        forward_batch,
+        positions,
+        meta=meta,
+        probes=probes,
+    )
+    _debug_attn_inner_log_line(
+        attn_module,
+        "MHA_qkv",
+        forward_batch,
+        "MHA_STYLE_QKV",
+        extra=f"q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}",
+    )
+
+
+def _mla_absorb_core_attn_branch_extra_meta(
+    attn_module: nn.Module,
+    forward_batch: ForwardBatch,
+    *,
+    routing: str,
+    attn_call: str,
+    layout: str,
+    fuse_rope_trtllm: bool,
+    save_kv_cache: Optional[bool],
+    llama4_q_scaled: bool,
+    split_prefill_special_dp: bool,
+    topk_indices_passed: bool,
+) -> Dict[str, Any]:
+    """Stable routing metadata for ``forward_absorb_core`` (MLA absorb) attn_mqa call sites."""
+
+    ab = getattr(forward_batch, "attn_backend", None)
+    if ab is None:
+        attn_backend_cls: Optional[str] = None
+    else:
+        cls = ab.__class__
+        attn_backend_cls = f"{cls.__module__}.{cls.__qualname__}"
+
+    sk = "na" if save_kv_cache is None else str(bool(save_kv_cache))
+    bid = (
+        f"{routing}|{attn_call}|layout={layout}|fuse_trtllm_rope={int(fuse_rope_trtllm)}"
+        f"|save_kv_cache={sk}|llama4_q_scaled={int(llama4_q_scaled)}"
+        f"|split_prefill_special_dp={int(split_prefill_special_dp)}"
+        f"|topk_indices={int(topk_indices_passed)}"
+    )
+    bk = getattr(attn_module, "current_attention_backend", None)
+    return {
+        "absorb_core_branch_id": bid,
+        "absorb_core_routing": routing,
+        "attn_mqa_call": attn_call,
+        "attn_mqa_tensor_layout": layout,
+        "fuse_rope_trtllm_mla": bool(fuse_rope_trtllm),
+        "save_kv_cache": save_kv_cache,
+        "llama_4_q_scaled": bool(llama4_q_scaled),
+        "split_prefill_special_dp_attn": bool(split_prefill_special_dp),
+        "topk_indices_passed": bool(topk_indices_passed),
+        "core_backend_in_set": bk in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
+        "backend": bk,
+        "attn_backend_cls": attn_backend_cls,
+        "where": "before_attn_mqa",
+    }
+
+
+def _debug_attn_inner_mla_post_mqa(
+    attn_module: nn.Module,
+    forward_batch: ForwardBatch,
+    positions: torch.Tensor,
+    attn_output: torch.Tensor,
+) -> None:
+    if not _debug_attn_inner_enabled():
+        return
+    layer_id = int(getattr(attn_module, "layer_id", -1))
+    if not _debug_attn_inner_layer_allowed(layer_id):
+        return
+    if _debug_attn_inner_skip_reason(forward_batch, positions) is not None:
+        return
+    me = _debug_attn_inner_sample_elems()
+    meta = _debug_attn_inner_base_meta(
+        attn_module,
+        forward_batch,
+        AttnForwardMethod.MLA,
+        stage="MLA_post_mqa",
+        extra={"note": "after attn_mqa, before w_vc bmm / o_proj"},
+    )
+    probes = {
+        "attn_output": _debug_tensor_probe_flat(
+            attn_output, max_elems=me, label="attn_output"
+        ),
+    }
+    full_gpu: Dict[str, torch.Tensor] = {}
+    if _debug_attn_inner_save_full() and _debug_attn_inner_full_key_allowed(
+        "attn_output"
+    ):
+        full_gpu["attn_output"] = attn_output
+    _debug_save_attn_inner_if_enabled(
+        attn_module,
+        "MLA_post_mqa",
+        forward_batch,
+        positions,
+        meta=meta,
+        probes=probes,
+        full_tensors=full_gpu if full_gpu else None,
+    )
+    _debug_attn_inner_log_line(
+        attn_module,
+        "MLA_post_mqa",
+        forward_batch,
+        AttnForwardMethod.MLA,
+        extra=f"attn_out={tuple(attn_output.shape)}",
+    )
+
+
+def _debug_attn_inner_mla_absorb_checkpoint(
+    attn_module: nn.Module,
+    forward_batch: ForwardBatch,
+    positions: torch.Tensor,
+    *,
+    stage: str,
+    attn_forward_method: Any,
+    extra_meta: Optional[Dict[str, Any]],
+    tensors: Dict[str, Any],
+) -> None:
+    """Decode-only MLA absorb path; gated by ``SGLANG_DEBUG_DUMP_ATTN_INNER_MLA_ABSORB``."""
+
+    if not _debug_attn_inner_mla_absorb_enabled():
+        return
+    if not _debug_attn_inner_mla_stage_allowed(stage):
+        return
+    layer_id = int(getattr(attn_module, "layer_id", -1))
+    if not _debug_attn_inner_layer_allowed(layer_id):
+        return
+    if _debug_attn_inner_skip_reason(forward_batch, positions) is not None:
+        return
+
+    me = _debug_attn_inner_sample_elems()
+    probes: Dict[str, Any] = {}
+    full_gpu: Dict[str, torch.Tensor] = {}
+    for name, t in tensors.items():
+        if not torch.is_tensor(t):
+            probes[name] = _debug_tensor_probe_flat(None, max_elems=me, label=name)
+            continue
+        probes[name] = _debug_tensor_probe_flat(t, max_elems=me, label=name)
+        if _debug_attn_inner_save_full() and _debug_attn_inner_full_key_allowed(name):
+            full_gpu[name] = t
+
+    extra = dict(extra_meta or {})
+    extra["mla_absorb_checkpoint"] = True
+    meta = _debug_attn_inner_base_meta(
+        attn_module,
+        forward_batch,
+        attn_forward_method,
+        stage=stage,
+        extra=extra,
+    )
+    if extra.get("absorb_core_branch_id"):
+        try:
+            layer_id = int(getattr(attn_module, "layer_id", -1))
+            logger.info(
+                "[attn_inner_mla_absorb] layer=%s stage=%s branch_id=%s routing=%s "
+                "attn_call=%s layout=%s backend=%s core_set=%s attn_backend_cls=%s",
+                layer_id,
+                stage,
+                extra.get("absorb_core_branch_id"),
+                extra.get("absorb_core_routing"),
+                extra.get("attn_mqa_call"),
+                extra.get("attn_mqa_tensor_layout"),
+                extra.get("backend"),
+                extra.get("core_backend_in_set"),
+                extra.get("attn_backend_cls"),
+            )
+        except Exception:
+            pass
+    try:
+        _debug_save_attn_inner_if_enabled(
+            attn_module,
+            stage,
+            forward_batch,
+            positions,
+            meta=meta,
+            probes=probes,
+            full_tensors=full_gpu if full_gpu else None,
+        )
+    except Exception:
+        pass
+
+
+def _debug_attn_inner_forward_inout(
+    attn_module: nn.Module,
+    hidden_states: Any,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    attn_forward_method: Any,
+    output: torch.Tensor,
+) -> None:
+    if not _debug_attn_inner_enabled():
+        return
+    layer_id = int(getattr(attn_module, "layer_id", -1))
+    if not _debug_attn_inner_layer_allowed(layer_id):
+        return
+    if _debug_attn_inner_skip_reason(forward_batch, positions) is not None:
+        return
+    hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+    if not torch.is_tensor(hs) or not torch.is_tensor(output):
+        return
+    me = _debug_attn_inner_sample_elems()
+    meta = _debug_attn_inner_base_meta(
+        attn_module,
+        forward_batch,
+        attn_forward_method,
+        stage="attn_forward_inout",
+    )
+    probes = {
+        "hidden_in": _debug_tensor_probe_flat(hs, max_elems=me, label="hidden_in"),
+        "hidden_out": _debug_tensor_probe_flat(output, max_elems=me, label="hidden_out"),
+    }
+    _debug_save_attn_inner_if_enabled(
+        attn_module,
+        "attn_inout",
+        forward_batch,
+        positions,
+        meta=meta,
+        probes=probes,
+    )
+    _debug_attn_inner_log_line(
+        attn_module,
+        "forward_done",
+        forward_batch,
+        attn_forward_method,
+        extra=f"in={tuple(hs.shape)} out={tuple(output.shape)}",
+    )
 
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
@@ -887,11 +1944,52 @@ class DeepseekV2MLP(nn.Module):
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
+        _debug_save_mlp_inner_if_enabled(
+            _debug_resolve_mlp_inner_layer_id(self),
+            "dense_gate_up",
+            tensor=gate_up,
+            residual=None,
+            forward_batch=forward_batch,
+            meta={
+                "module": "DeepseekV2MLP",
+                "should_allreduce_fusion": bool(should_allreduce_fusion),
+                "use_reduce_scatter": bool(use_reduce_scatter),
+                "tp_size": int(self.tp_size) if self.tp_size is not None else None,
+                "hidden_tokens": int(gate_up.shape[0]),
+            },
+        )
+
         x = self.act_fn(gate_up)
+
+        _debug_save_mlp_inner_if_enabled(
+            _debug_resolve_mlp_inner_layer_id(self),
+            "dense_act",
+            tensor=x,
+            residual=None,
+            forward_batch=forward_batch,
+            meta={"module": "DeepseekV2MLP"},
+        )
+
         x, _ = self.down_proj(
             x,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
         )
+
+        if _debug_mlp_inner_save_dense_down_proj():
+            _debug_save_mlp_inner_if_enabled(
+                _debug_resolve_mlp_inner_layer_id(self),
+                "dense_down_proj",
+                tensor=x,
+                residual=None,
+                forward_batch=forward_batch,
+                meta={
+                    "module": "DeepseekV2MLP",
+                    "skip_all_reduce_in_down_proj": bool(
+                        should_allreduce_fusion or use_reduce_scatter
+                    ),
+                },
+            )
+
         return x
 
 
@@ -932,6 +2030,7 @@ class MoEGate(nn.Module):
         forward_batch: ForwardBatch = None,
     ):
         if use_intel_amx_backend(self):
+            self._debug_last_router_branch = "intel_amx_weight_packed_linear"
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,
                 self.weight,
@@ -940,9 +2039,11 @@ class MoEGate(nn.Module):
             )
 
         if get_global_server_args().enable_deterministic_inference:
+            self._debug_last_router_branch = "deterministic_F_linear"
             return F.linear(hidden_states, self.weight, None)
 
         if forward_batch is not None and nsa_use_prefill_cp(forward_batch):
+            self._debug_last_router_branch = "nsa_prefill_cp_F_linear"
             logits = F.linear(hidden_states, self.weight, None)
         else:
             # NOTE: For some unknown reason, router_gemm seems degrade accept length.
@@ -955,14 +2056,17 @@ class MoEGate(nn.Module):
             ):
 
                 # router gemm output float32
+                self._debug_last_router_branch = "cuda_sm90plus_dsv3_router_gemm_fp32"
                 logits = dsv3_router_gemm(
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
             elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
+                self._debug_last_router_branch = "gfx_aiter_dsv3_router_gemm"
                 logits = aiter_dsv3_router_gemm(
                     hidden_states, self.weight, gemm_output_zero_allocator
                 )
             else:
+                self._debug_last_router_branch = "F_linear_default"
                 logits = F.linear(hidden_states, self.weight, None)
 
         return logits
@@ -1114,6 +2218,11 @@ class DeepseekV2MoE(nn.Module):
                     self.shared_experts_weight_block_size = (
                         self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
                     )
+            setattr(
+                self.shared_experts,
+                "_sglang_decoder_layer_id",
+                int(self.layer_id),
+            )
 
         self.top_k = config.num_experts_per_tok
 
@@ -1173,6 +2282,7 @@ class DeepseekV2MoE(nn.Module):
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
+                    forward_batch,
                     should_allreduce_fusion,
                     use_reduce_scatter,
                     gemm_output_zero_allocator,
@@ -1180,6 +2290,7 @@ class DeepseekV2MoE(nn.Module):
             else:
                 return self.forward_normal(
                     hidden_states,
+                    forward_batch,
                     should_allreduce_fusion,
                     use_reduce_scatter,
                     gemm_output_zero_allocator,
@@ -1190,6 +2301,7 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
@@ -1203,7 +2315,9 @@ class DeepseekV2MoE(nn.Module):
 
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            router_logits = self.gate(
+                hidden_states, gemm_output_zero_allocator, forward_batch
+            )
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
             if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
@@ -1211,6 +2325,44 @@ class DeepseekV2MoE(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
+
+        if forward_batch is not None:
+            _dbg_router = {
+                "route": "forward_normal_dual_stream",
+                "moe_gate_branch": getattr(
+                    self.gate, "_debug_last_router_branch", None
+                ),
+                "router_logits_shape": tuple(router_logits.shape),
+                "router_logits_meta": _debug_router_logits_meta(router_logits),
+            }
+            _debug_mlp_inner_maybe_log_router_branch(
+                layer_id=self.layer_id,
+                forward_batch=forward_batch,
+                extra=_dbg_router,
+            )
+            _debug_save_mlp_inner_if_enabled(
+                self.layer_id,
+                "moe_router_meta",
+                tensor=None,
+                residual=None,
+                forward_batch=forward_batch,
+                meta=_dbg_router,
+            )
+
+            _debug_save_mlp_inner_if_enabled(
+                self.layer_id,
+                "moe_pre_tp_allreduce",
+                tensor=final_hidden_states,
+                residual=None,
+                forward_batch=forward_batch,
+                meta={
+                    "route": "forward_normal_dual_stream",
+                    "tp_size": self.tp_size,
+                    "should_allreduce_fusion": bool(should_allreduce_fusion),
+                    "use_reduce_scatter": bool(use_reduce_scatter),
+                },
+            )
+
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -1223,6 +2375,7 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
@@ -1240,7 +2393,31 @@ class DeepseekV2MoE(nn.Module):
                     hidden_states, gemm_output_zero_allocator
                 )
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            router_logits = self.gate(
+                hidden_states, gemm_output_zero_allocator, forward_batch
+            )
+            if forward_batch is not None:
+                _dbg_router = {
+                    "route": "forward_normal",
+                    "moe_gate_branch": getattr(
+                        self.gate, "_debug_last_router_branch", None
+                    ),
+                    "router_logits_shape": tuple(router_logits.shape),
+                    "router_logits_meta": _debug_router_logits_meta(router_logits),
+                }
+                _debug_mlp_inner_maybe_log_router_branch(
+                    layer_id=self.layer_id,
+                    forward_batch=forward_batch,
+                    extra=_dbg_router,
+                )
+                _debug_save_mlp_inner_if_enabled(
+                    self.layer_id,
+                    "moe_router_meta",
+                    tensor=None,
+                    residual=None,
+                    forward_batch=forward_batch,
+                    meta=_dbg_router,
+                )
             topk_output = self.topk(hidden_states, router_logits)
         else:
             shared_output = None
@@ -1287,8 +2464,34 @@ class DeepseekV2MoE(nn.Module):
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
+        if forward_batch is not None and hidden_states.shape[0] > 0:
+            _debug_save_mlp_inner_if_enabled(
+                self.layer_id,
+                "moe_routed_maybe_scaled_pre_shared",
+                tensor=final_hidden_states,
+                residual=None,
+                forward_batch=forward_batch,
+                meta={"route": "forward_normal"},
+            )
         if shared_output is not None:
             final_hidden_states += shared_output
+        if forward_batch is not None:
+            _debug_save_mlp_inner_if_enabled(
+                self.layer_id,
+                "moe_pre_tp_allreduce",
+                tensor=final_hidden_states,
+                residual=None,
+                forward_batch=forward_batch,
+                meta={
+                    "route": "forward_normal",
+                    "tp_size": self.tp_size,
+                    "should_allreduce_fusion": bool(should_allreduce_fusion),
+                    "use_reduce_scatter": bool(use_reduce_scatter),
+                    "fuse_shared_experts_inside_sbo": bool(
+                        self._fuse_shared_experts_inside_sbo
+                    ),
+                },
+            )
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -1986,7 +3189,25 @@ class DeepseekV2AttentionMLA(nn.Module):
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
         )
-        return self.forward_core(s)
+        out = self.forward_core(s)
+        try:
+            if (
+                isinstance(s, tuple)
+                and len(s) == 4
+                and s[1] is not None
+                and torch.is_tensor(out)
+            ):
+                _debug_attn_inner_forward_inout(
+                    self,
+                    hidden_states,
+                    positions,
+                    forward_batch,
+                    s[1],
+                    out,
+                )
+        except Exception:
+            pass
+        return out
 
     def forward_prepare(
         self,
@@ -2020,6 +3241,16 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        try:
+            _debug_attn_inner_on_dispatch(
+                self,
+                forward_batch,
+                positions,
+                attn_forward_method,
+                hidden_states,
+            )
+        except Exception:
+            pass
 
         # Debug: dump KV-cache fingerprint as close as possible to decode cache-read.
         # This is a low-overhead, best-effort dump (decode-only, layer0-only by default).
@@ -2086,7 +3317,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             return hidden_states
 
         if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention and self.enable_pdmux and attn_forward_method not in [
-            AttnForwardMethod.MHA, AttnForwardMethod.MHA_ONE_SHOT, AttnForwardMethod.MLA
+            AttnForwardMethod.MHA, AttnForwardMethod.MHA_ONE_SHOT #, AttnForwardMethod.MLA
             ]:
             raise NotImplementedError(f"DP-Attention + PD-MUX is not supported for attention method: {attn_forward_method.name}")
 
@@ -2317,6 +3548,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             k = self._concat_and_cast_mha_k_split_prefill_normal_tp(k_nope, k_pe, forward_batch)
         else:
             k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+        try:
+            _debug_attn_inner_mha_qkv(self, forward_batch, positions, q, k, v)
+        except Exception:
+            pass
         return q, k, v, forward_batch
 
     def forward_normal_core(self, q, k, v, forward_batch):
@@ -2421,6 +3656,22 @@ class DeepseekV2AttentionMLA(nn.Module):
                         q = self.q_a_layernorm(q)
                         k_nope = self.kv_a_layernorm(k_nope)
 
+            try:
+                _debug_attn_inner_mla_absorb_checkpoint(
+                    self,
+                    forward_batch,
+                    positions,
+                    stage="mla_prep_after_latent_norms",
+                    attn_forward_method=AttnForwardMethod.MLA,
+                    extra_meta={
+                        "path": "forward_absorb_prepare",
+                        "branch": "q_lora_rank",
+                    },
+                    tensors={"q": q, "k_nope": k_nope},
+                )
+            except Exception:
+                pass
+
             # q_lora needed by indexer
             if self.use_nsa:
                 q_lora = q
@@ -2482,8 +3733,47 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
+        try:
+            _debug_attn_inner_mla_absorb_checkpoint(
+                self,
+                forward_batch,
+                positions,
+                stage="mla_prep_before_q_nope_pe_split",
+                attn_forward_method=AttnForwardMethod.MLA,
+                extra_meta={
+                    "path": "forward_absorb_prepare",
+                    "q_lora_rank_is_none": self.q_lora_rank is None,
+                },
+                tensors={"q": q, "k_nope": k_nope},
+            )
+        except Exception:
+            pass
+
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+
+        try:
+            _debug_attn_inner_mla_absorb_checkpoint(
+                self,
+                forward_batch,
+                positions,
+                stage="mla_prep_after_qkv_split",
+                attn_forward_method=AttnForwardMethod.MLA,
+                extra_meta={"path": "forward_absorb_prepare"},
+                tensors={
+                    "q_nope": q_nope,
+                    "q_pe": q_pe,
+                    "k_pe": k_pe,
+                    "k_nope": k_nope,
+                },
+            )
+        except Exception:
+            pass
+
+        try:
+            _debug_attn_inner_save_w_kc_static_once(self, forward_batch, positions)
+        except Exception:
+            pass
 
         # q_nope: torch.Size([2, 128, 128]), q_pe: torch.Size([2, 128, 64])
         # use_deep_gemm_bmm: False, _is_hip: False, _use_aiter_gfx95: False
@@ -2567,12 +3857,44 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
+        try:
+            _debug_attn_inner_mla_absorb_checkpoint(
+                self,
+                forward_batch,
+                positions,
+                stage="mla_prep_after_w_kc",
+                attn_forward_method=AttnForwardMethod.MLA,
+                extra_meta={
+                    "path": "forward_absorb_prepare",
+                    "use_deep_gemm_bmm": bool(self.use_deep_gemm_bmm),
+                    "w_kc_dtype": str(self.w_kc.dtype),
+                },
+                tensors={"q_nope_out": q_nope_out},
+            )
+        except Exception:
+            pass
+
         if (
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
             and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            try:
+                _debug_attn_inner_mla_absorb_checkpoint(
+                    self,
+                    forward_batch,
+                    positions,
+                    stage="mla_prep_after_rope",
+                    attn_forward_method=AttnForwardMethod.MLA,
+                    extra_meta={
+                        "path": "forward_absorb_prepare",
+                        "rotary_applied": True,
+                    },
+                    tensors={"q_pe": q_pe, "k_pe": k_pe},
+                )
+            except Exception:
+                pass
 
         if nsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -2606,16 +3928,76 @@ class DeepseekV2AttentionMLA(nn.Module):
     ):
         save_kv_cache = True
 
+        try:
+            _debug_attn_inner_mla_absorb_checkpoint(
+                self,
+                forward_batch,
+                positions,
+                stage="mla_core_inputs",
+                attn_forward_method=AttnForwardMethod.MLA,
+                extra_meta={
+                    "where": "forward_absorb_core_entry",
+                    "core_backend_in_set": self.current_attention_backend
+                    in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
+                    "backend": self.current_attention_backend,
+                },
+                tensors={
+                    "q_pe": q_pe,
+                    "k_pe": k_pe,
+                    "q_nope_out": q_nope_out,
+                    "k_nope": k_nope,
+                },
+            )
+        except Exception:
+            pass
+
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
-            if self._fuse_rope_for_trtllm_mla(forward_batch):
+            fuse_rope_trtllm = self._fuse_rope_for_trtllm_mla(forward_batch)
+            if fuse_rope_trtllm:
                 extra_args = {
                     "cos_sin_cache": self.rotary_emb.cos_sin_cache,
                     "is_neox": self.rotary_emb.is_neox_style,
                     "llama_4_scaling": llama_4_scaling,
                 }
 
-            if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
+            split_prefill_special_dp = (
+                forward_batch.forward_mode.is_split_prefill()
+                and self.enable_special_dp_attention
+            )
+            topk_passed = topk_indices is not None
+            attn_call = "attn_mqa_normal_tp" if split_prefill_special_dp else "attn_mqa"
+            branch_extra = _mla_absorb_core_attn_branch_extra_meta(
+                self,
+                forward_batch,
+                routing="core_backend_set",
+                attn_call=attn_call,
+                layout="split_nope_rope",
+                fuse_rope_trtllm=fuse_rope_trtllm,
+                save_kv_cache=None,
+                llama4_q_scaled=False,
+                split_prefill_special_dp=split_prefill_special_dp,
+                topk_indices_passed=topk_passed,
+            )
+            try:
+                _debug_attn_inner_mla_absorb_checkpoint(
+                    self,
+                    forward_batch,
+                    positions,
+                    stage="mla_core_attn_mqa_inputs",
+                    attn_forward_method=AttnForwardMethod.MLA,
+                    extra_meta=dict(branch_extra),
+                    tensors={
+                        "q_nope_out": q_nope_out,
+                        "k_nope": k_nope,
+                        "q_pe": q_pe,
+                        "k_pe": k_pe,
+                    },
+                )
+            except Exception:
+                pass
+
+            if split_prefill_special_dp:
                 attn_output = self.attn_mqa_normal_tp(
                     q_nope_out,
                     k_nope,
@@ -2624,7 +4006,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     q_rope=q_pe,
                     k_rope=k_pe,
                     **extra_args,
-                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                    **(dict(topk_indices=topk_indices) if topk_passed else {}),
                 )
             else:
                 attn_output = self.attn_mqa(
@@ -2635,7 +4017,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     q_rope=q_pe,
                     k_rope=k_pe,
                     **extra_args,
-                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                    **(dict(topk_indices=topk_indices) if topk_passed else {}),
                 )
         else:
             if _use_aiter_gfx95:
@@ -2664,22 +4046,62 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
 
                 save_kv_cache = False
+                absorb_routing = "legacy_aiter_fused_qk_rope_cache"
+                tensor_layout = "aiter_fused"
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
+                absorb_routing = "legacy_cat_qk"
+                tensor_layout = "concat_qk"
 
             # Apply llama 4 scaling if provided
+            llama4_q_scaled = llama_4_scaling is not None
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
 
-            if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
+            split_prefill_special_dp = (
+                forward_batch.forward_mode.is_split_prefill()
+                and self.enable_special_dp_attention
+            )
+            topk_passed = topk_indices is not None
+            attn_call = "attn_mqa_normal_tp" if split_prefill_special_dp else "attn_mqa"
+            branch_extra = _mla_absorb_core_attn_branch_extra_meta(
+                self,
+                forward_batch,
+                routing=absorb_routing,
+                attn_call=attn_call,
+                layout=tensor_layout,
+                fuse_rope_trtllm=False,
+                save_kv_cache=save_kv_cache,
+                llama4_q_scaled=llama4_q_scaled,
+                split_prefill_special_dp=split_prefill_special_dp,
+                topk_indices_passed=topk_passed,
+            )
+            try:
+                _debug_attn_inner_mla_absorb_checkpoint(
+                    self,
+                    forward_batch,
+                    positions,
+                    stage="mla_core_attn_mqa_inputs",
+                    attn_forward_method=AttnForwardMethod.MLA,
+                    extra_meta=dict(branch_extra),
+                    tensors={
+                        "attn_mqa_q": q,
+                        "attn_mqa_k": k,
+                        "k_nope": k_nope,
+                    },
+                )
+            except Exception:
+                pass
+
+            if split_prefill_special_dp:
                 attn_output = self.attn_mqa_normal_tp(
                     q,
                     k,
                     k_nope,
                     forward_batch,
                     save_kv_cache=save_kv_cache,
-                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                    **(dict(topk_indices=topk_indices) if topk_passed else {}),
                 )
             else:
                 attn_output = self.attn_mqa(
@@ -2688,12 +4110,35 @@ class DeepseekV2AttentionMLA(nn.Module):
                     k_nope,
                     forward_batch,
                     save_kv_cache=save_kv_cache,
-                    **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+                    **(dict(topk_indices=topk_indices) if topk_passed else {}),
                 )
+        try:
+            _debug_attn_inner_mla_absorb_checkpoint(
+                self,
+                forward_batch,
+                positions,
+                stage="mla_core_after_attn_mqa_raw",
+                attn_forward_method=AttnForwardMethod.MLA,
+                extra_meta={
+                    "where": "after_attn_mqa_before_view",
+                    "attn_output_shape_before_view": tuple(attn_output.shape),
+                },
+                tensors={"attn_output": attn_output},
+            )
+        except Exception:
+            pass
+
         if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
             attn_output = attn_output.view(-1, self.tp_num_heads, self.kv_lora_rank)
         else:
             attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+
+        try:
+            _debug_attn_inner_mla_post_mqa(
+                self, forward_batch, positions, attn_output
+            )
+        except Exception:
+            pass
 
         if self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
@@ -3504,6 +4949,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
+        setattr(self.mlp, "_sglang_decoder_layer_id", int(self.layer_id))
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(

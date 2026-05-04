@@ -2,6 +2,9 @@
 """
 Compare per-layer debug dumps from SGLANG_DEBUG_SAVE_LAYER_HIDDENS (normal_forward vs split_prefill).
 
+For **decode** runs (two ``normal_forward/`` dirs, req-id mapping, ``layer_*`` + ``mlpinner_*`` in
+pipeline order), prefer ``compare_decode_pipeline.py`` in this directory instead of this script.
+
 Usage:
  python compare_tensor.py \
  --a run_add_logit/normal_forward \

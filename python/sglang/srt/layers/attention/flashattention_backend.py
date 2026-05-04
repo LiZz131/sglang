@@ -10,6 +10,9 @@ import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.fa_backend_decode_dump import (
+    maybe_dump_forward_decode,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -1079,6 +1082,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
+        fa_dbg_kv_page_tables: list = []
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
         use_local_attn = (
             self.has_local_attention
@@ -1138,6 +1142,7 @@ class FlashAttentionBackend(AttentionBackend):
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
+                fa_dbg_kv_page_tables.append(metadata.encoder_page_table)
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -1158,6 +1163,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
+                fa_dbg_kv_page_tables.append(local_attn_metadata.local_block_table)
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -1193,6 +1199,7 @@ class FlashAttentionBackend(AttentionBackend):
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
+                fa_dbg_kv_page_tables.append(page_table)
 
                 # Default: single-token self-attention
                 result = flash_attn_with_kvcache(
@@ -1215,6 +1222,9 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
+                    fa_dbg_kv_page_tables.append(
+                        self.forward_metadata_spec_decode_expand.page_table
+                    )
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
                             q=q_reshaped,
@@ -1271,6 +1281,7 @@ class FlashAttentionBackend(AttentionBackend):
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
+            fa_dbg_kv_page_tables.append(metadata.page_table)
 
             result = flash_attn_with_kvcache(
                 q=q_rope,
@@ -1292,6 +1303,9 @@ class FlashAttentionBackend(AttentionBackend):
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
+                fa_dbg_kv_page_tables.append(
+                    self.forward_metadata_spec_decode_expand.page_table
+                )
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
@@ -1320,6 +1334,36 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 o = result
 
+        _fa_dbg_flags = {
+            "use_mla": self.use_mla,
+            "use_local_attn": use_local_attn,
+            "use_cascade_attn": use_cascade_attn,
+            "is_swa_layer": is_swa_layer,
+            "causal": causal,
+            "window_size": window_size,
+            "save_kv_cache": save_kv_cache,
+            "fa_impl_ver": self.fa_impl_ver,
+            "page_size": self.page_size,
+            "use_sliding_window_kv_pool": self.use_sliding_window_kv_pool,
+            "has_local_attention": self.has_local_attention,
+            "kv_cache_dtype_str": self.kv_cache_dtype_str,
+            "topk": self.topk,
+        }
+        maybe_dump_forward_decode(
+            self,
+            layer,
+            forward_batch,
+            q=q,
+            k=k,
+            v=v,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            sinks=sinks,
+            save_kv_cache=save_kv_cache,
+            o=o,
+            dbg_flags=_fa_dbg_flags,
+            fa_kv_page_tables=fa_dbg_kv_page_tables,
+        )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):

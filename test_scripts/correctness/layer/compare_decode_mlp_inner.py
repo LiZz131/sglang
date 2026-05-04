@@ -1,40 +1,21 @@
 #!/usr/bin/env python3
 """
-Compare **decode** per-layer hidden dumps produced by DeepSeek-V2 debug hook
-(``_debug_save_layer_hidden_if_enabled``) across two runs whose req ids differ.
+Compare **decode** ``mlpinner_*`` checkpoints from ``SGLANG_DEBUG_DUMP_MLP_INNER``
+(``_debug_save_mlp_inner_if_enabled`` in ``deepseek_v2.py``).
 
-This script matches files by a **stable signature** derived from filename +
-payload, rather than relying on request id strings.
+``compare_decode_layer_hiddens.py`` only matches filenames ``layer_*_decode_*``;
+it **never** sees ``mlpinner_*``. Use this script for MLP/MoE inner tensors + meta.
 
-Expected filenames (decode-enabled):
-  layer_{layer:04d}_{stage}_tp{tp}_decode_pos{pos}_req{...}.pt
-
-**Decode comparison policy (aligned with parallel semantics)**
-
-- **PRIMARY** (default-first in output): ``pre_mlp`` — hidden/residual **after**
-  attention-side collectives in ``prepare_mlp`` and **before** the MLP. Use this
-  as the main cross-run gate when comparing TP vs dp-attn / special-dp-attn.
-- **AUXILIARY**: ``pre_attn``, ``post_attn`` — per-shard / pre-collective slices;
-  TP vs dp-attention paths **may legitimately differ** here; keep only for local
-  sanity, not as the main correctness signal vs TP.
-- **DOWNSTREAM**: ``post_mlp``, ``layer_out`` — after MLP; useful for tracing
-  propagation but not the same semantic cut as ``pre_mlp``.
+Expected filenames (typical single-token decode):
+  mlpinner_layer_{layer:04d}_{stage}_tp{tp}_decode_pos{pos}_req{...}.pt
 
 Usage:
-  python compare_decode_layer_hiddens.py \
-    --a /path/to/run_..._tp/normal_forward \
-    --b /path/to/run_..._dpattn/normal_forward \
-    -o run_0430_decode.hidden.decode.diff
+  python compare_decode_mlp_inner.py \\
+    --a /path/run_A/normal_forward \\
+    --b /path/run_B/normal_forward \\
+    -o run_ab.mlpinner.diff
 
-  # Only compare the primary cut (faster, matches offline review policy):
-  python compare_decode_layer_hiddens.py --a ... --b ... --only-primary
-
-Notes:
-  - Only compares files whose name contains ``_decode_``.
-  - Does NOT use sampled token ids (input_ids) as matching keys.
-  - Maps request ids across runs by decode pos coverage, then matches tensors by
-    (pos, layer_id, stage, tp_rank) within each mapped request.
-  - Tensors compared: payload["hidden_states"] and payload["residual"] (if present).
+  python compare_decode_mlp_inner.py --a ... --b ... --only-stages moe_router_meta,dense_act
 """
 
 from __future__ import annotations
@@ -46,7 +27,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, TextIO, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, TextIO, Tuple
 
 import torch
 
@@ -69,17 +50,20 @@ class _TeeStdout:
         return self._a.isatty()
 
 
-_FNAME_RE = re.compile(
-    r"^layer_(?P<layer>\d{4})_(?P<stage>.+?)_tp(?P<tp>\d+)_decode_pos(?P<pos>\d+)_req(?P<req>.+?)\.pt$"
+_MLPINNER_RE = re.compile(
+    r"^mlpinner_layer_(?P<layer>\d{4})_(?P<stage>.+?)_tp(?P<tp>\d+)"
+    r"_decode_(?P<dbody>.+?)_req(?P<req>.+?)\.pt$"
 )
+_POS_SINGLE = re.compile(r"^pos(\d+)$")
 
 
 @dataclass(frozen=True)
-class Key:
+class InnerKey:
     layer: int
     stage: str
     tp_rank: int
-    pos: int
+    pos: int  # -1 if decode suffix is not ``pos{N}`` (e.g. multi-token ``npos...``)
+    decode_body: str
 
 
 @dataclass(frozen=True)
@@ -87,29 +71,6 @@ class ReqSig:
     decode_min_pos: int
     decode_max_pos: int
     decode_pos_count: int
-
-
-# See module docstring: PRIMARY = post-attn collective, pre-MLP tensor.
-PRIMARY_DECODE_STAGES = frozenset({"pre_mlp"})
-AUXILIARY_DECODE_STAGES = frozenset({"pre_attn", "post_attn"})
-DOWNSTREAM_DECODE_STAGES = frozenset({"post_mlp", "layer_out"})
-
-
-def _decode_stage_bucket(stage: str) -> str:
-    if stage in PRIMARY_DECODE_STAGES:
-        return "primary"
-    if stage in AUXILIARY_DECODE_STAGES:
-        return "auxiliary"
-    if stage in DOWNSTREAM_DECODE_STAGES:
-        return "downstream"
-    return "other"
-
-
-def _decode_key_sort_policy(k: Key) -> Tuple:
-    """Order keys: primary -> downstream -> auxiliary -> other, then stable tie-break."""
-    order = {"primary": 0, "downstream": 1, "auxiliary": 2, "other": 3}
-    b = _decode_stage_bucket(k.stage)
-    return (order.get(b, 9), k.pos, k.layer, k.tp_rank, k.stage)
 
 
 def _load(path: str) -> Dict[str, Any]:
@@ -148,18 +109,13 @@ def _strict_fail(metrics: Dict[str, float], cos_tol: float) -> bool:
         not math.isfinite(metrics["cos"]) or abs(1.0 - metrics["cos"]) > cos_tol
     )
 
+
 def _best_row_match_by_metrics(
     a: torch.Tensor,
     b: torch.Tensor,
     *,
     name: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
-    """Conservative row matching when batch differs.
-
-    If A is (1, ...) and B is (N, ...) with same trailing dims, compare A[0] with each
-    B[i] and choose the row that is *closest* by (max cos, then min max_abs).
-    Symmetric when B is (1, ...) and A is (N, ...).
-    """
     notes: List[str] = []
     if not (torch.is_tensor(a) and torch.is_tensor(b)):
         return a, b, notes
@@ -201,61 +157,82 @@ def _best_row_match_by_metrics(
     return a, b, notes
 
 
+def _decode_pos_from_mlpinner_basename(fn: str) -> Optional[int]:
+    m = _MLPINNER_RE.match(fn)
+    if not m:
+        return None
+    dbody = m.group("dbody")
+    pm = _POS_SINGLE.match(dbody)
+    if pm:
+        return int(pm.group(1))
+    return None
+
+
+def _inner_key_from_basename(fn: str) -> Optional[Tuple[InnerKey, str]]:
+    m = _MLPINNER_RE.match(fn)
+    if m is None:
+        return None
+    layer = int(m.group("layer"))
+    stage = m.group("stage")
+    tp = int(m.group("tp"))
+    dbody = m.group("dbody")
+    req = m.group("req")
+    pm = _POS_SINGLE.match(dbody)
+    pos = int(pm.group(1)) if pm else -1
+    k = InnerKey(layer=layer, stage=stage, tp_rank=tp, pos=pos, decode_body=dbody)
+    return k, req
+
+
+def _iter_mlpinner_decode_files(dir_path: str) -> List[str]:
+    out: List[str] = []
+    try:
+        names = os.listdir(dir_path)
+    except FileNotFoundError:
+        return []
+    for fn in names:
+        if not fn.startswith("mlpinner_") or not fn.endswith(".pt"):
+            continue
+        if "_decode_" not in fn:
+            continue
+        out.append(os.path.join(dir_path, fn))
+    out.sort()
+    return out
+
+
 def _req_sig_from_paths(paths: Iterable[str]) -> Optional[ReqSig]:
     poss: List[int] = []
     for p in paths:
         fn = os.path.basename(p)
-        m = _FNAME_RE.match(fn)
-        if m is not None:
-            poss.append(int(m.group("pos")))
+        pos = _decode_pos_from_mlpinner_basename(fn)
+        if pos is not None:
+            poss.append(pos)
     if not poss:
         return None
     poss.sort()
+    uniq = sorted(set(poss))
     return ReqSig(
-        decode_min_pos=poss[0],
-        decode_max_pos=poss[-1],
-        decode_pos_count=len(set(poss)),
+        decode_min_pos=uniq[0],
+        decode_max_pos=uniq[-1],
+        decode_pos_count=len(uniq),
     )
 
 
-def _iter_decode_files(dir_path: str) -> List[str]:
-    files = []
-    for fn in os.listdir(dir_path):
-        if not fn.endswith(".pt"):
-            continue
-        if "_decode_" not in fn:
-            continue
-        files.append(os.path.join(dir_path, fn))
-    files.sort()
-    return files
-
-
-def _build_req_index(dir_path: str) -> Dict[str, Dict[Key, str]]:
-    """Extract per-request indices from filenames.
-
-    Returns: req_id_in_filename -> (Key -> path)
-    """
-    by_req: Dict[str, Dict[Key, str]] = {}
-    for path in _iter_decode_files(dir_path):
+def _build_req_index(dir_path: str) -> Dict[str, Dict[InnerKey, str]]:
+    by_req: Dict[str, Dict[InnerKey, str]] = {}
+    for path in _iter_mlpinner_decode_files(dir_path):
         fn = os.path.basename(path)
-        m = _FNAME_RE.match(fn)
-        if m is None:
+        parsed = _inner_key_from_basename(fn)
+        if parsed is None:
             continue
-        layer = int(m.group("layer"))
-        stage = m.group("stage")
-        tp = int(m.group("tp"))
-        pos = int(m.group("pos"))
-        req = m.group("req")
-        k = Key(layer=layer, stage=stage, tp_rank=tp, pos=pos)
-        by_req.setdefault(req, {}).setdefault(k, path)
+        k, req = parsed
+        by_req.setdefault(req, {})[k] = path
     return by_req
 
 
 def _build_req_mapping(
-    reqs_a: Dict[str, Dict[Key, str]],
-    reqs_b: Dict[str, Dict[Key, str]],
+    reqs_a: Dict[str, Dict[InnerKey, str]],
+    reqs_b: Dict[str, Dict[InnerKey, str]],
 ) -> Tuple[Dict[str, str], List[str]]:
-    """Map request ids across runs using decode pos coverage signature."""
     notes: List[str] = []
     sig_to_a: Dict[ReqSig, List[str]] = {}
     sig_to_b: Dict[ReqSig, List[str]] = {}
@@ -287,8 +264,43 @@ def _build_req_mapping(
     return mapping, notes
 
 
+def _meta_line_diff(ma: Any, mb: Any, indent: str = "  ") -> List[str]:
+    lines: List[str] = []
+    if type(ma) != type(mb):
+        lines.append(f"{indent}type diff: A={type(ma).__name__} B={type(mb).__name__}")
+        return lines
+    if ma == mb:
+        return lines
+    if isinstance(ma, dict) and isinstance(mb, dict):
+        keys_a, keys_b = set(ma), set(mb)
+        for k in sorted(keys_a - keys_b):
+            lines.append(f"{indent}meta only A: {k!r}")
+        for k in sorted(keys_b - keys_a):
+            lines.append(f"{indent}meta only B: {k!r}")
+        for k in sorted(keys_a & keys_b):
+            sub = _meta_line_diff(ma[k], mb[k], indent + "  ")
+            if sub:
+                lines.append(f"{indent}meta[{k!r}]:")
+                lines.extend(sub)
+        return lines
+    lines.append(f"{indent}value A={ma!r} B={mb!r}")
+    return lines
+
+
+def _inner_key_sort(k: InnerKey) -> Tuple:
+    stage_order = {
+        "moe_router_meta": 0,
+        "moe_routed_maybe_scaled_pre_shared": 1,
+        "moe_pre_tp_allreduce": 2,
+        "dense_gate_up": 3,
+        "dense_act": 4,
+        "dense_down_proj": 5,
+    }
+    return (k.pos if k.pos >= 0 else 10**9, k.layer, stage_order.get(k.stage, 99), k.tp_rank, k.stage)
+
+
 def compare_pair(
-    key: Key,
+    key: InnerKey,
     pa: str,
     pb: str,
     *,
@@ -296,12 +308,9 @@ def compare_pair(
     cos_tol: float,
 ) -> int:
     bad = 0
-    bucket = _decode_stage_bucket(key.stage)
-    tag = {"primary": "[PRIMARY]", "auxiliary": "[AUX]", "downstream": "[POST-MLP]", "other": "[OTHER]"}.get(
-        bucket, "[OTHER]"
-    )
     print(
-        f"=== decode key: {tag} pos={key.pos} layer={key.layer} tp={key.tp_rank} stage={key.stage} ==="
+        f"=== mlpinner key: pos={key.pos} layer={key.layer} tp={key.tp_rank} "
+        f"stage={key.stage} decode_body={key.decode_body!r} ==="
     )
     print(f"A: {pa}")
     print(f"B: {pb}")
@@ -311,15 +320,19 @@ def compare_pair(
         print(f"  LOAD_ERROR: {e}")
         return 1
 
-    # Quick meta sanity
-    for mk in ("forward_mode", "tp_rank", "attn_dp_rank", "decode_dump"):
+    for mk in ("dump_kind", "layer_id", "stage", "decode_dump", "tp_rank", "attn_dp_rank", "forward_mode"):
         va, vb = da.get(mk, None), db.get(mk, None)
         if va != vb:
-            print(f"  meta.{mk}: A={va!r} B={vb!r}  [diff]")
-        else:
-            print(f"  meta.{mk}: A==B  ({va!r})")
+            print(f"  payload.{mk}: A={va!r} B={vb!r}  [diff]")
 
-    for tk in ("hidden_states", "residual"):
+    ma, mb = da.get("meta") or {}, db.get("meta") or {}
+    mdiff = _meta_line_diff(ma, mb)
+    if mdiff:
+        print("  meta diff:")
+        for line in mdiff:
+            print(line)
+
+    for tk in ("tensor", "residual"):
         ta, tb = da.get(tk, None), db.get(tk, None)
         if ta is None and tb is None:
             print(f"  {tk}: both None  [ok]")
@@ -332,13 +345,10 @@ def compare_pair(
             print(f"  {tk}: not tensors  [diff]")
             bad += 1
             continue
-
         ta2, tb2, notes = _best_row_match_by_metrics(ta, tb, name=tk)
         for n in notes:
             print(f"  {n}")
-        ta, tb = ta2, tb2
-
-        line, m = _tensor_stats(ta, tb, tk)
+        line, m = _tensor_stats(ta2, tb2, tk)
         print(line)
         if strict and m is not None and _strict_fail(m, cos_tol):
             bad += 1
@@ -348,21 +358,16 @@ def compare_pair(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--a", required=True, help="Run A normal_forward dir (e.g. TP)")
-    p.add_argument("--b", required=True, help="Run B normal_forward dir (e.g. special-dp-attn)")
-    p.add_argument("-o", "--output", default="", help="Write report to file (and tee to stdout if TTY)")
-    p.add_argument("--strict", action="store_true", help="Non-zero exit if any tensor fails cos tolerance")
-    p.add_argument(
-        "--strict-primary",
-        action="store_true",
-        help="Non-zero exit only if PRIMARY stage (pre_mlp) tensors fail cos tolerance",
-    )
-    p.add_argument(
-        "--only-primary",
-        action="store_true",
-        help="Compare only PRIMARY decode stages (pre_mlp); skip auxiliary/downstream",
-    )
+    p.add_argument("--a", required=True, help="Run A normal_forward dir")
+    p.add_argument("--b", required=True, help="Run B normal_forward dir")
+    p.add_argument("-o", "--output", default="", help="Write report to file (tee if TTY)")
+    p.add_argument("--strict", action="store_true", help="Non-zero exit if tensor cos tolerance fails")
     p.add_argument("--cos-tol", type=float, default=1e-5)
+    p.add_argument(
+        "--only-stages",
+        default="",
+        help="Comma-separated inner stage names (e.g. moe_router_meta,dense_act); empty = all",
+    )
     args = p.parse_args(list(argv) if argv is not None else None)
 
     dir_a = os.path.abspath(os.path.expanduser(args.a))
@@ -374,6 +379,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"ERROR: not a directory: {dir_b}", file=sys.stderr)
         return 2
 
+    only_stages: Optional[Set[str]] = None
+    if (args.only_stages or "").strip():
+        only_stages = {s.strip() for s in args.only_stages.split(",") if s.strip()}
+
     out_path = os.path.abspath(os.path.expanduser(args.output)) if args.output else ""
 
     def run_body() -> int:
@@ -382,37 +391,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         mapping, notes = _build_req_mapping(req_a, req_b)
         print(f"A: {dir_a}")
         print(f"B: {dir_b}")
+        print(f"A mlpinner decode files: {len(_iter_mlpinner_decode_files(dir_a))}")
+        print(f"B mlpinner decode files: {len(_iter_mlpinner_decode_files(dir_b))}")
         print(f"A req groups: {len(req_a)}")
         print(f"B req groups: {len(req_b)}")
         for n in notes:
             print(f"# {n}")
         print(f"mapped reqs: {len(mapping)}")
-        print()
-        print(
-            "# Decode stage policy: PRIMARY=pre_mlp (after attn collectives, before MLP); "
-            "AUXILIARY=pre_attn,post_attn (per-shard; may differ vs TP by design); "
-            "DOWNSTREAM=post_mlp,layer_out"
-        )
-        if args.only_primary:
-            print("# Filter: --only-primary (pre_mlp only)")
+        if not mapping:
+            print(
+                "\n# No request mapping — check that both dirs contain mlpinner_*_decode_*.pt "
+                "and overlapping decode position signatures.",
+            )
         print()
 
         bad = 0
-        bad_primary = 0
         compared = 0
-        compared_primary = 0
         for ra, rb in sorted(mapping.items()):
-            ia = req_a.get(ra, {})
-            ib = req_b.get(rb, {})
+            ia, ib = req_a.get(ra, {}), req_b.get(rb, {})
             keys_a, keys_b = set(ia.keys()), set(ib.keys())
-            common = sorted(keys_a & keys_b, key=_decode_key_sort_policy)
-            if args.only_primary:
-                common = [k for k in common if k.stage in PRIMARY_DECODE_STAGES]
+            common = sorted(keys_a & keys_b, key=_inner_key_sort)
+            if only_stages is not None:
+                common = [k for k in common if k.stage in only_stages]
 
-            # If there are no common keys, it is often due to a consistent tp_rank swap
-            # across two runs (e.g., one side only dumps tp0 while the other only dumps tp1).
-            # For decode PRIMARY (pre_mlp), the global tensor after collectives should match
-            # regardless of which tp rank produced it, so we can safely remap tp_rank here.
             tp_map: Dict[int, int] = {}
             if not common:
                 tpa = sorted({k.tp_rank for k in keys_a})
@@ -420,50 +421,54 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if len(tpa) == 1 and len(tpb) == 1 and tpa[0] != tpb[0]:
                     tp_map[tpa[0]] = tpb[0]
                     print(
-                        f"== req pair A={ra} B={rb}: no common keys, tp_rank remap A{tpa[0]}->B{tpb[0]} =="
+                        f"== req pair A={ra} B={rb}: no direct key match, tp_rank remap "
+                        f"A{tpa[0]}->B{tpb[0]} =="
                     )
-                    # Rebuild common by matching all non-tp fields.
-                    common2: List[Key] = []
+                    common2: List[InnerKey] = []
                     for ka in keys_a:
-                        kb = Key(layer=ka.layer, stage=ka.stage, tp_rank=tp_map.get(ka.tp_rank, ka.tp_rank), pos=ka.pos)
+                        if only_stages is not None and ka.stage not in only_stages:
+                            continue
+                        kb = InnerKey(
+                            layer=ka.layer,
+                            stage=ka.stage,
+                            tp_rank=tp_map.get(ka.tp_rank, ka.tp_rank),
+                            pos=ka.pos,
+                            decode_body=ka.decode_body,
+                        )
                         if kb in keys_b:
                             common2.append(ka)
-                    common = sorted(common2, key=_decode_key_sort_policy)
-                    if args.only_primary:
-                        common = [k for k in common if k.stage in PRIMARY_DECODE_STAGES]
+                    common = sorted(common2, key=_inner_key_sort)
+                    print(f"== after tp remap: common_keys={len(common)} ==")
 
             if not common:
-                print(f"== req pair A={ra} B={rb}: no common decode keys ==")
+                print(f"== req pair A={ra} B={rb}: no common mlpinner keys ==")
                 bad += 1
                 continue
+
             print(f"== req pair A={ra} B={rb}: common_keys={len(common)} ==")
+
             for k in common:
-                use_strict = args.strict or (
-                    args.strict_primary and k.stage in PRIMARY_DECODE_STAGES
+                kb = InnerKey(
+                    layer=k.layer,
+                    stage=k.stage,
+                    tp_rank=tp_map.get(k.tp_rank, k.tp_rank),
+                    pos=k.pos,
+                    decode_body=k.decode_body,
                 )
-                kb = k
-                if tp_map:
-                    kb = Key(layer=k.layer, stage=k.stage, tp_rank=tp_map.get(k.tp_rank, k.tp_rank), pos=k.pos)
-                b = compare_pair(
-                    k,
-                    ia[k],
-                    ib[kb],
-                    strict=use_strict,
-                    cos_tol=args.cos_tol,
-                )
-                bad += b
+                pa = ia[k]
+                pb_path = ib.get(kb)
+                if pb_path is None:
+                    print(f"  missing B for key {k} (lookup {kb})")
+                    bad += 1
+                    continue
+                bad += compare_pair(k, pa, pb_path, strict=args.strict, cos_tol=args.cos_tol)
                 compared += 1
-                if k.stage in PRIMARY_DECODE_STAGES:
-                    compared_primary += 1
-                    bad_primary += b
+
         print("--- summary ---")
         print(f"req pairs: {len(mapping)}")
-        print(f"compared: {compared} key(s) (primary-stage keys: {compared_primary})")
-        print(f"bad score (all compared): {bad}")
-        print(f"bad score (primary pre_mlp only): {bad_primary}")
+        print(f"compared mlpinner keys: {compared}")
+        print(f"bad score: {bad}")
         if args.strict and bad > 0:
-            return 1
-        if args.strict_primary and bad_primary > 0:
             return 1
         return 0
 
@@ -481,4 +486,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
