@@ -2223,7 +2223,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
 
         else:
-            if self.enable_special_dp_attention and self.enable_pdmux:
+            if self.enable_special_dp_attention and self.enable_pdmux and forward_batch.forward_mode.is_split_prefill():
                 q = self.q_proj.forward_split_prefill_normal_tp(
                     hidden_states, tp_size=self.tp_size, tp_rank=self.tp_rank, 
                     tp_attention_size=self.attn_tp_size, tp_attention_rank=self.attn_tp_rank,
@@ -2467,7 +2467,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                         layer_id=self.layer_id,
                     )
         else:
-            if self.enable_special_dp_attention and self.enable_pdmux:
+            if self.enable_special_dp_attention and self.enable_pdmux and forward_batch.forward_mode.is_split_prefill():
                 q = self.q_proj.forward_split_prefill_normal_tp(
                     hidden_states, tp_size=self.tp_size, tp_rank=self.tp_rank, 
                     tp_attention_size=self.attn_tp_size, tp_attention_rank=self.attn_tp_rank,
@@ -2860,7 +2860,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             q = self.q_a_layernorm(q)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
-            if self.enable_special_dp_attention and self.enable_pdmux:
+            if self.enable_special_dp_attention and self.enable_pdmux and forward_batch.forward_mode.is_split_prefill():
                 q = self.q_proj.forward_split_prefill_normal_tp(
                     hidden_states, tp_size=self.tp_size, tp_rank=self.tp_rank, 
                     tp_attention_size=self.attn_tp_size, tp_attention_rank=self.attn_tp_rank,
