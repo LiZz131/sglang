@@ -4495,9 +4495,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             # This may affect the accuracy of fp8 model.
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
-            if self.enable_special_dp_attention:
-                shard_size = self.tp_size // self.attn_tp_size
-                shard_rank = get_attention_dp_rank()
 
             logger.debug(f"in post_load_weights, kv_b_proj weight w.dtype: {w.dtype}")
             if w.dtype in (
@@ -4616,21 +4613,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
-                if self.enable_special_dp_attention:
-                    w_kc_shard = w_kc.tensor_split(shard_size, dim=0)[shard_rank]
-                    self_attn.w_kc_normal_tp = bind_or_assign(
-                        self_attn.w_kc_normal_tp, w_kc_shard.transpose(1, 2).contiguous().transpose(1, 2)
-                    )
                 w_vc = w_vc.contiguous().transpose(1, 2)
-                if self.enable_special_dp_attention:
-                    w_vc_shard = w_vc.tensor_split(shard_size, dim=0)[shard_rank]
                 if _is_npu:
                     w_vc = w_vc.contiguous()
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
-                if self.enable_special_dp_attention:
-                    self_attn.w_vc_normal_tp = bind_or_assign(
-                        self_attn.w_vc_normal_tp, w_vc_shard.contiguous()
-                    )
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
@@ -4638,10 +4624,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.w_scale = bind_or_assign(
                         self_attn.w_scale, self_attn.kv_b_proj.weight_scale
                     )
-                    if self.enable_special_dp_attention:
-                        self_attn.w_scale_normal_tp = bind_or_assign(
-                            self_attn.w_scale_normal_tp, self_attn.kv_b_proj.weight_scale.tensor_split(shard_size, dim=0)[shard_rank]
-                        )
                     if _is_hip:
                         self_attn.w_scale *= 2.0
                 # TODO: remove this after adding FP8 support in bmm cpu kernel
