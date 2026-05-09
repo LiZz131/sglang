@@ -2076,6 +2076,7 @@ class SchedulerMultiplexMixin:
                 )
 
             decode_batch = None
+            overlap_prefill_plan: Optional[Dict[str, Any]] = None
             prefill_active = self.split_prefill_batch is not None
 
             # Decide how to handle the decode launch this round.
@@ -2086,8 +2087,9 @@ class SchedulerMultiplexMixin:
             #
             # Strict-sync mode  (prefill running, remain <= 0):
             #   Case A — queue has pending results: drain one, skip launching this round.
-            #   Case B — queue is empty: launch decode and immediately process its result
-            #             (blocks on copy_done.synchronize) before the next iteration.
+            #   Case B — queue is empty: launch decode, then immediately launch prefill
+            #             to overlap with the decode GPU kernel, then process the decode
+            #             result (blocks on copy_done.synchronize).
             #
             # Prefill-done / no-prefill:
             #   Skip decode launch; let the loop reach the prefill-result section.
@@ -2113,7 +2115,8 @@ class SchedulerMultiplexMixin:
                     # Prevent decode_last_batch from re-processing a result this round.
                     decode_last_batch = None
                 else:
-                    # Case B: queue empty — will launch below and process immediately.
+                    # Case B: queue empty — will launch below, then launch prefill to
+                    # overlap with decode GPU, then process decode result immediately.
                     strict_sync_immediate = True
 
             # run decode batch
@@ -2125,11 +2128,33 @@ class SchedulerMultiplexMixin:
                     and not self.running_batch.is_empty()
                 ):
                     decode_batch = self.running_batch
+                    # Compute offline layer-count plan: how many prefill layers fit
+                    # inside the decode GPU execution window.  Used by the prefill
+                    # launch section below; None when offline tables are unavailable.
+                    overlap_prefill_plan = self._overlap_latency_prefill_plan(
+                        stream_idx,
+                        self.split_prefill_batch,
+                        decode_batch,
+                    )
+                    plan_nvtx = ""
+                    if overlap_prefill_plan is not None:
+                        p = overlap_prefill_plan
+                        plan_nvtx = (
+                            f" | tbl dec_gpu={p['dec_gpu_ms']:.3f}"
+                            f" dec_cpu_pl={p['dec_cpu_pl_ms']:.3f}"
+                            f" prefill_launch_full_ms={p['prefill_lo_full_ms']:.3f}"
+                            f" lo/L={p['per_layer_lo_ms']:.4f}"
+                            f" bgt={p['budget_ms']:.3f}"
+                            f" L={p['L']}"
+                        )
+                        overlap_log(f"overlap_prefill_plan: {overlap_prefill_plan}")
                     decode_gpu_handle = nvtx.range_start(
                         "run decode batch"
                         + f": {decode_forward_count} "
-                        + f"remain_overlap_decode_round={remain_overlap_decode_round}"
-                        + f"skip_prepare_decode={_will_skip_decode}"
+                        + f"remain={remain_overlap_decode_round} "
+                        + f"strict_imm={strict_sync_immediate}"
+                        + plan_nvtx
+                        + " | "
                         + _pdmux_nvtx_len_list_str(
                             decode_batch, add_decode_global_num_tokens=True
                         )
@@ -2153,24 +2178,12 @@ class SchedulerMultiplexMixin:
                         f"launch decode#{decode_step}, bs={decode_batch.batch_size()}, remain={remain_overlap_decode_round}, strict_imm={strict_sync_immediate}"
                     )
 
-            # Strict-sync immediate (Case B): process the just-launched decode result
-            # synchronously before the next loop iteration.
-            if strict_sync_immediate and decode_batch is not None:
-                (
-                    decode_batch_to_process,
-                    decode_result_to_process,
-                    decode_gpu_handle_to_process,
-                    _,
-                ) = decode_result_queue.popleft()
-                nvtx.range_end(decode_gpu_handle_to_process)
-                overlap_log(
-                    f"strict-sync immediate process: bs={decode_batch_to_process.batch_size()}"
-                )
-                self.process_batch_result(decode_batch_to_process, decode_result_to_process)
-                # Mark as processed so decode_last_batch path does not re-process.
-                decode_batch = None
-
             # run prefill batch
+            # In strict-sync Case B the prefill launch is deliberately placed HERE,
+            # between the decode launch and the immediate process step, so that the
+            # CPU can submit prefill kernels to prefill_stream while the decode kernel
+            # is already running on the GPU — maximising CPU-GPU overlap before we
+            # block on copy_done.synchronize() in process_batch_result below.
             with torch.cuda.stream(prefill_stream):
                 set_pdmux_status(True)
                 if (
@@ -2179,33 +2192,57 @@ class SchedulerMultiplexMixin:
                     and not wait_prefill_kernel_done
                 ):
                     prefill_done = True
-                    forward_count = (
+                    H = int(self.model_config.num_hidden_layers)
+                    idx = int(self.split_prefill_batch.split_index)
+                    remain_layers = max(0, H - idx)
+                    # Base forward count from token-budget heuristic (fallback).
+                    forward_count_base = (
                         max(
                             1,
                             self.pdmux_config.split_forward_token_budget
                             // self.split_prefill_batch.extend_num_tokens,
                         )
                         if self.split_prefill_batch.extend_num_tokens > 0
-                        else self.model_config.num_hidden_layers
-                    )
-                    next_split_index = min(
-                        self.split_prefill_batch.split_index + forward_count,
-                        self.model_config.num_hidden_layers,
+                        else H
                     )
                     forward_count = (
-                        next_split_index - self.split_prefill_batch.split_index
+                        min(forward_count_base, remain_layers) if remain_layers > 0 else 0
                     )
+                    if forward_count <= 0:
+                        forward_count = min(H, remain_layers) if remain_layers > 0 else 1
+                    # Tighten with offline plan when available: only launch as many
+                    # layers as the CPU can submit inside the decode GPU window.
+                    if overlap_prefill_plan is not None:
+                        forward_count = min(
+                            forward_count,
+                            int(overlap_prefill_plan["L"]),
+                            remain_layers,
+                        )
+                    # DEBUG(lbz): 
+                    # if remain_overlap_decode_round <= 0:
+                    #     forward_count = remain_layers
+                    forward_count = max(1, forward_count)
+                    next_split_index = min(idx + forward_count, H)
+                    forward_count = next_split_index - idx
 
                     self.split_prefill_batch.split_forward_count = forward_count
+                    prefill_nvtx_plan = ""
+                    if overlap_prefill_plan is not None:
+                        p = overlap_prefill_plan
+                        prefill_nvtx_plan = (
+                            f" | tbl L={p['L']} dec_gpu={p['dec_gpu_ms']:.3f}"
+                            f" dec_cpu_pl={p['dec_cpu_pl_ms']:.3f} lo/L={p['per_layer_lo_ms']:.4f}"
+                        )
                     if prefill_gpu_handle is None:
                         prefill_gpu_handle = nvtx.range_start(
-                        "run prefill batch"
-                        + f": {prefill_whole_batch_count} "
-                        + _pdmux_nvtx_len_list_str(self.split_prefill_batch))
+                            "run prefill batch"
+                            + f": {prefill_whole_batch_count} "
+                            + _pdmux_nvtx_len_list_str(self.split_prefill_batch)
+                        )
                         prefill_whole_batch_count += 1
                     prefill_launch_handle = nvtx.range_start(
                         "launch prefill batch"
-                        + f": {prefill_forward_count} "
+                        + f": {prefill_forward_count} L={forward_count}{prefill_nvtx_plan} | "
                         + _pdmux_nvtx_len_list_str(self.split_prefill_batch)
                     )
                     prefill_forward_count += 1
@@ -2221,6 +2258,25 @@ class SchedulerMultiplexMixin:
                     prefill_done = True
                 else:
                     prefill_done = False
+
+            # Strict-sync immediate (Case B): process the just-launched decode result
+            # now that prefill kernels have been submitted.  The decode kernel has been
+            # running on the GPU since the launch above; copy_done.synchronize() will
+            # wait for it while the prefill GPU work runs concurrently.
+            if strict_sync_immediate and decode_batch is not None:
+                (
+                    decode_batch_to_process,
+                    decode_result_to_process,
+                    decode_gpu_handle_to_process,
+                    _,
+                ) = decode_result_queue.popleft()
+                nvtx.range_end(decode_gpu_handle_to_process)
+                overlap_log(
+                    f"strict-sync immediate process: bs={decode_batch_to_process.batch_size()}"
+                )
+                self.process_batch_result(decode_batch_to_process, decode_result_to_process)
+                # Mark as processed so decode_last_batch path does not re-process.
+                decode_batch = None
 
             # process decode result (overlap-mode path: the previous iteration's launch)
             if decode_last_batch and len(decode_result_queue) > 0:
