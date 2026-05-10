@@ -636,6 +636,7 @@ class ServerArgs:
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
+    pdmux_no_all_decode_SMs: bool = False
     pdmux_config_path: Optional[str] = None
     sm_group_num: int = 8
     enable_special_dp_attention: bool = False
@@ -4593,6 +4594,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.sm_group_num,
             help="Number of sm partition groups.",
+        )
+        parser.add_argument(
+            "--pdmux-no-all-decode-SMs",
+            action="store_true",
+            help="Disable all decode SMs in PD-Multiplexing.",
         )
         parser.add_argument(
             "--enable-special-dp-attention",

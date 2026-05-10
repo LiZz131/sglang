@@ -126,6 +126,9 @@ class SchedulerMultiplexMixin:
         logger.info(
             f"PD-Multiplexing enabled with {self.real_sm_group_num} stream groups, sm_counts (prefill_sm, decode_sm): {self.sm_counts}"
         )
+        self.pdmux_no_all_decode_SMs = getattr(self.server_args, "pdmux_no_all_decode_SMs", False)
+        if self.pdmux_no_all_decode_SMs:
+            logger.info("PD-Multiplexing: disable all decode SMs stream group")
         self.log_stream_groups()
 
         self._pdmux_time_predictor: Optional[PDMuxTimePredictor] = None
@@ -239,7 +242,12 @@ class SchedulerMultiplexMixin:
                 )
             set_current_stream_idx(stream_idx)
         elif not self.running_batch.is_empty():
-            set_current_stream_idx(self.real_sm_group_num - 1)
+            # set_current_stream_idx(self.real_sm_group_num - 1)
+            # DEBUG(lbz): use the second last, for prefill need SMs
+            if self.pdmux_no_all_decode_SMs:
+                set_current_stream_idx(self.real_sm_group_num - 2)
+            else:
+                set_current_stream_idx(self.real_sm_group_num - 1)
         else:
             set_current_stream_idx(0)
 
@@ -2033,8 +2041,6 @@ class SchedulerMultiplexMixin:
 
             # adjust stream group
             if adjust_stream_group:
-                prefill_stream.synchronize()
-                decode_stream.synchronize()
 
                 while decode_result_queue:
                     (
@@ -2047,6 +2053,8 @@ class SchedulerMultiplexMixin:
                     self.process_batch_result(
                         decode_batch_to_process, decode_result_to_process
                     )
+                decode_stream.synchronize()
+                prefill_stream.synchronize()
                 # Drain already processed all pending results from previous loops.
                 # Reset decode_last_batch so the pop-and-process guard below does not
                 # fire on the batch we are about to launch in this same loop.
@@ -2327,6 +2335,8 @@ class SchedulerMultiplexMixin:
                             overlap_log(
                                 f"before merge, clear decode_result_queue: bs={decode_batch_to_process.batch_size()}, queue_len_after={len(decode_result_queue)}"
                             )
+                        prefill_stream.synchronize()
+                        decode_stream.synchronize()
 
                         if self.running_batch and not self.running_batch.is_empty():
                             self.running_batch.merge_batch(self.split_prefill_batch)
