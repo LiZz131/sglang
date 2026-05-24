@@ -642,6 +642,7 @@ class ServerArgs:
     enable_special_dp_attention: bool = False
     enable_save_kv_cache_for_dp: bool = False
     enable_special_dp_attention_prefix_0: bool = False
+    enable_share_prefix_for_special_dp_attention: bool = False
     auto_adjust_stream_group: bool = True
     manual_stream_group_idx: int = 0
     # PD-Multiplexing time model (special-DP event loop): choose stream group by predicted decode run
@@ -4604,6 +4605,11 @@ class ServerArgs:
             "--enable-special-dp-attention",
             action="store_true",
             help="Enable pdmux + dp attention for deepseek v3",
+        )
+        parser.add_argument(
+            "--enable-share-prefix-for-special-dp-attention",
+            action="store_true",
+            help="Enable share prefix across DP ranks for special dp attention.",
         )
         parser.add_argument(
             "--enable-save-kv-cache-for-dp",

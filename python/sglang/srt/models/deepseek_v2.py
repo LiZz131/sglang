@@ -3156,8 +3156,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         result = handler(self, forward_batch)
 
         if result == AttnForwardMethod.MLA and self.enable_special_dp_attention and forward_batch.forward_mode.is_split_prefill():
-            logger.info(f"MLA is not supported for split prefill with dp-attention, change to MHA")
-            result = AttnForwardMethod.MHA
+            if get_global_server_args().enable_share_prefix_for_special_dp_attention:
+                logger.info(f"[share prefix] MLA is supported for split prefill with dp-attention")
+            else:
+                logger.info(f"MLA is not supported for split prefill with dp-attention, change to MHA")
+                result = AttnForwardMethod.MHA
         
         return result
 
@@ -3316,10 +3319,19 @@ class DeepseekV2AttentionMLA(nn.Module):
         if inner_state is None:
             return hidden_states
 
-        if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention and self.enable_pdmux and attn_forward_method not in [
-            AttnForwardMethod.MHA, AttnForwardMethod.MHA_ONE_SHOT #, AttnForwardMethod.MLA
-            ]:
+        if (
+            forward_batch.forward_mode.is_split_prefill()
+            and self.enable_special_dp_attention
+            and self.enable_pdmux
+            and attn_forward_method not in [
+                AttnForwardMethod.MHA,
+                AttnForwardMethod.MHA_ONE_SHOT,
+            ] + (
+                [AttnForwardMethod.MLA] if get_global_server_args().enable_share_prefix_for_special_dp_attention else []
+            )
+        ):
             raise NotImplementedError(f"DP-Attention + PD-MUX is not supported for attention method: {attn_forward_method.name}")
+       
 
         if attn_forward_method == AttnForwardMethod.MHA:
             return self.forward_normal_core(*inner_state)
@@ -3967,6 +3979,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             topk_passed = topk_indices is not None
             attn_call = "attn_mqa_normal_tp" if split_prefill_special_dp else "attn_mqa"
+            # just for debug, skip it
             branch_extra = _mla_absorb_core_attn_branch_extra_meta(
                 self,
                 forward_batch,
@@ -3998,16 +4011,21 @@ class DeepseekV2AttentionMLA(nn.Module):
                 pass
 
             if split_prefill_special_dp:
-                attn_output = self.attn_mqa_normal_tp(
-                    q_nope_out,
-                    k_nope,
-                    k_nope,
-                    forward_batch,
-                    q_rope=q_pe,
-                    k_rope=k_pe,
-                    **extra_args,
-                    **(dict(topk_indices=topk_indices) if topk_passed else {}),
-                )
+                if forward_batch.share_prefix_info is not None:
+                    attn_output = self._share_prefix_attn_mqa(
+                        q_nope_out, q_pe, k_nope, k_pe, forward_batch
+                    )
+                else:
+                    attn_output = self.attn_mqa_normal_tp(
+                        q_nope_out,
+                        k_nope,
+                        k_nope,
+                        forward_batch,
+                        q_rope=q_pe,
+                        k_rope=k_pe,
+                        **extra_args,
+                        **(dict(topk_indices=topk_indices) if topk_passed else {}),
+                    )
             else:
                 attn_output = self.attn_mqa(
                     q_nope_out,
@@ -4753,6 +4771,149 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         else:
             raise NotImplementedError("Only support cuda and aiter for now")
+
+    def _share_prefix_attn_mqa(
+        self,
+        q_nope_out: torch.Tensor,   # [num_extend, tp_num_heads, kv_lora_rank]
+        q_pe: torch.Tensor,         # [num_extend, tp_num_heads, qk_rope_head_dim]
+        k_nope: torch.Tensor,       # [num_extend, 1, kv_lora_rank]
+        k_pe: torch.Tensor,         # [num_extend, 1, qk_rope_head_dim]
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """
+        Share-prefix MLA attention for split_prefill special DP attention.
+
+        Data flow per layer
+        -------------------
+        1. Lazily allocate transfer_buffer (first layer only).
+        2. Zero transfer_buffer.
+        3. fill_transfer_buffer_for_layer: max_rank + attn_tp_rank==0 copies
+           KV[min_prefix : max_prefix] into transfer_buffer; others leave zeros.
+        4. all_reduce(transfer_buffer) – every rank now holds complete transfer KV.
+        5. build_combined_kv_for_layer: combined_kv = [local_prefix | transfer | extend].
+        6. Call flash_attn_with_kvcache with combined_kv as the paged KV cache.
+
+        Returns
+        -------
+        Attention output: [num_extend, tp_num_heads * kv_lora_rank]
+        """
+        import torch.distributed as dist
+        from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+        from sglang.srt.distributed.parallel_state import get_tp_group
+        from sglang.srt.multiplex.share_prefix_helper import (
+            build_combined_kv_for_layer,
+            fill_transfer_buffer_for_layer,
+            reset_transfer_buffer,
+            save_dp_local_kv,
+        )
+
+        info = forward_batch.share_prefix_info
+        layer_id = self.attn_mqa_normal_tp.layer_id
+        kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
+
+        # ---- 1. Lazy allocation ----
+        info.ensure_transfer_buffer_allocated(
+            kv_cache_dim=kv_cache_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            dtype=q_nope_out.dtype,
+            device=q_nope_out.device,
+        )
+
+        # ---- 2-4. Fill + all-reduce transfer buffer (skip when nothing to transfer) ----
+        kv_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)
+        if info.total_transfer_tokens > 0:
+            reset_transfer_buffer(info)
+            fill_transfer_buffer_for_layer(info, layer_id, kv_buf)
+            dist.all_reduce(
+                info.transfer_buffer,
+                op=dist.ReduceOp.SUM,
+                group=get_tp_group().device_group,
+            )
+            logger.debug(
+                "[share_prefix] layer=%d all_reduce done, transfer_buffer norm=%.4f",
+                layer_id,
+                info.transfer_buffer.float().norm().item(),
+            )
+        else:
+            logger.debug(
+                "[share_prefix] layer=%d total_transfer=0, skip fill+all_reduce",
+                layer_id,
+            )
+
+        # ---- 5. Build combined KV ----
+        combined_kv, page_table, cache_seqlens = build_combined_kv_for_layer(
+            info, layer_id, k_nope, k_pe, kv_buf
+        )
+
+        # combined_kv: [total_combined, 1, kv_cache_dim]
+        # Reshape to paged format with page_size=1:
+        # [total_combined, page_size=1, num_kv_heads=1, kv_cache_dim]
+        combined_kv_paged = combined_kv.unsqueeze(1)  # [total, 1, 1, kv_cache_dim]
+        k_rope_c = combined_kv_paged[:, :, :, self.kv_lora_rank :]   # rope part
+        c_kv_c = combined_kv_paged[:, :, :, : self.kv_lora_rank]     # nope (value) part
+
+        # ---- 6. Flash attention ----
+        metadata = forward_batch.attn_backend.forward_metadata
+        cu_seqlens_q = metadata.cu_seqlens_q
+        max_seqlen_q = metadata.max_seq_len_q
+        # Recompute cu_seqlens_k to match combined_kv's cache_seqlens
+        cu_seqlens_k_new = torch.nn.functional.pad(
+            torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
+        )
+
+        layer = self.attn_mqa_normal_tp
+
+        logger.debug(
+            "[share_prefix] layer=%d flash_attn: q_pe=%s q_nope_out=%s "
+            "k_rope_c=%s c_kv_c=%s page_table=%s cache_seqlens=%s "
+            "cu_seqlens_q=%s cu_seqlens_k_new=%s max_seqlen_q=%d",
+            layer_id,
+            tuple(q_pe.shape), tuple(q_nope_out.shape),
+            tuple(k_rope_c.shape), tuple(c_kv_c.shape),
+            tuple(page_table.shape), cache_seqlens.tolist(),
+            cu_seqlens_q.tolist(), cu_seqlens_k_new.tolist(), max_seqlen_q,
+        )
+
+        result = flash_attn_with_kvcache(
+            q=q_pe,
+            k_cache=k_rope_c,
+            v_cache=c_kv_c,
+            qv=q_nope_out,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=layer.scaling,
+            causal=True,
+            softcap=layer.logit_cap,
+        )
+
+        # ---- 7. Save KV for dp-local requests ----
+        # Write transfer region [local_prefix, max_prefix) and extend region
+        # [max_prefix, seq_len) into the pre-allocated out_cache_loc slots.
+        # This is required for correct decode: without it the KV pool for
+        # dp-local requests would have unfilled slots.
+        save_dp_local_kv(
+            info=info,
+            layer=layer,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            out_cache_loc=forward_batch.out_cache_loc,
+            token_to_kv_pool=forward_batch.token_to_kv_pool,
+        )
+        logger.info(
+            "[share_prefix] layer=%d KV saved for %d dp-local reqs "
+            "(total_transfer=%d out_cache_loc=%d)",
+            layer_id,
+            len(info.dp_local_req_global_indices),
+            info.total_transfer_tokens,
+            forward_batch.out_cache_loc.shape[0],
+        )
+
+        # result: [num_extend, tp_num_heads, kv_lora_rank]
+        return result.view(-1, self.tp_num_heads * self.kv_lora_rank)
 
     def _get_mla_kv_buffer(
         self,
@@ -5941,6 +6102,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             # This may affect the accuracy of fp8 model.
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
+            if self.enable_special_dp_attention:
+                shard_size = self.tp_size // self.attn_tp_size
+                shard_rank = get_attention_dp_rank()
 
             logger.debug(f"in post_load_weights, kv_b_proj weight w.dtype: {w.dtype}")
             if w.dtype in (
@@ -6059,10 +6223,21 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
+                if self.enable_special_dp_attention:
+                    w_kc_shard = w_kc.tensor_split(shard_size, dim=0)[shard_rank]
+                    self_attn.w_kc_normal_tp = bind_or_assign(
+                        self_attn.w_kc_normal_tp, w_kc_shard.transpose(1, 2).contiguous().transpose(1, 2)
+                    )
                 w_vc = w_vc.contiguous().transpose(1, 2)
+                if self.enable_special_dp_attention:
+                    w_vc_shard = w_vc.tensor_split(shard_size, dim=0)[shard_rank]
                 if _is_npu:
                     w_vc = w_vc.contiguous()
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
+                if self.enable_special_dp_attention:
+                    self_attn.w_vc_normal_tp = bind_or_assign(
+                        self_attn.w_vc_normal_tp, w_vc_shard.contiguous()
+                    )
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
@@ -6070,6 +6245,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self_attn.w_scale = bind_or_assign(
                         self_attn.w_scale, self_attn.kv_b_proj.weight_scale
                     )
+                    if self.enable_special_dp_attention:
+                        self_attn.w_scale_normal_tp = bind_or_assign(
+                            self_attn.w_scale_normal_tp, self_attn.kv_b_proj.weight_scale.tensor_split(shard_size, dim=0)[shard_rank]
+                        )
                     if _is_hip:
                         self_attn.w_scale *= 2.0
                 # TODO: remove this after adding FP8 support in bmm cpu kernel

@@ -1273,6 +1273,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For special dp attention
     enable_save_kv_cache_for_dp: bool = False
     dp_rank: Optional[int] = None
+    # Share prefix across DP ranks (set in prepare_for_extend when flag is on)
+    share_prefix_info: Optional[Any] = None  # SharePrefixBatchInfo | None
     dp_local_reqs: Optional[List[Req]] = None
     dp_local_token_start: Optional[int] = None
     dp_local_token_end: Optional[int] = None
@@ -1457,14 +1459,51 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # For DLLM, we use a separate forward mode
             self.forward_mode = ForwardMode.DLLM_EXTEND
 
-        # Init tensors
+        # ------------------------------------------------------------------ #
+        # Early all-gather for share-prefix (must happen before input_ids)    #
+        # When share-prefix is active all ranks must use max_prefix as the    #
+        # effective prefix so that every rank feeds the same number of tokens  #
+        # per request to the model, preventing all_reduce shape mismatches.   #
+        # ------------------------------------------------------------------ #
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        _server_args = get_global_server_args()
+        _share_prefix_active = (
+            _server_args.enable_special_dp_attention
+            and _server_args.enable_share_prefix_for_special_dp_attention
+        )
+        _gathered_prefix_data = None  # cached for compute_share_prefix_info below
+        if _share_prefix_active and len(reqs) > 0:
+            from sglang.srt.distributed.parallel_state import get_tp_group
+            from sglang.srt.multiplex.share_prefix_helper import gather_prefix_data
+            _gathered_prefix_data = gather_prefix_data(
+                reqs, get_tp_group(), self.device
+            )
+
+        # Init tensors
+        # When share-prefix is active, input_ids uses max_prefix (not local_prefix)
+        # so all ranks process the same number of tokens per request.
+        # prefix_lens / extend_lens are also updated to max_prefix-based so that
+        # positions, cu_seqlens_q, and sample logit positions are all correct.
+        # KV-allocation fields (dp_local_prefix_lens / dp_local_extend_lens) keep
+        # local_prefix as base because they must allocate space for both the
+        # transfer region AND the true extend region.
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
-        prefix_lens = [len(r.prefix_indices) for r in reqs]
-        extend_lens = [r.extend_input_len for r in reqs]
+        if _gathered_prefix_data is not None:
+            _max_prefix = _gathered_prefix_data.max_prefix_list
+            input_ids = [r.fill_ids[_max_prefix[i] :] for i, r in enumerate(reqs)]
+            prefix_lens = list(_max_prefix)
+            extend_lens = [seq_lens[i] - _max_prefix[i] for i in range(len(reqs))]
+            logger.info(
+                "[share_prefix] prepare_for_extend: input_ids adjusted to max_prefix; "
+                "max_prefix=%s extend_lens=%s",
+                _max_prefix, extend_lens,
+            )
+        else:
+            input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+            prefix_lens = [len(r.prefix_indices) for r in reqs]
+            extend_lens = [r.extend_input_len for r in reqs]
+        extend_num_tokens = sum(len(ids) for ids in input_ids)
 
         # When server has enable_special_dp_attention, we always set dp_local_* so the mixin can
         # filter and release non-local reqs after prefill (avoid token leak). Local-only allocation
@@ -1597,7 +1636,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            assert seq_len - pre_len == req.extend_input_len
+            # When share-prefix is active, prefix_lens[i] == max_prefix[i] which
+            # may differ from req.extend_input_len (seq_len - local_prefix).
+            if not _share_prefix_active:
+                assert seq_len - pre_len == req.extend_input_len
 
             if enable_special_dp_attention_save_kv_cache:
                 if i in local_idx_for_global:
@@ -1742,6 +1784,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
+
+        # ------------------------------------------------------------------ #
+        # Share prefix across DP ranks (special DP attention)                 #
+        # ------------------------------------------------------------------ #
+        server_args = get_global_server_args()
+        if (
+            server_special_dp_attention
+            and server_args.enable_share_prefix_for_special_dp_attention
+        ):
+            from sglang.srt.distributed.parallel_state import get_tp_group
+            from sglang.srt.multiplex.share_prefix_helper import compute_share_prefix_info
+
+            # Pass _gathered_prefix_data to skip re-doing the all-gather that was
+            # already run at the start of this method to adjust input_ids.
+            self.share_prefix_info = compute_share_prefix_info(
+                self,
+                tp_group=get_tp_group(),
+                device=self.device,
+                gathered_data=_gathered_prefix_data,
+            )
+            if self.share_prefix_info is not None:
+                logger.info(
+                    "[share_prefix] share_prefix_info computed: "
+                    "total_transfer_tokens=%d batch_size=%d",
+                    self.share_prefix_info.total_transfer_tokens,
+                    len(reqs),
+                )
+            else:
+                logger.debug("[share_prefix] share_prefix_info is None (trivial transfer).")
+        else:
+            self.share_prefix_info = None
 
         # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -2316,6 +2389,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_local_token_start=self.dp_local_token_start,
             dp_local_token_end=self.dp_local_token_end,
+            share_prefix_info=self.share_prefix_info,
         )
 
     def copy(self):
@@ -2392,6 +2466,8 @@ class ModelWorkerBatch:
     # For special dp attention
     dp_local_token_start: Optional[int]
     dp_local_token_end: Optional[int]
+    # share prefix across DP ranks (SharePrefixBatchInfo | None)
+    share_prefix_info: Optional[Any]
 
     # For extend
     extend_num_tokens: Optional[int]

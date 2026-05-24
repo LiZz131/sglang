@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -300,6 +300,8 @@ class ForwardBatch:
     special_dp_attention: bool = False
     dp_local_token_start: Optional[int] = None
     dp_local_token_end: Optional[int] = None
+    # for share prefix across DP ranks (SharePrefixBatchInfo | None)
+    share_prefix_info: Optional[Any] = None
 
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether the kv cache needs to be attended in current pass
@@ -452,6 +454,7 @@ class ForwardBatch:
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             dp_local_token_start=batch.dp_local_token_start,
             dp_local_token_end=batch.dp_local_token_end,
+            share_prefix_info=getattr(batch, "share_prefix_info", None),
         )
         device = model_runner.device
 
