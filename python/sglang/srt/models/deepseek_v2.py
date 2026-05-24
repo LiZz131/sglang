@@ -4802,9 +4802,9 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         from sglang.srt.distributed.parallel_state import get_tp_group
         from sglang.srt.multiplex.share_prefix_helper import (
-            build_combined_kv_for_layer,
-            fill_transfer_buffer_for_layer,
-            reset_transfer_buffer,
+            fill_local_and_extend_for_layer,
+            fill_transfer_region_for_layer,
+            reset_transfer_region,
             save_dp_local_kv,
         )
 
@@ -4812,28 +4812,31 @@ class DeepseekV2AttentionMLA(nn.Module):
         layer_id = self.attn_mqa_normal_tp.layer_id
         kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
-        # ---- 1. Lazy allocation ----
-        info.ensure_transfer_buffer_allocated(
+        # ---- 1. Lazy allocation of combined_kv_buf (first layer only) ----
+        info.ensure_combined_buf_allocated(
             kv_cache_dim=kv_cache_dim,
             kv_lora_rank=self.kv_lora_rank,
             dtype=q_nope_out.dtype,
             device=q_nope_out.device,
         )
 
-        # ---- 2-4. Fill + all-reduce transfer buffer (skip when nothing to transfer) ----
         kv_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)
+
+        # ---- 2. Fill + all-reduce transfer_block (skip when nothing to transfer) ----
         if info.total_transfer_tokens > 0:
-            reset_transfer_buffer(info)
-            fill_transfer_buffer_for_layer(info, layer_id, kv_buf)
+            reset_transfer_region(info)
+            fill_transfer_region_for_layer(info, layer_id, kv_buf)
             dist.all_reduce(
-                info.transfer_buffer,
+                info.combined_kv_buf[info.local_block_size : info.extend_block_start],
                 op=dist.ReduceOp.SUM,
                 group=get_tp_group().device_group,
             )
             logger.debug(
-                "[share_prefix] layer=%d all_reduce done, transfer_buffer norm=%.4f",
+                "[share_prefix] layer=%d all_reduce done, transfer norm=%.4f",
                 layer_id,
-                info.transfer_buffer.float().norm().item(),
+                info.combined_kv_buf[
+                    info.local_block_size : info.extend_block_start
+                ].float().norm().item(),
             )
         else:
             logger.debug(
@@ -4841,26 +4844,20 @@ class DeepseekV2AttentionMLA(nn.Module):
                 layer_id,
             )
 
-        # ---- 5. Build combined KV ----
-        combined_kv, page_table, cache_seqlens = build_combined_kv_for_layer(
-            info, layer_id, k_nope, k_pe, kv_buf
-        )
+        # ---- 3. Fill local_block and extend_block ----
+        fill_local_and_extend_for_layer(info, k_nope, k_pe, kv_buf)
 
-        # combined_kv: [total_combined, 1, kv_cache_dim]
+        # ---- 4. Flash attention (all layout tensors are pre-computed, no new allocs) ----
+        # combined_kv_buf: [total_combined, 1, kv_cache_dim]
         # Reshape to paged format with page_size=1:
         # [total_combined, page_size=1, num_kv_heads=1, kv_cache_dim]
-        combined_kv_paged = combined_kv.unsqueeze(1)  # [total, 1, 1, kv_cache_dim]
+        combined_kv_paged = info.combined_kv_buf.unsqueeze(1)  # [total, 1, 1, kv_cache_dim]
         k_rope_c = combined_kv_paged[:, :, :, self.kv_lora_rank :]   # rope part
         c_kv_c = combined_kv_paged[:, :, :, : self.kv_lora_rank]     # nope (value) part
 
-        # ---- 6. Flash attention ----
         metadata = forward_batch.attn_backend.forward_metadata
         cu_seqlens_q = metadata.cu_seqlens_q
         max_seqlen_q = metadata.max_seq_len_q
-        # Recompute cu_seqlens_k to match combined_kv's cache_seqlens
-        cu_seqlens_k_new = torch.nn.functional.pad(
-            torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
-        )
 
         layer = self.attn_mqa_normal_tp
 
@@ -4871,8 +4868,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             layer_id,
             tuple(q_pe.shape), tuple(q_nope_out.shape),
             tuple(k_rope_c.shape), tuple(c_kv_c.shape),
-            tuple(page_table.shape), cache_seqlens.tolist(),
-            cu_seqlens_q.tolist(), cu_seqlens_k_new.tolist(), max_seqlen_q,
+            tuple(info.page_table_cached.shape),
+            info.cache_seqlens_tensor.tolist(),
+            cu_seqlens_q.tolist(),
+            info.cu_seqlens_k_new_tensor.tolist(),
+            max_seqlen_q,
         )
 
         result = flash_attn_with_kvcache(
@@ -4880,26 +4880,23 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_cache=k_rope_c,
             v_cache=c_kv_c,
             qv=q_nope_out,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
+            page_table=info.page_table_cached,
+            cache_seqlens=info.cache_seqlens_tensor,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k_new=cu_seqlens_k_new,
+            cu_seqlens_k_new=info.cu_seqlens_k_new_tensor,
             max_seqlen_q=max_seqlen_q,
             softmax_scale=layer.scaling,
             causal=True,
             softcap=layer.logit_cap,
         )
 
-        # ---- 7. Save KV for dp-local requests ----
-        # Write transfer region [local_prefix, max_prefix) and extend region
-        # [max_prefix, seq_len) into the pre-allocated out_cache_loc slots.
+        # ---- 5. Save KV for dp-local requests ----
+        # KV is read directly from combined_kv_buf (transfer_block + extend_block).
         # This is required for correct decode: without it the KV pool for
         # dp-local requests would have unfilled slots.
         save_dp_local_kv(
             info=info,
             layer=layer,
-            k_nope=k_nope,
-            k_pe=k_pe,
             out_cache_loc=forward_batch.out_cache_loc,
             token_to_kv_pool=forward_batch.token_to_kv_pool,
         )
