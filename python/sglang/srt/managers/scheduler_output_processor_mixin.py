@@ -310,10 +310,10 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
-    def _is_dp_local_req(self: Scheduler, batch: ScheduleBatch, req: Req) -> bool:    
+    def _is_dp_local_req(self: Scheduler, batch: ScheduleBatch, req: Req) -> bool:
         return (
-            batch.dp_local_req_indices is not None
-            and req in batch.dp_local_req_indices
+            batch.dp_local_reqs is not None
+            and req in batch.dp_local_reqs
         )
     
     def _resolve_spec_overlap_token_ids(
