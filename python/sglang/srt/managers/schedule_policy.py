@@ -111,8 +111,23 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
     def calc_priority(
-        self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
+        self,
+        waiting_queue: List[Req],
+        running_batch: Optional[ScheduleBatch] = None,
+        use_global_prefix: bool = False,
     ) -> bool:
+        # When share-prefix scheduling synchronization is active, prefix_indices
+        # have already been populated by gather_scheduling_prefix_data(), and
+        # sched_max_prefix is set on every request.  Sort by max_prefix directly
+        # and skip the local _compute_prefix_matches (which would diverge across ranks).
+        if use_global_prefix:
+            waiting_queue.sort(
+                key=lambda r: -(
+                    getattr(r, "sched_max_prefix", None) or len(r.prefix_indices)
+                )
+            )
+            return True
+
         # When special dp attention prefix_0 is enabled, we should avoid using
         # cache-aware scheduling policies that rely on prefix matching, because
         # different DP ranks may see different tree cache states.
@@ -389,6 +404,7 @@ class PrefillAdder:
         priority_scheduling_preemption_threshold: int = 0,
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
+        rem_total_tokens_cap: Optional[int] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -422,6 +438,9 @@ class PrefillAdder:
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
         self.is_hybrid_ssm_cache = isinstance(self.tree_cache, MambaRadixCache)
+        # When set, caps rem_total_tokens to the global minimum across DP ranks
+        # (set by Scheme C scheduling synchronization for share-prefix).
+        self._rem_total_tokens_cap = rem_total_tokens_cap
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -457,6 +476,10 @@ class PrefillAdder:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
+            )
+        if self._rem_total_tokens_cap is not None:
+            available_and_evictable = min(
+                available_and_evictable, self._rem_total_tokens_cap
             )
         return available_and_evictable - self.rem_total_token_offset
 

@@ -357,6 +357,154 @@ class SharePrefixBatchInfo:
 
 
 # ---------------------------------------------------------------------------
+# SchedulingGatherResult: result of the scheduling-level all-gather
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SchedulingGatherResult:
+    """Result of gather_scheduling_prefix_data() called during scheduling.
+
+    Contains per-request max_prefix_list (max across all DP ranks) and the
+    global minimum KV memory budget, used to make consistent prefill scheduling
+    decisions across all DP ranks.
+    """
+    max_prefix_list: List[int]      # max local_prefix_len across DP ranks, per req
+    global_min_raw_budget: int      # min(available + evictable) across all DP ranks
+
+
+def gather_scheduling_prefix_data(
+    waiting_queue,              # List[Req] — the scheduler waiting queue
+    tree_cache,                 # BasePrefixCache — for match_prefix
+    tp_cpu_group,               # Gloo CPU group spanning all DP ranks × attn_tp ranks
+    attn_tp_size: int,          # number of attn_tp ranks per DP group
+    dp_size: int,               # number of DP groups
+    token_to_kv_pool_allocator, # BaseTokenToKVPoolAllocator — for budget query
+) -> "SchedulingGatherResult":
+    """All-gather local prefix lengths and KV budget across DP ranks for scheduling.
+
+    This function is called once per scheduling round (inside
+    _get_new_batch_prefill_raw) BEFORE calc_priority and PrefillAdder run.
+    It ensures every DP rank uses the same per-request max_prefix and the same
+    KV memory budget, preventing the prefill batch sizes from diverging.
+
+    Side-effects
+    ------------
+    - Calls tree_cache.match_prefix() for every request in waiting_queue,
+      populating req.prefix_indices / req.last_node / req.last_host_node /
+      req.host_hit_length (identical side-effect to SchedulePolicy._compute_prefix_matches).
+    - Sets req.sched_max_prefix (int) on every request.
+
+    Communication
+    -------------
+    One dist.all_gather on the CPU group carrying:
+        [prefix_len_0, …, prefix_len_{n-1}, raw_budget]
+    Total payload: (n+1) × 8 bytes × tp_size.  Very cheap.
+
+    Parameters
+    ----------
+    waiting_queue           : scheduler waiting_queue (list of Req).
+    tree_cache              : local radix-tree cache.
+    tp_cpu_group            : Gloo CPU group spanning all TP ranks (scheduler's
+                              tp_cpu_group).  Do NOT use attn_tp_cpu_group here:
+                              with dp_attention, attn_tp_size may be 1 per process.
+    attn_tp_size            : TP ranks per DP group (to select representative rank).
+    dp_size                 : number of DP groups.
+    token_to_kv_pool_allocator : allocator whose available_size() gives budget.
+
+    Returns
+    -------
+    SchedulingGatherResult with max_prefix_list and global_min_raw_budget.
+    """
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+
+    n = len(waiting_queue)
+    world_size = dist.get_world_size(group=tp_cpu_group)
+
+    # ------------------------------------------------------------------ #
+    # Step 1: compute local prefix match lengths (same side-effect as     #
+    # SchedulePolicy._compute_prefix_matches).                            #
+    # ------------------------------------------------------------------ #
+    local_prefix_lens: List[int] = []
+    for req in waiting_queue:
+        prefix_ids = req.origin_input_ids + req.output_ids
+        extra_key = req.extra_key
+        match_result = tree_cache.match_prefix(
+            rid=req.rid,
+            key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+        )
+        req.prefix_indices = match_result.device_indices
+        req.last_node = match_result.last_device_node
+        req.last_host_node = match_result.last_host_node
+        req.host_hit_length = match_result.host_hit_length
+        local_prefix_lens.append(len(req.prefix_indices))
+
+    # ------------------------------------------------------------------ #
+    # Step 2: query local KV budget (must match PrefillAdder.rem_total_tokens
+    # before rem_total_token_offset: available + evictable).                #
+    # ------------------------------------------------------------------ #
+    try:
+        local_budget = int(
+            token_to_kv_pool_allocator.available_size()
+            + tree_cache.evictable_size()
+        )
+    except Exception:
+        local_budget = 0
+
+    # ------------------------------------------------------------------ #
+    # Step 3: all_gather  [prefix_len_0, …, prefix_len_{n-1}, budget]    #
+    #         via CPU (Gloo) group                                        #
+    # ------------------------------------------------------------------ #
+    local_data = torch.tensor(
+        local_prefix_lens + [local_budget], dtype=torch.int64
+    )
+    gathered = [torch.empty_like(local_data) for _ in range(world_size)]
+    dist.all_gather(gathered, local_data, group=tp_cpu_group)
+
+    # ------------------------------------------------------------------ #
+    # Step 4: compute per-request max_prefix across DP ranks              #
+    # Use only attn_tp_rank==0 representative per DP group                #
+    # (same convention as gather_prefix_data).                            #
+    # ------------------------------------------------------------------ #
+    dp_prefix_matrix: List[List[int]] = []
+    dp_budgets: List[int] = []
+    for dp_r in range(dp_size):
+        rep_idx = dp_r * attn_tp_size + 0  # attn_tp_rank == 0 representative
+        row = gathered[rep_idx].tolist()
+        dp_prefix_matrix.append(row[:n])   # prefix lens
+        dp_budgets.append(int(row[n]))     # budget
+
+    max_prefix_list: List[int] = []
+    for i in range(n):
+        max_p = max(dp_prefix_matrix[dp_r][i] for dp_r in range(dp_size))
+        max_prefix_list.append(max_p)
+
+    # Set convenience attribute on each request so PrefillAdder can read it
+    for req, mp in zip(waiting_queue, max_prefix_list):
+        req.sched_max_prefix = mp
+
+    global_min_raw_budget = min(dp_budgets) if dp_budgets else local_budget
+
+    logger.debug(
+        "[sched_gather] n_reqs=%d world_size=%d dp_size=%d attn_tp_size=%d "
+        "local_prefix_lens=%s max_prefix_list=%s "
+        "local_budget=%d global_min_raw_budget=%d",
+        n, world_size, dp_size, attn_tp_size,
+        local_prefix_lens, max_prefix_list,
+        local_budget, global_min_raw_budget,
+    )
+    for i, req in enumerate(waiting_queue):
+        logger.debug(
+            "[sched_gather] req[%d] rid=%s local_prefix=%d max_prefix=%d",
+            i, req.rid, local_prefix_lens[i], max_prefix_list[i],
+        )
+
+    return SchedulingGatherResult(
+        max_prefix_list=max_prefix_list,
+        global_min_raw_budget=global_min_raw_budget,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helper: gather_prefix_data  (early all-gather, runs before input_ids)
 # ---------------------------------------------------------------------------
 

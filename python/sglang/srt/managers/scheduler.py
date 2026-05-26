@@ -291,6 +291,9 @@ class Scheduler(
         self.enable_special_dp_attention = server_args.enable_special_dp_attention
         self.enable_save_kv_cache_for_dp = server_args.enable_save_kv_cache_for_dp
         self.enable_special_dp_attention_prefix_0 = server_args.enable_special_dp_attention_prefix_0
+        self.enable_share_prefix_for_special_dp_attention = (
+            server_args.enable_share_prefix_for_special_dp_attention
+        )
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
         self.enable_metrics_for_all_schedulers = (
@@ -1931,8 +1934,51 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
+        # global prefix all-gather for share-prefix scheduling consistency.
+        # When share-prefix is active, different DP ranks have different local radix
+        # tree states and thus compute different extend_input_len for the same request.
+        # This causes prefill batch sizes to diverge across ranks, leading to
+        # collective communication deadlocks.  We resolve this by:
+        #   1. All-gathering local prefix lengths across all DP ranks (CPU Gloo group).
+        #   2. Using the global max_prefix for sorting (calc_priority).
+        #   3. Overriding req.extend_input_len with the global max_prefix-based value.
+        #   4. Capping rem_total_tokens to the global minimum budget (PrefillAdder).
+        sched_gather_result = None
+        if (
+            self.enable_share_prefix_for_special_dp_attention
+            and len(self.waiting_queue) > 0
+        ):
+            from sglang.srt.multiplex.share_prefix_helper import (
+                gather_scheduling_prefix_data,
+            )
+            # Must use tp_cpu_group (full tensor-parallel world), NOT attn_tp_cpu_group.
+            # With enable_dp_attention, attn_tp_size = tp_size // dp_size; when that is 1,
+            # attn_tp_cpu_group has only one rank per scheduler process and cannot
+            # all_gather across DP ranks (causes "expected length 1, got 2").
+            sched_cpu_group = self.tp_cpu_group
+            sched_gather_result = gather_scheduling_prefix_data(
+                waiting_queue=self.waiting_queue,
+                tree_cache=self.tree_cache,
+                tp_cpu_group=sched_cpu_group,
+                attn_tp_size=self.attn_tp_size,
+                dp_size=self.dp_size,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            )
+            logger.debug(
+                "[sched_gather] dp_rank=%d waiting_queue_len=%d "
+                "max_prefix_list=%s global_min_raw_budget=%d",
+                self.attn_dp_rank,
+                len(self.waiting_queue),
+                sched_gather_result.max_prefix_list,
+                sched_gather_result.global_min_raw_budget,
+            )
+
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue, self.running_batch)
+        self.policy.calc_priority(
+            self.waiting_queue,
+            self.running_batch,
+            use_global_prefix=(sched_gather_result is not None),
+        )
         # TODO: 这里为什么不区分 cache aware 和 cache agnostic 的调度策略? 如果已经计算 prefixmatch 后续应该可以减少计算？
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
@@ -1962,6 +2008,11 @@ class Scheduler(
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
+            rem_total_tokens_cap=(
+                sched_gather_result.global_min_raw_budget
+                if sched_gather_result is not None
+                else None
+            ),
         )
 
         if self.chunked_req is not None:
@@ -2015,6 +2066,24 @@ class Scheduler(
             else:
                 req.ignore_cache_prefix = False
                 req.init_next_round_input(self.tree_cache)
+
+            # Scheme C: override extend_input_len with the globally agreed max_prefix
+            # so every DP rank consumes the same budget for this request.
+            # sched_max_prefix was set by gather_scheduling_prefix_data() above.
+            if sched_gather_result is not None:
+                mp = getattr(req, "sched_max_prefix", None)
+                if mp is not None:
+                    global_extend = max(0, len(req.fill_ids) - mp)
+                    req.set_extend_input_len(global_extend)
+                    logger.debug(
+                        "[sched_gather] req rid=%s: local_prefix=%d "
+                        "sched_max_prefix=%d global_extend=%d",
+                        req.rid,
+                        len(req.prefix_indices),
+                        mp,
+                        global_extend,
+                    )
+
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -2263,7 +2332,6 @@ class Scheduler(
                 future_indices = self.future_map.alloc_future_indices(bs)
 
                 with self.forward_stream_ctx:
-                    # TODO(lbz): 这里是要做什么? 保证default上面没有东西执行了??
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
                     with self.record_forward_metrics(batch):
@@ -2274,7 +2342,6 @@ class Scheduler(
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
-                        # TODO(lbz): store what to map? 这表示什么含义?
                         self.future_map.store_to_map(future_indices, batch_result)
                         # TODO(lbz): copy what to cpu what? 这表示什么含义?
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
