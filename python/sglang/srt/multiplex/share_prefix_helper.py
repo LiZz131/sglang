@@ -57,14 +57,164 @@ Communication groups
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.distributed as dist
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# NVTX profiling (optional, gated by ServerArgs)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SharePrefixNvtxStats:
+    """Byte/token counts for NVTX range labels and batch_stats logging."""
+
+    total_transfer_tokens: int
+    transfer_bytes: int
+    local_block_tokens: int
+    local_bytes: int
+    extend_tokens: int
+    extend_bytes: int
+    combined_bytes: int
+    batch_size: int
+    local_dp_rank: int
+    kv_cache_dim: int
+    elem_size: int
+
+
+def _share_prefix_nvtx_config() -> Tuple[bool, int]:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        sa = get_global_server_args()
+        enabled = bool(getattr(sa, "enable_share_prefix_nvtx", False))
+        stride = int(getattr(sa, "share_prefix_nvtx_layer_stride", 1))
+        return enabled, max(1, stride)
+    except Exception:
+        return False, 1
+
+
+def compute_share_prefix_nvtx_stats(
+    info: "SharePrefixBatchInfo",
+    elem_size: int,
+) -> SharePrefixNvtxStats:
+    kv_cache_dim = info.kv_cache_dim
+    if kv_cache_dim <= 0:
+        kv_cache_dim = info.kv_lora_rank  # fallback before buf alloc
+    extend_tokens = sum(
+        info.seq_lens[i] - info.max_prefix[i] for i in range(len(info.seq_lens))
+    )
+    transfer_bytes = info.total_transfer_tokens * kv_cache_dim * elem_size
+    local_bytes = info.local_block_size * kv_cache_dim * elem_size
+    extend_bytes = extend_tokens * kv_cache_dim * elem_size
+    combined_bytes = sum(info.seq_lens) * kv_cache_dim * elem_size
+    return SharePrefixNvtxStats(
+        total_transfer_tokens=info.total_transfer_tokens,
+        transfer_bytes=transfer_bytes,
+        local_block_tokens=info.local_block_size,
+        local_bytes=local_bytes,
+        extend_tokens=extend_tokens,
+        extend_bytes=extend_bytes,
+        combined_bytes=combined_bytes,
+        batch_size=len(info.seq_lens),
+        local_dp_rank=info.local_dp_rank,
+        kv_cache_dim=kv_cache_dim,
+        elem_size=elem_size,
+    )
+
+
+def format_share_prefix_nvtx_label(
+    stats: SharePrefixNvtxStats,
+    layer_id: int,
+    phase: str,
+) -> str:
+    if layer_id < 0:
+        prefix = f"share_prefix/batch/{phase}"
+    else:
+        prefix = f"share_prefix/L{layer_id}/{phase}"
+    return (
+        f"{prefix} xfer_toks={stats.total_transfer_tokens} xfer_B={stats.transfer_bytes} "
+        f"local_toks={stats.local_block_tokens} local_B={stats.local_bytes} "
+        f"ext_toks={stats.extend_tokens} ext_B={stats.extend_bytes} "
+        f"combined_B={stats.combined_bytes} bs={stats.batch_size} dp={stats.local_dp_rank}"
+    )
+
+
+@contextmanager
+def share_prefix_nvtx_range(
+    info: Optional["SharePrefixBatchInfo"],
+    layer_id: int,
+    phase: str,
+    *,
+    elem_size: int = 4,
+) -> Iterator[None]:
+    """NVTX range for share-prefix; batch ranges use layer_id=-1 (no stride filter)."""
+    enabled, stride = _share_prefix_nvtx_config()
+    if not enabled:
+        yield
+        return
+    if layer_id >= 0 and layer_id % stride != 0:
+        yield
+        return
+    if info is None:
+        label = f"share_prefix/batch/{phase}" if layer_id < 0 else f"share_prefix/L{layer_id}/{phase}"
+        handle = nvtx.range_start(label)
+    else:
+        stats = compute_share_prefix_nvtx_stats(info, elem_size)
+        handle = nvtx.range_start(format_share_prefix_nvtx_label(stats, layer_id, phase))
+    try:
+        yield
+    finally:
+        nvtx.range_end(handle)
+
+
+def log_share_prefix_batch_stats(
+    info: "SharePrefixBatchInfo",
+    elem_size: int = 2,
+) -> None:
+    """One-line INFO summary per batch (rank0 only)."""
+    if info.local_dp_rank != 0 or info.local_attn_tp_rank != 0:
+        return
+    _, stride = _share_prefix_nvtx_config()
+    stats = compute_share_prefix_nvtx_stats(info, elem_size)
+    if stats.kv_cache_dim > 0:
+        logger.info(
+            "[share_prefix] batch_stats: total_transfer=%d transfer_B=%d "
+            "local_toks=%d local_B=%d ext_toks=%d ext_B=%d combined_B=%d "
+            "bs=%d dp=%d kv_dim=%d nvtx_stride_K=%d",
+            stats.total_transfer_tokens,
+            stats.transfer_bytes,
+            stats.local_block_tokens,
+            stats.local_bytes,
+            stats.extend_tokens,
+            stats.extend_bytes,
+            stats.combined_bytes,
+            stats.batch_size,
+            stats.local_dp_rank,
+            stats.kv_cache_dim,
+            stride,
+        )
+    else:
+        logger.info(
+            "[share_prefix] batch_stats: total_transfer=%d local_toks=%d "
+            "ext_toks=%d combined_toks=%d bs=%d dp=%d nvtx_stride_K=%d "
+            "(bytes logged after combined_kv_buf alloc)",
+            stats.total_transfer_tokens,
+            stats.local_block_tokens,
+            stats.extend_tokens,
+            sum(info.seq_lens),
+            stats.batch_size,
+            stats.local_dp_rank,
+            stride,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +402,8 @@ def gather_prefix_data(
         local_prefix_lens_cpu, dtype=torch.int64, device=device
     )
     gathered = [torch.empty_like(local_tensor) for _ in range(tp_size * dp_size)]
-    dist.all_gather(gathered, local_tensor, group=tp_group.device_group)
+    with share_prefix_nvtx_range(None, -1, "gather_prefix"):
+        dist.all_gather(gathered, local_tensor, group=tp_group.device_group)
 
     # dp_prefix_matrix[dp_rank][req_idx] = prefix len (use attn_tp_rank 0 per DP group)
     dp_prefix_matrix: List[List[int]] = []
@@ -448,58 +599,53 @@ def compute_share_prefix_info(
     # 6. Pre-compute GPU layout tensors (all layer-invariant)              #
     # ------------------------------------------------------------------ #
 
-    # all_local_src_indices: concatenation of pref_idx[:min_p] for each req
-    # Shape: [local_block_size], dtype int64
-    if local_block_size > 0:
-        all_local_src_indices: torch.Tensor = torch.cat([
-            prefix_indices_list[i][:min_prefix_list[i]]
-            for i in range(n)
-            if min_prefix_list[i] > 0
-        ])
-    else:
-        all_local_src_indices = torch.empty(0, dtype=torch.int64, device=device)
+    with share_prefix_nvtx_range(None, -1, "compute_info"):
+        # all_local_src_indices: concatenation of pref_idx[:min_p] for each req
+        if local_block_size > 0:
+            all_local_src_indices: torch.Tensor = torch.cat([
+                prefix_indices_list[i][:min_prefix_list[i]]
+                for i in range(n)
+                if min_prefix_list[i] > 0
+            ])
+        else:
+            all_local_src_indices = torch.empty(0, dtype=torch.int64, device=device)
 
-    # page_table_cached [n, max_seq_len] int32
-    # Block layout: position j in request i maps to:
-    #   [0, min_p)   → local_block_starts[i] + j
-    #   [min_p, max_p) → local_block_size + transfer_offsets[i] + (j - min_p)
-    #   [max_p, seq_len) → extend_block_start + extend_hidden_starts[i] + (j - max_p)
-    max_seq_len = max(seq_lens_cpu)
-    page_table_cached = torch.zeros(
-        (n, max_seq_len), dtype=torch.int32, device=device
-    )
-    for i in range(n):
-        min_p = min_prefix_list[i]
-        max_p = max_prefix_list[i]
-        seq_len = seq_lens_cpu[i]
-        t_len = transfer_len_list[i]
-        e_len = seq_len - max_p
+        max_seq_len = max(seq_lens_cpu)
+        page_table_cached = torch.zeros(
+            (n, max_seq_len), dtype=torch.int32, device=device
+        )
+        for i in range(n):
+            min_p = min_prefix_list[i]
+            max_p = max_prefix_list[i]
+            seq_len = seq_lens_cpu[i]
+            t_len = transfer_len_list[i]
+            e_len = seq_len - max_p
 
-        if min_p > 0:
-            page_table_cached[i, :min_p] = torch.arange(
-                local_block_starts[i],
-                local_block_starts[i] + min_p,
-                dtype=torch.int32, device=device,
-            )
-        if t_len > 0:
-            page_table_cached[i, min_p:max_p] = torch.arange(
-                local_block_size + transfer_offsets[i],
-                local_block_size + transfer_offsets[i] + t_len,
-                dtype=torch.int32, device=device,
-            )
-        if e_len > 0:
-            page_table_cached[i, max_p:seq_len] = torch.arange(
-                extend_block_start + extend_hidden_starts[i],
-                extend_block_start + extend_hidden_starts[i] + e_len,
-                dtype=torch.int32, device=device,
-            )
+            if min_p > 0:
+                page_table_cached[i, :min_p] = torch.arange(
+                    local_block_starts[i],
+                    local_block_starts[i] + min_p,
+                    dtype=torch.int32, device=device,
+                )
+            if t_len > 0:
+                page_table_cached[i, min_p:max_p] = torch.arange(
+                    local_block_size + transfer_offsets[i],
+                    local_block_size + transfer_offsets[i] + t_len,
+                    dtype=torch.int32, device=device,
+                )
+            if e_len > 0:
+                page_table_cached[i, max_p:seq_len] = torch.arange(
+                    extend_block_start + extend_hidden_starts[i],
+                    extend_block_start + extend_hidden_starts[i] + e_len,
+                    dtype=torch.int32, device=device,
+                )
 
-    cache_seqlens_tensor = torch.tensor(
-        seq_lens_cpu, dtype=torch.int32, device=device
-    )
-    cu_seqlens_k_new_tensor = F.pad(
-        torch.cumsum(cache_seqlens_tensor, dim=0, dtype=torch.int32), (1, 0)
-    )
+        cache_seqlens_tensor = torch.tensor(
+            seq_lens_cpu, dtype=torch.int32, device=device
+        )
+        cu_seqlens_k_new_tensor = F.pad(
+            torch.cumsum(cache_seqlens_tensor, dim=0, dtype=torch.int32), (1, 0)
+        )
 
     logger.debug(
         "[share_prefix] dp_rank=%d precomputed page_table=%s "
@@ -543,6 +689,7 @@ def compute_share_prefix_info(
         "total_transfer_tokens=%d batch_size=%d",
         local_dp_rank, total_transfer, n,
     )
+    log_share_prefix_batch_stats(info, elem_size=2)
     return info
 
 

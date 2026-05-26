@@ -643,6 +643,8 @@ class ServerArgs:
     enable_save_kv_cache_for_dp: bool = False
     enable_special_dp_attention_prefix_0: bool = False
     enable_share_prefix_for_special_dp_attention: bool = False
+    enable_share_prefix_nvtx: bool = False
+    share_prefix_nvtx_layer_stride: int = 1
     auto_adjust_stream_group: bool = True
     manual_stream_group_idx: int = 0
     # PD-Multiplexing time model (special-DP event loop): choose stream group by predicted decode run
@@ -4610,6 +4612,17 @@ class ServerArgs:
             "--enable-share-prefix-for-special-dp-attention",
             action="store_true",
             help="Enable share prefix across DP ranks for special dp attention.",
+        )
+        parser.add_argument(
+            "--enable-share-prefix-nvtx",
+            action="store_true",
+            help="Enable NVTX ranges for share-prefix (all_reduce, fill, flash_attn, etc.).",
+        )
+        parser.add_argument(
+            "--share-prefix-nvtx-layer-stride",
+            type=int,
+            default=ServerArgs.share_prefix_nvtx_layer_stride,
+            help="Emit per-layer share-prefix NVTX only when layer_id %% K == 0 (K=1: every layer).",
         )
         parser.add_argument(
             "--enable-save-kv-cache-for-dp",

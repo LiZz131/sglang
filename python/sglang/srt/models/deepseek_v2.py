@@ -4806,11 +4806,13 @@ class DeepseekV2AttentionMLA(nn.Module):
             fill_transfer_region_for_layer,
             reset_transfer_region,
             save_dp_local_kv,
+            share_prefix_nvtx_range,
         )
 
         info = forward_batch.share_prefix_info
         layer_id = self.attn_mqa_normal_tp.layer_id
         kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        elem_size = q_nope_out.element_size()
 
         # ---- 1. Lazy allocation of combined_kv_buf (first layer only) ----
         info.ensure_combined_buf_allocated(
@@ -4824,13 +4826,18 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # ---- 2. Fill + all-reduce transfer_block (skip when nothing to transfer) ----
         if info.total_transfer_tokens > 0:
-            reset_transfer_region(info)
-            fill_transfer_region_for_layer(info, layer_id, kv_buf)
-            dist.all_reduce(
-                info.combined_kv_buf[info.local_block_size : info.extend_block_start],
-                op=dist.ReduceOp.SUM,
-                group=get_tp_group().device_group,
-            )
+            with share_prefix_nvtx_range(info, layer_id, "reset_xfer", elem_size=elem_size):
+                reset_transfer_region(info)
+            with share_prefix_nvtx_range(info, layer_id, "fill_xfer", elem_size=elem_size):
+                fill_transfer_region_for_layer(info, layer_id, kv_buf)
+            with share_prefix_nvtx_range(info, layer_id, "all_reduce", elem_size=elem_size):
+                dist.all_reduce(
+                    info.combined_kv_buf[
+                        info.local_block_size : info.extend_block_start
+                    ],
+                    op=dist.ReduceOp.SUM,
+                    group=get_tp_group().device_group,
+                )
             logger.debug(
                 "[share_prefix] layer=%d all_reduce done, transfer norm=%.4f",
                 layer_id,
@@ -4845,7 +4852,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
 
         # ---- 3. Fill local_block and extend_block ----
-        fill_local_and_extend_for_layer(info, k_nope, k_pe, kv_buf)
+        with share_prefix_nvtx_range(info, layer_id, "fill_local_extend", elem_size=elem_size):
+            fill_local_and_extend_for_layer(info, k_nope, k_pe, kv_buf)
 
         # ---- 4. Flash attention (all layout tensors are pre-computed, no new allocs) ----
         # combined_kv_buf: [total_combined, 1, kv_cache_dim]
@@ -4875,31 +4883,30 @@ class DeepseekV2AttentionMLA(nn.Module):
             max_seqlen_q,
         )
 
-        result = flash_attn_with_kvcache(
-            q=q_pe,
-            k_cache=k_rope_c,
-            v_cache=c_kv_c,
-            qv=q_nope_out,
-            page_table=info.page_table_cached,
-            cache_seqlens=info.cache_seqlens_tensor,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k_new=info.cu_seqlens_k_new_tensor,
-            max_seqlen_q=max_seqlen_q,
-            softmax_scale=layer.scaling,
-            causal=True,
-            softcap=layer.logit_cap,
-        )
+        with share_prefix_nvtx_range(info, layer_id, "flash_attn", elem_size=elem_size):
+            result = flash_attn_with_kvcache(
+                q=q_pe,
+                k_cache=k_rope_c,
+                v_cache=c_kv_c,
+                qv=q_nope_out,
+                page_table=info.page_table_cached,
+                cache_seqlens=info.cache_seqlens_tensor,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k_new=info.cu_seqlens_k_new_tensor,
+                max_seqlen_q=max_seqlen_q,
+                softmax_scale=layer.scaling,
+                causal=True,
+                softcap=layer.logit_cap,
+            )
 
         # ---- 5. Save KV for dp-local requests ----
-        # KV is read directly from combined_kv_buf (transfer_block + extend_block).
-        # This is required for correct decode: without it the KV pool for
-        # dp-local requests would have unfilled slots.
-        save_dp_local_kv(
-            info=info,
-            layer=layer,
-            out_cache_loc=forward_batch.out_cache_loc,
-            token_to_kv_pool=forward_batch.token_to_kv_pool,
-        )
+        with share_prefix_nvtx_range(info, layer_id, "save_kv", elem_size=elem_size):
+            save_dp_local_kv(
+                info=info,
+                layer=layer,
+                out_cache_loc=forward_batch.out_cache_loc,
+                token_to_kv_pool=forward_batch.token_to_kv_pool,
+            )
         logger.info(
             "[share_prefix] layer=%d KV saved for %d dp-local reqs "
             "(total_transfer=%d out_cache_loc=%d)",
