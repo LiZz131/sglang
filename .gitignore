@@ -266,3 +266,8 @@ python/sglang/_version.py
 python/sglang/srt/grpc/*_pb2.py
 python/sglang/srt/grpc/*_pb2_grpc.py
 python/sglang/srt/grpc/*_pb2.pyi
+
+/logs
+/notes
+**.diff
+**.pt
