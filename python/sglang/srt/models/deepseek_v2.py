@@ -146,6 +146,7 @@ from sglang.srt.model_loader.utils import (
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
+    _dispatch_mla_subtype,
 )
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
@@ -3155,13 +3156,32 @@ class DeepseekV2AttentionMLA(nn.Module):
         handler = AttentionBackendRegistry.get_handler(attention_backend)
         result = handler(self, forward_batch)
 
-        if result == AttnForwardMethod.MLA and self.enable_special_dp_attention and forward_batch.forward_mode.is_split_prefill():
+        if (
+            self.enable_special_dp_attention
+            and self.enable_pdmux
+            and forward_batch.forward_mode.is_split_prefill()
+        ):
             if get_global_server_args().enable_share_prefix_for_special_dp_attention:
-                logger.info(f"[share prefix] MLA is supported for split prefill with dp-attention")
-            else:
-                logger.info(f"MLA is not supported for split prefill with dp-attention, change to MHA")
+                # share-prefix split_prefill must always use the MLA path so that
+                # _share_prefix_attn_mqa is invoked.  The FA3/FlashInfer backend may
+                # dispatch to MHA_ONE_SHOT or MHA_CHUNKED_KV when
+                # sum(extend_prefix_lens) >= chunked_prefix_cache_threshold because
+                # share-prefix sets prefix_lens = max_prefix (which is large).
+                # We override that decision here unconditionally.
+                if result != AttnForwardMethod.MLA:
+                    logger.debug(
+                        "[share_prefix] dispatch: split_prefill backend chose %s "
+                        "(sum_extend_prefix_lens likely exceeded threshold), "
+                        "forcing MLA so _share_prefix_attn_mqa is taken",
+                        result.name,
+                    )
+                result = _dispatch_mla_subtype(self, forward_batch)
+            elif result == AttnForwardMethod.MLA:
+                logger.info(
+                    "MLA is not supported for split prefill with dp-attention, change to MHA"
+                )
                 result = AttnForwardMethod.MHA
-        
+
         return result
 
     def op_prepare(self, state):
@@ -3508,10 +3528,16 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        # TODO(lbz): 
-        # logger.debug(f"set_mla_kv_buffer, latent_cache: {latent_cache.shape}, kv_a: {kv_a.shape}, k_pe: {k_pe.shape}")
         if self.enable_save_kv_cache_for_dp:
-            if forward_batch.dp_local_token_start is not None and forward_batch.dp_local_token_end is not None:
+            if (
+                forward_batch.dp_local_token_start is not None
+                and forward_batch.dp_local_token_end is not None
+                # share-prefix mode manages its own KV save via save_dp_local_kv
+                # (reading from combined_kv_buf).  out_cache_loc in that mode only
+                # covers per-request extend tokens, not the full dp-local span, so
+                # _set_mla_kv_buffer_for_dp would crash with a shape mismatch.
+                and getattr(forward_batch, "share_prefix_info", None) is None
+            ):
                 self._set_mla_kv_buffer_for_dp(latent_cache, kv_a, k_pe, forward_batch)
             else:
                 self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
