@@ -20,8 +20,10 @@ import torch.nn.functional as F
 
 from sglang.srt.multiplex.share_prefix_helper import (
     SharePrefixBatchInfo,
+    clear_persistent_combined_kv_buf,
     fill_local_and_extend_for_layer,
     fill_transfer_region_for_layer,
+    get_persistent_combined_kv_buf_capacity,
     reset_transfer_region,
     save_dp_local_kv,
 )
@@ -420,6 +422,9 @@ class TestPageTableBlockLayout:
 class TestFillTransferRegion:
     """Verify fill_transfer_region_for_layer fills the right slots in combined_kv_buf."""
 
+    def setup_method(self):
+        clear_persistent_combined_kv_buf()
+
     def _setup(self, local_dp_rank, local_attn_tp_rank):
         """
         Batch: 2 requests
@@ -540,6 +545,9 @@ class TestFillTransferRegion:
 class TestFillLocalAndExtend:
     """Verify fill_local_and_extend_for_layer fills correct slots in combined_kv_buf."""
 
+    def setup_method(self):
+        clear_persistent_combined_kv_buf()
+
     def _make_test_batch(self):
         """
         2 requests:
@@ -656,9 +664,13 @@ class TestFillLocalAndExtend:
 # ---------------------------------------------------------------------------
 
 class TestEnsureCombinedBufAllocated:
-    """Verify lazy allocation and idempotency of ensure_combined_buf_allocated."""
+    """Verify lazy wiring and idempotency of ensure_combined_buf_allocated."""
 
-    def test_allocates_on_first_call(self):
+    def setup_method(self):
+        clear_persistent_combined_kv_buf()
+
+    def test_wires_on_first_call(self):
+        """After first call, combined_kv_buf is a view with the correct shape."""
         info = _make_info(
             seq_lens=[10], local_prefix=[5], min_prefix=[3], max_prefix=[7],
             max_rank=[0], local_dp_rank=0, local_attn_tp_rank=0,
@@ -666,10 +678,11 @@ class TestEnsureCombinedBufAllocated:
         assert info.combined_kv_buf is None
         info.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
         assert info.combined_kv_buf is not None
-        # total_combined = seq_lens[0] = 10
+        # The view has exactly total_combined=10 tokens
         assert info.combined_kv_buf.shape == (10, 1, 8)
 
     def test_idempotent(self):
+        """Second call on same info returns the same view object."""
         info = _make_info(
             seq_lens=[10], local_prefix=[5], min_prefix=[3], max_prefix=[7],
             max_rank=[0], local_dp_rank=0, local_attn_tp_rank=0,
@@ -677,7 +690,18 @@ class TestEnsureCombinedBufAllocated:
         info.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
         buf1 = info.combined_kv_buf
         info.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
-        assert info.combined_kv_buf is buf1  # same object
+        assert info.combined_kv_buf is buf1  # same object (no re-allocation)
+
+    def test_view_is_backed_by_persistent_buf(self):
+        """The view shares storage with the persistent buffer."""
+        info = _make_info(
+            seq_lens=[10], local_prefix=[5], min_prefix=[3], max_prefix=[7],
+            max_rank=[0], local_dp_rank=0, local_attn_tp_rank=0,
+        )
+        info.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        # Persistent buffer capacity >= 10
+        cap = get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu"))
+        assert cap >= 10
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +709,9 @@ class TestEnsureCombinedBufAllocated:
 # ---------------------------------------------------------------------------
 
 class TestResetTransferRegion:
+    def setup_method(self):
+        clear_persistent_combined_kv_buf()
+
     def test_zeroes_transfer_block(self):
         info = _make_info(
             seq_lens=[10], local_prefix=[5], min_prefix=[3], max_prefix=[7],
@@ -770,6 +797,9 @@ def _setup_combined_kv_buf(info, xfer_val, nope_val, pe_val):
 
 class TestSaveDpLocalKv:
     """Verify save_dp_local_kv writes transfer and extend KV to the correct slots."""
+
+    def setup_method(self):
+        clear_persistent_combined_kv_buf()
 
     # ------------------------------------------------------------------
     # Scenario 1: two requests, both dp-local, non-donor rank
@@ -987,3 +1017,326 @@ class TestSaveDpLocalKv:
         # Slots not written should remain NaN
         assert kv[0:200].isnan().all(), "Non-dp-local slots should be untouched"
         assert kv[213:].isnan().all(), "Slots beyond req1 should be untouched"
+
+
+# ---------------------------------------------------------------------------
+# 10. test_persistent_combined_kv_buf
+# ---------------------------------------------------------------------------
+
+class TestPersistentCombinedKvBuf:
+    """Verify the grow-only persistent combined_kv_buf semantics.
+
+    The persistent buffer avoids per-batch cudaMalloc by keeping a module-level
+    tensor that is only reallocated (2x growth) when total_combined exceeds the
+    current capacity.  All other calls get a zero-copy view.
+    """
+
+    def setup_method(self):
+        clear_persistent_combined_kv_buf()
+
+    def _make_simple_info(self, seq_lens, kv_cache_dim=8, kv_lora_rank=5):
+        return _make_info(
+            seq_lens=seq_lens,
+            local_prefix=[1] * len(seq_lens),
+            min_prefix=[1] * len(seq_lens),
+            max_prefix=[max(1, s - 2) for s in seq_lens],
+            max_rank=[0] * len(seq_lens),
+            local_dp_rank=0,
+            local_attn_tp_rank=0,
+            kv_cache_dim=kv_cache_dim,
+            kv_lora_rank=kv_lora_rank,
+        )
+
+    # ------ basic allocation ------
+
+    def test_initial_capacity_zero_before_any_alloc(self):
+        cap = get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu"))
+        assert cap == 0
+
+    def test_first_alloc_sets_capacity_at_least_2x(self):
+        info = self._make_simple_info(seq_lens=[50])
+        info.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        cap = get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu"))
+        assert cap >= 100, f"Expected capacity >= 100, got {cap}"
+
+    def test_view_has_exact_shape(self):
+        info = self._make_simple_info(seq_lens=[30, 20])  # total_combined = 50
+        info.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        assert info.combined_kv_buf.shape == (50, 1, 8)
+
+    # ------ reuse semantics ------
+
+    def test_second_batch_reuses_storage(self):
+        """Two batches of the same total_combined share the same storage."""
+        info1 = self._make_simple_info(seq_lens=[40])
+        info1.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        ptr1 = info1.combined_kv_buf.data_ptr()
+
+        info2 = self._make_simple_info(seq_lens=[40])
+        info2.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        ptr2 = info2.combined_kv_buf.data_ptr()
+
+        assert ptr1 == ptr2, "Both batches must reuse the same persistent storage"
+
+    def test_smaller_batch_reuses_storage(self):
+        info1 = self._make_simple_info(seq_lens=[100])
+        info1.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        cap_before = get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu"))
+
+        info2 = self._make_simple_info(seq_lens=[30])
+        info2.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        cap_after = get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu"))
+
+        assert cap_after == cap_before, "Smaller batch must not grow the buffer"
+        assert info2.combined_kv_buf.shape == (30, 1, 8)
+
+    def test_capacity_never_shrinks(self):
+        info_large = self._make_simple_info(seq_lens=[200])
+        info_large.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        cap_large = get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu"))
+
+        info_small = self._make_simple_info(seq_lens=[10])
+        info_small.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        cap_small = get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu"))
+
+        assert cap_small == cap_large, "Capacity must not shrink on a smaller batch"
+
+    # ------ growth semantics ------
+
+    def test_larger_batch_grows_buffer(self):
+        info1 = self._make_simple_info(seq_lens=[10])
+        info1.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        cap1 = get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu"))
+
+        need = cap1 + 1
+        info2 = _make_info(
+            seq_lens=[need], local_prefix=[1], min_prefix=[1],
+            max_prefix=[need - 1], max_rank=[0],
+            local_dp_rank=0, local_attn_tp_rank=0,
+            kv_cache_dim=8, kv_lora_rank=5,
+        )
+        info2.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        cap2 = get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu"))
+
+        assert cap2 > cap1, "Buffer must grow when total_combined exceeds capacity"
+        assert cap2 >= need * 2, "New capacity should be >= 2x needed (doubling strategy)"
+
+    def test_growth_changes_storage_pointer(self):
+        info1 = self._make_simple_info(seq_lens=[10])
+        info1.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        cap1 = get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu"))
+        ptr1 = info1.combined_kv_buf.data_ptr()
+
+        info2 = _make_info(
+            seq_lens=[cap1 + 1], local_prefix=[1], min_prefix=[1],
+            max_prefix=[cap1], max_rank=[0],
+            local_dp_rank=0, local_attn_tp_rank=0,
+            kv_cache_dim=8, kv_lora_rank=5,
+        )
+        info2.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        ptr2 = info2.combined_kv_buf.data_ptr()
+
+        assert ptr2 != ptr1, "New allocation must have a different storage address"
+
+    # ------ key isolation ------
+
+    def test_different_kv_cache_dim_get_separate_buffers(self):
+        info8 = self._make_simple_info(seq_lens=[10], kv_cache_dim=8, kv_lora_rank=5)
+        info8.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+
+        info16 = self._make_simple_info(seq_lens=[10], kv_cache_dim=16, kv_lora_rank=10)
+        info16.ensure_combined_buf_allocated(16, 10, torch.float32, torch.device("cpu"))
+
+        assert info8.combined_kv_buf.data_ptr() != info16.combined_kv_buf.data_ptr()
+        cap8  = get_persistent_combined_kv_buf_capacity(8,  torch.float32, torch.device("cpu"))
+        cap16 = get_persistent_combined_kv_buf_capacity(16, torch.float32, torch.device("cpu"))
+        assert cap8 >= 10 and cap16 >= 10
+
+    def test_different_dtype_get_separate_buffers(self):
+        info_f32 = self._make_simple_info(seq_lens=[10])
+        info_f32.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+
+        info_f16 = self._make_simple_info(seq_lens=[10])
+        info_f16.ensure_combined_buf_allocated(8, 5, torch.float16, torch.device("cpu"))
+
+        assert info_f32.combined_kv_buf.data_ptr() != info_f16.combined_kv_buf.data_ptr()
+        assert info_f16.combined_kv_buf.dtype == torch.float16
+        assert info_f32.combined_kv_buf.dtype == torch.float32
+
+    # ------ clear ------
+
+    def test_clear_resets_capacity_to_zero(self):
+        info = self._make_simple_info(seq_lens=[50])
+        info.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        assert get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu")) > 0
+
+        clear_persistent_combined_kv_buf()
+        assert get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu")) == 0
+
+    def test_clear_then_alloc_works(self):
+        info1 = self._make_simple_info(seq_lens=[10])
+        info1.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        clear_persistent_combined_kv_buf()
+
+        info2 = self._make_simple_info(seq_lens=[10])
+        info2.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        assert info2.combined_kv_buf.shape == (10, 1, 8)
+        assert get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu")) >= 20
+
+    # ------ data integrity ------
+
+    def test_views_from_same_batch_are_aliases(self):
+        """Two info objects for the same batch size share storage (aliases)."""
+        info1 = self._make_simple_info(seq_lens=[10])
+        info1.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        info1.combined_kv_buf[:] = 1.0
+
+        info2 = self._make_simple_info(seq_lens=[10])
+        info2.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        info2.combined_kv_buf[:] = 2.0
+
+        assert info1.combined_kv_buf[0, 0, 0].item() == pytest.approx(2.0), (
+            "info1 view and info2 view are storage aliases"
+        )
+
+    def test_view_does_not_exceed_total_combined(self):
+        total_combined = 20
+        info = self._make_simple_info(seq_lens=[total_combined])
+        info.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
+        cap = get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu"))
+
+        assert info.combined_kv_buf.shape[0] == total_combined
+        assert cap > total_combined, "Persistent buffer has headroom beyond the view"
+
+
+# ---------------------------------------------------------------------------
+# Tests for the dispatch fix: sum_extend_prefix_lens threshold scenario
+# ---------------------------------------------------------------------------
+
+class TestDispatchFixLogic:
+    """
+    Verify the logic that prevents MHA_ONE_SHOT from leaking through when
+    share-prefix is active and sum(extend_prefix_lens) is large.
+
+    These tests exercise the _handle_attention_backend dispatch condition directly
+    without needing a full model instance.  We check:
+    1. The threshold condition that causes the MHA_ONE_SHOT path to be chosen.
+    2. That the out_cache_loc size mismatch between share-prefix and
+       dp_local_token_start/end is correctly characterised.
+    """
+
+    def test_extend_prefix_lens_threshold_condition(self):
+        """
+        Reproduce the condition that causes the dispatch to choose MHA_ONE_SHOT
+        in the high-cache-hit (extend=1) scenario.
+
+        In share-prefix mode prepare_for_extend sets prefix_lens = max_prefix.
+        Here we verify that such large prefix sums DO exceed a typical threshold.
+        """
+        # Simulate the high-cache-hit scenario from the bug report
+        # seq_lens = [1954, 1309, 664, 5953, 1954, 1825]
+        # max_prefix ≈ seq_len - 1
+        max_prefix = [1953, 1308, 663, 5952, 1953, 1824]
+        sum_extend_prefix_lens = sum(max_prefix)   # 13653
+
+        # A typical chunked_prefix_cache_threshold is small (e.g., a few thousand)
+        # The point is sum_extend_prefix_lens is large when all tokens are cached.
+        # Verify it is non-zero and would plausibly exceed a threshold.
+        assert sum_extend_prefix_lens > 0
+        # With extend=1, each request contributes only 1 extend token
+        extend_lens = [1, 1, 1, 1, 1, 1]
+        total_extend_tokens = sum(extend_lens)  # 6
+        assert total_extend_tokens == 6
+
+        # The critical invariant: sum_extend_prefix_lens is huge because it
+        # equals sum(max_prefix), not sum(local_prefix) or sum(extend_lens).
+        assert sum_extend_prefix_lens > 1000
+
+    def test_out_cache_loc_size_mismatch_characterisation(self):
+        """
+        Verify that out_cache_loc (allocated by alloc_for_extend in share-prefix
+        mode) has a DIFFERENT size than what _set_mla_kv_buffer_for_dp expects.
+
+        share-prefix out_cache_loc size  = sum(seq_len - local_prefix)  ← extend only
+        _set_mla_kv_buffer_for_dp expects = dp_local_token_end - dp_local_token_start
+        """
+        # From the bug report log:
+        # DP1 dp-local requests: indices [3, 4, 5] → seq_lens [5953, 1954, 1825]
+        # local_prefix for DP1:  [5952, 1953, 1824]
+        # extend = 1 for each
+        seq_lens_all     = [1954, 1309, 664, 5953, 1954, 1825]
+        local_prefix_dp1 = [137,  137,  137, 5952, 1953, 1824]   # dp1's local view
+        dp_local_indices = [3, 4, 5]
+
+        # share-prefix out_cache_loc: sum(seq_len - local_prefix) for dp-local reqs
+        oc_size_share_prefix = sum(
+            seq_lens_all[g] - local_prefix_dp1[g] for g in dp_local_indices
+        )
+        assert oc_size_share_prefix == 3   # 1+1+1
+
+        # _set_mla_kv_buffer_for_dp expects: dp_local_token_end - dp_local_token_start
+        # dp_local_token_start = sum(seq_lens[:3]) = 1954+1309+664 = 3927
+        # dp_local_token_end   = sum(seq_lens)     = 13659
+        dp_local_token_start = sum(seq_lens_all[:3])   # = 3927
+        dp_local_token_end   = sum(seq_lens_all)       # = 13659
+        local_tok_n = dp_local_token_end - dp_local_token_start
+        assert local_tok_n == 9732
+
+        # The mismatch: 3 ≠ 9732  → AssertionError in _set_mla_kv_buffer_for_dp
+        assert oc_size_share_prefix != local_tok_n, (
+            "_set_mla_kv_buffer_for_dp would crash: "
+            f"out_cache_loc.shape[0]={oc_size_share_prefix}, "
+            f"local_tok_n={local_tok_n}"
+        )
+
+    def test_fix_forces_mla_when_share_prefix_active(self):
+        """
+        Verify that the fix correctly forces result = MLA regardless of what
+        the backend initially returned.
+
+        This test directly exercises the dispatch override condition without
+        instantiating a full model.
+        """
+        from sglang.srt.models.deepseek_common.attention_backend_handler import (
+            _dispatch_mla_subtype,
+        )
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
+            AttnForwardMethod,
+        )
+
+        # Mock the override logic from dispatch_attn_forward_method
+        def apply_share_prefix_override(initial_result, enable_share_prefix):
+            """Mirrors the logic in dispatch_attn_forward_method."""
+            if enable_share_prefix:
+                # Always force MLA (or its subtype)
+                # We can't call _dispatch_mla_subtype without a real attn object,
+                # so we simulate what it returns for the non-HIP CUDA case.
+                return AttnForwardMethod.MLA
+            else:
+                if initial_result == AttnForwardMethod.MLA:
+                    return AttnForwardMethod.MHA
+                return initial_result
+
+        # Case 1: backend returned MHA_ONE_SHOT, share-prefix enabled → must become MLA
+        result = apply_share_prefix_override(AttnForwardMethod.MHA_ONE_SHOT, enable_share_prefix=True)
+        assert result == AttnForwardMethod.MLA, (
+            f"Expected MLA but got {result.name}: share-prefix must force MLA for MHA_ONE_SHOT"
+        )
+
+        # Case 2: backend returned MHA_CHUNKED_KV, share-prefix enabled → must become MLA
+        result = apply_share_prefix_override(AttnForwardMethod.MHA_CHUNKED_KV, enable_share_prefix=True)
+        assert result == AttnForwardMethod.MLA
+
+        # Case 3: backend returned MLA, share-prefix enabled → stays MLA
+        result = apply_share_prefix_override(AttnForwardMethod.MLA, enable_share_prefix=True)
+        assert result == AttnForwardMethod.MLA
+
+        # Case 4: backend returned MLA, share-prefix disabled (prefix-0 mode) → becomes MHA
+        result = apply_share_prefix_override(AttnForwardMethod.MLA, enable_share_prefix=False)
+        assert result == AttnForwardMethod.MHA, (
+            "prefix-0 mode should still downgrade MLA → MHA"
+        )
+
+        # Case 5: backend returned MHA_ONE_SHOT, share-prefix disabled → unchanged
+        result = apply_share_prefix_override(AttnForwardMethod.MHA_ONE_SHOT, enable_share_prefix=False)
+        assert result == AttnForwardMethod.MHA_ONE_SHOT

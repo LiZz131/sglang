@@ -46,6 +46,20 @@ This replaces the old design that had:
   - a per-layer torch.tensor for cache_seqlens   (N_layers mallocs eliminated)
   - a separate transfer_buffer + per-layer copy  (N_layers copies eliminated)
 
+Persistent buffer (grow-only)
+------------------------------
+combined_kv_buf is now backed by a module-level grow-only tensor
+(_PERSISTENT_COMBINED_KV_BUF).  On each new batch, ensure_combined_buf_allocated()
+returns a view (no CUDA malloc) if capacity ≥ total_combined.  Only when a batch
+requires more tokens than ever seen before does the buffer grow (2× doubling
+strategy).  After the first forward pass, all subsequent batches of equal or
+smaller token count incur zero cudaMalloc overhead at layer 0.
+
+Why max_prefill_tokens is not the right static bound:
+  total_combined = sum(seq_lens) = sum(max_prefix) + sum(extend_lens)
+  Only sum(extend_lens) ≤ max_prefill_tokens.
+  sum(max_prefix) ≤ KV pool capacity, which is >> max_prefill_tokens.
+
 Communication groups
 --------------------
 * All-gather  : tp_group (spans all DP groups within one worker).
@@ -67,6 +81,120 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Persistent (grow-only) combined_kv_buf
+# ---------------------------------------------------------------------------
+# combined_kv_buf is the main per-batch working buffer used in
+# _share_prefix_attn_mqa.  Its size is sum(seq_lens) × kv_cache_dim, which
+# varies per batch.  Allocating it fresh each batch (even once per forward)
+# causes a cudaMalloc visible in nsys at layer 0.
+#
+# Solution: keep a module-level dict of grow-only tensors, one per
+# (device, dtype, kv_cache_dim) key.  On each batch, acquire() returns a
+# *view* (no new allocation) if the capacity is sufficient, or reallocates
+# at 2× the required size.  After warm-up, no further cudaMalloc occurs.
+#
+# Why is max_prefill_tokens insufficient as a static upper bound?
+#   combined_kv_buf size = sum(seq_lens) = sum(max_prefix) + sum(extend_lens)
+#   Only sum(extend_lens) ≤ max_prefill_tokens.
+#   sum(max_prefix) is bounded by the KV pool size, which can be >> max_prefill_tokens.
+#
+# Key: (device_str, dtype_str, kv_cache_dim: int)
+_PERSISTENT_COMBINED_KV_BUF: dict[tuple, torch.Tensor] = {}
+
+# Minimum initial capacity (tokens) to avoid growth on tiny warm-up batches.
+_PERSISTENT_BUF_MIN_CAPACITY = 44156
+
+
+def _acquire_combined_kv_buf(
+    total_combined: int,
+    kv_cache_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a [:total_combined, 1, kv_cache_dim] view of the persistent buffer.
+
+    Grows the persistent buffer (doubling strategy) only when
+    total_combined > current capacity.  The returned tensor is a storage-alias
+    view; it shares memory with the persistent buffer and will be overwritten
+    on the next batch that calls this function.  Callers must NOT hold the
+    view past the end of the current forward pass.
+
+    Parameters
+    ----------
+    total_combined : int
+        sum(seq_lens) for the current batch.
+    kv_cache_dim   : int
+        kv_lora_rank + qk_rope_head_dim.
+    dtype          : torch.dtype
+        Model activation dtype (fp16 / bf16).
+    device         : torch.device
+        CUDA device the model runs on.
+
+    Returns
+    -------
+    torch.Tensor  shape [total_combined, 1, kv_cache_dim], dtype=dtype, device=device
+    """
+    key = (str(device), str(dtype), kv_cache_dim)
+    buf = _PERSISTENT_COMBINED_KV_BUF.get(key)
+
+    if buf is None or buf.shape[0] < total_combined:
+        old_capacity = buf.shape[0] if buf is not None else 0
+        new_capacity = max(
+            total_combined * 2,            # 2× headroom for future batches
+            old_capacity * 2,              # double existing if non-zero
+            _PERSISTENT_BUF_MIN_CAPACITY,  # minimum floor
+        )
+        buf = torch.empty(
+            (new_capacity, 1, kv_cache_dim),
+            dtype=dtype,
+            device=device,
+        )
+        _PERSISTENT_COMBINED_KV_BUF[key] = buf
+        logger.info(
+            "[share_prefix] persistent combined_kv_buf GROW: "
+            "old_capacity=%d new_capacity=%d total_combined=%d "
+            "dtype=%s device=%s kv_cache_dim=%d "
+            "alloc_MB=%.2f",
+            old_capacity, new_capacity, total_combined,
+            dtype, device, kv_cache_dim,
+            new_capacity * kv_cache_dim * buf.element_size() / (1024 * 1024),
+        )
+    else:
+        logger.debug(
+            "[share_prefix] persistent combined_kv_buf REUSE: "
+            "capacity=%d total_combined=%d (headroom=%d)",
+            buf.shape[0], total_combined, buf.shape[0] - total_combined,
+        )
+
+    return buf[:total_combined]
+
+
+def get_persistent_combined_kv_buf_capacity(
+    kv_cache_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> int:
+    """Return the current capacity (number of token slots) of the persistent buffer.
+
+    Returns 0 if no buffer has been allocated yet for this (device, dtype, kv_cache_dim).
+    Intended for logging, monitoring, and unit tests.
+    """
+    key = (str(device), str(dtype), kv_cache_dim)
+    buf = _PERSISTENT_COMBINED_KV_BUF.get(key)
+    return buf.shape[0] if buf is not None else 0
+
+
+def clear_persistent_combined_kv_buf() -> None:
+    """Release all persistent combined_kv_buf allocations.
+
+    Intended for unit tests (call in setup_method) and server shutdown.
+    Not safe to call while a forward pass is in-flight.
+    """
+    _PERSISTENT_COMBINED_KV_BUF.clear()
+    logger.debug("[share_prefix] persistent combined_kv_buf cleared")
 
 
 # ---------------------------------------------------------------------------
@@ -316,9 +444,10 @@ class SharePrefixBatchInfo:
     # shape [batch_size + 1], dtype int32
     cu_seqlens_k_new_tensor: Optional[torch.Tensor]
 
-    # ---------- preallocated reusable buffer (overwritten each layer) ----------
+    # ---------- per-batch view into the module-level persistent buffer ----------
     # combined_kv_buf: [total_combined, 1, kv_cache_dim]
-    # None until ensure_combined_buf_allocated() is called.
+    # Set to a view of _PERSISTENT_COMBINED_KV_BUF by ensure_combined_buf_allocated().
+    # None until that call.
     combined_kv_buf: Optional[torch.Tensor]
 
     # ---------- misc ----------
@@ -333,11 +462,19 @@ class SharePrefixBatchInfo:
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        """Allocate combined_kv_buf if not yet done; idempotent.
+        """Wire combined_kv_buf to the global grow-only persistent buffer.
+
+        On the first call for this batch, this returns a *view* (no new CUDA
+        malloc) into _PERSISTENT_COMBINED_KV_BUF when the existing capacity is
+        sufficient.  The persistent buffer is reallocated (grow-only, 2×) only
+        when total_combined exceeds the current capacity.
+
+        After the model warm-up batch, subsequent prefill batches should never
+        trigger a CUDA malloc here.
 
         Only combined_kv_buf requires kv_cache_dim and is deferred to the first
-        model layer.  All layout tensors (page_table_cached, etc.) are already
-        allocated in compute_share_prefix_info.
+        model layer.  All other layout tensors (page_table_cached, etc.) are
+        already allocated in compute_share_prefix_info.
         """
         if self.combined_kv_buf is not None:
             return
@@ -345,14 +482,8 @@ class SharePrefixBatchInfo:
         self.kv_lora_rank = kv_lora_rank
         self.device = device
         total_combined = sum(self.seq_lens)
-        self.combined_kv_buf = torch.empty(
-            (total_combined, 1, kv_cache_dim),
-            dtype=dtype,
-            device=device,
-        )
-        logger.debug(
-            "[share_prefix] allocated combined_kv_buf shape=%s dtype=%s",
-            tuple(self.combined_kv_buf.shape), dtype,
+        self.combined_kv_buf = _acquire_combined_kv_buf(
+            total_combined, kv_cache_dim, dtype, device
         )
 
 
