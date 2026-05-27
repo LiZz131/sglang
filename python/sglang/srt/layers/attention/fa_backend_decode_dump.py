@@ -479,6 +479,13 @@ def maybe_dump_forward_decode(
         return
     if not forward_batch.forward_mode.is_decode():
         return
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if get_is_capture_mode():
+            return
+    except Exception:
+        pass
     layer_id = int(getattr(layer, "layer_id", -1))
     if not _layer_allowed(layer_id):
         return

@@ -945,6 +945,13 @@ def _debug_mlp_inner_should_dump(forward_batch: ForwardBatch, positions: Optiona
     return _debug_mlp_inner_skip_reason(forward_batch, positions) is None
 
 
+def _debug_moe_wants_router_diag(forward_batch: Optional[ForwardBatch]) -> bool:
+    """True when MoE router diagnostics may run (never during CUDA graph capture)."""
+    if forward_batch is None or _debug_moe_capture_mode():
+        return False
+    return _debug_mlp_inner_enabled() or _debug_mlp_inner_branch_log_enabled()
+
+
 def _debug_mlp_inner_path_tag(forward_batch: ForwardBatch) -> str:
     fm = getattr(forward_batch, "forward_mode", None)
     if fm is not None and fm.is_split_prefill():
@@ -2327,15 +2334,18 @@ class DeepseekV2MoE(nn.Module):
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
 
-        if forward_batch is not None:
+        if _debug_moe_wants_router_diag(forward_batch):
             _dbg_router = {
                 "route": "forward_normal_dual_stream",
                 "moe_gate_branch": getattr(
                     self.gate, "_debug_last_router_branch", None
                 ),
                 "router_logits_shape": tuple(router_logits.shape),
-                "router_logits_meta": _debug_router_logits_meta(router_logits),
             }
+            if _debug_mlp_inner_enabled():
+                _dbg_router["router_logits_meta"] = _debug_router_logits_meta(
+                    router_logits
+                )
             _debug_mlp_inner_maybe_log_router_branch(
                 layer_id=self.layer_id,
                 forward_batch=forward_batch,
@@ -2350,6 +2360,7 @@ class DeepseekV2MoE(nn.Module):
                 meta=_dbg_router,
             )
 
+        if forward_batch is not None:
             _debug_save_mlp_inner_if_enabled(
                 self.layer_id,
                 "moe_pre_tp_allreduce",
@@ -2397,15 +2408,18 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(
                 hidden_states, gemm_output_zero_allocator, forward_batch
             )
-            if forward_batch is not None:
+            if _debug_moe_wants_router_diag(forward_batch):
                 _dbg_router = {
                     "route": "forward_normal",
                     "moe_gate_branch": getattr(
                         self.gate, "_debug_last_router_branch", None
                     ),
                     "router_logits_shape": tuple(router_logits.shape),
-                    "router_logits_meta": _debug_router_logits_meta(router_logits),
                 }
+                if _debug_mlp_inner_enabled():
+                    _dbg_router["router_logits_meta"] = _debug_router_logits_meta(
+                        router_logits
+                    )
                 _debug_mlp_inner_maybe_log_router_branch(
                     layer_id=self.layer_id,
                     forward_batch=forward_batch,
