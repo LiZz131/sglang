@@ -4878,13 +4878,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                     op=dist.ReduceOp.SUM,
                     group=get_tp_group().device_group,
                 )
-            logger.debug(
-                "[share_prefix] layer=%d all_reduce done, transfer norm=%.4f",
-                layer_id,
-                info.combined_kv_buf[
-                    info.local_block_size : info.extend_block_start
-                ].float().norm().item(),
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[share_prefix] layer=%d all_reduce done, transfer norm=%.4f",
+                    layer_id,
+                    info.combined_kv_buf[
+                        info.local_block_size : info.extend_block_start
+                    ].float().norm().item(),
+                )
         else:
             logger.debug(
                 "[share_prefix] layer=%d total_transfer=0, skip fill+all_reduce",
@@ -4909,19 +4910,20 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         layer = self.attn_mqa_normal_tp
 
-        logger.debug(
-            "[share_prefix] layer=%d flash_attn: q_pe=%s q_nope_out=%s "
-            "k_rope_c=%s c_kv_c=%s page_table=%s cache_seqlens=%s "
-            "cu_seqlens_q=%s cu_seqlens_k_new=%s max_seqlen_q=%d",
-            layer_id,
-            tuple(q_pe.shape), tuple(q_nope_out.shape),
-            tuple(k_rope_c.shape), tuple(c_kv_c.shape),
-            tuple(info.page_table_cached.shape),
-            info.cache_seqlens_tensor.tolist(),
-            cu_seqlens_q.tolist(),
-            info.cu_seqlens_k_new_tensor.tolist(),
-            max_seqlen_q,
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[share_prefix] layer=%d flash_attn: q_pe=%s q_nope_out=%s "
+                "k_rope_c=%s c_kv_c=%s page_table=%s cache_seqlens=%s "
+                "cu_seqlens_q=%s cu_seqlens_k_new=%s max_seqlen_q=%d",
+                layer_id,
+                tuple(q_pe.shape), tuple(q_nope_out.shape),
+                tuple(k_rope_c.shape), tuple(c_kv_c.shape),
+                tuple(info.page_table_cached.shape),
+                info.cache_seqlens_tensor.tolist(),
+                cu_seqlens_q.tolist(),
+                info.cu_seqlens_k_new_tensor.tolist(),
+                max_seqlen_q,
+            )
 
         with share_prefix_nvtx_range(info, layer_id, "flash_attn", elem_size=elem_size):
             result = flash_attn_with_kvcache(

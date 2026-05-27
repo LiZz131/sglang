@@ -817,12 +817,10 @@ def compute_share_prefix_info(
     prefix_indices_list: List[torch.Tensor] = []
     for req in reqs:
         if len(req.prefix_indices) > 0:
-            pi = torch.tensor(
-                req.prefix_indices
-                if not isinstance(req.prefix_indices, torch.Tensor)
-                else req.prefix_indices.tolist(),
-                dtype=torch.int64, device=device,
-            )
+            if isinstance(req.prefix_indices, torch.Tensor):
+                pi = req.prefix_indices.to(dtype=torch.int64, device=device)
+            else:
+                pi = torch.tensor(req.prefix_indices, dtype=torch.int64, device=device)
         else:
             pi = torch.empty(0, dtype=torch.int64, device=device)
         prefix_indices_list.append(pi)
