@@ -441,16 +441,22 @@ class CudaGraphRunner:
         )
 
     def _init_profile_context_and_memory_record(self):
+        from sglang.srt.utils.cuda_memory_snapshot import (
+            disable_memory_history,
+            dump_memory_snapshot,
+            enable_memory_history,
+        )
+
         profile_context = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
         )
-        torch.cuda.memory._record_memory_history()
+        enable_memory_history()
         return profile_context
 
     def _post_process_after_profile(self, prof_context):
-        torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
-        torch.cuda.memory._record_memory_history(enabled=None)
+        dump_memory_snapshot("cuda_graph_runner_memory_usage.pickle")
+        disable_memory_history()
         log_message = (
             "Sorted by CUDA Time:\n"
             + prof_context.key_averages(group_by_input_shape=True).table(

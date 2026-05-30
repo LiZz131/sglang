@@ -44,6 +44,10 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.debug.kv_golden_mla import (
+    maybe_dump_tp_kv_golden_mla,
+    maybe_inject_tp_kv_golden_mla,
+)
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
@@ -454,6 +458,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.server_args.elastic_ep_backend
             else None
         )
+        from sglang.srt.utils.cuda_memory_snapshot import maybe_enable_from_server_args
+
+        maybe_enable_from_server_args(server_args)
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
@@ -2114,6 +2121,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        maybe_inject_tp_kv_golden_mla(self, forward_batch)
         if not skip_attn_backend_init:
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
@@ -2149,17 +2157,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         ):
-            return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+            ret = self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+            maybe_dump_tp_kv_golden_mla(self, forward_batch)
+            return ret
 
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
 
-        return self.model.forward(
+        ret = self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
+        maybe_dump_tp_kv_golden_mla(self, forward_batch)
+        return ret
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
@@ -2199,6 +2211,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             (forward_batch.split_index, next_split_index),
         )
         forward_batch.split_index = next_split_index
+        if forward_batch.split_index >= self.model_config.num_hidden_layers:
+            maybe_dump_tp_kv_golden_mla(self, forward_batch)
         return ret
 
     def forward(

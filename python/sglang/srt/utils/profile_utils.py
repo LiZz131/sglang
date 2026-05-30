@@ -12,6 +12,11 @@ from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.cuda_memory_snapshot import (
+    disable_memory_history,
+    dump_memory_snapshot,
+    enable_memory_history,
+)
 
 _is_npu = is_npu()
 if _is_npu:
@@ -316,7 +321,9 @@ class _ProfilerTorch(_ProfilerConcreteBase):
 
 class _ProfilerMemory(_ProfilerConcreteBase):
     def start(self):
-        torch.cuda.memory._record_memory_history(max_entries=100000)
+        enable_memory_history(
+            max_entries=get_global_server_args().cuda_memory_snapshot_max_entries
+        )
 
     def stop(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
@@ -328,8 +335,8 @@ class _ProfilerMemory(_ProfilerConcreteBase):
             + self.output_suffix
             + ".pickle",
         )
-        torch.cuda.memory._dump_snapshot(memory_profile_path)
-        torch.cuda.memory._record_memory_history(enabled=None)
+        dump_memory_snapshot(memory_profile_path)
+        disable_memory_history()
 
 
 class _ProfilerCudart(_ProfilerConcreteBase):

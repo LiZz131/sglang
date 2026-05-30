@@ -535,6 +535,8 @@ class ServerArgs:
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
+    enable_cuda_memory_snapshot_from_start: bool = False
+    cuda_memory_snapshot_max_entries: int = 500_000
     enable_cudagraph_gc: bool = False
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
@@ -4103,6 +4105,17 @@ class ServerArgs:
             "--enable-profile-cuda-graph",
             action="store_true",
             help="Enable profiling of cuda graph capture.",
+        )
+        parser.add_argument(
+            "--enable-cuda-memory-snapshot-from-start",
+            action="store_true",
+            help="Record CUDA allocation history from before model load, so memory_viz captures the full lifecycle.",
+        )
+        parser.add_argument(
+            "--cuda-memory-snapshot-max-entries",
+            type=int,
+            default=ServerArgs.cuda_memory_snapshot_max_entries,
+            help="Max allocation events for CUDA memory snapshot (default: %(default)s).",
         )
         parser.add_argument(
             "--enable-cudagraph-gc",
