@@ -455,6 +455,86 @@ class SharePrefixBatchInfo:
     kv_lora_rank: int = 0           # for splitting combined KV into rope / nope
     device: Optional[torch.device] = None
 
+    # ---------- pipeline overlap state (optional) ----------
+    # Set comm_stream to enable computation-communication overlap.  When set,
+    # _share_prefix_attn_mqa uses the pipelined path:
+    #   Phase A (comm_stream): save_kv(layer i) + reset/fill_xfer/all_reduce/fill_local(layer i+1)
+    #   Phase B (main_stream): fill_extend(layer i+1) + flash_attn(layer i+1)
+    # Both streams are coordinated via attn_done_event (main→comm) and
+    # _pending_ltr_event (comm→main).
+    #
+    # comm_stream is per-batch but can be a long-lived object reused across batches.
+    # Use set_pipeline_comm_stream() to inject or replace the stream.
+    comm_stream: Optional[torch.cuda.Stream] = None
+
+    # The PP-rank-local last layer id (self.end_layer - 1).  Used to decide when
+    # to drain comm_stream and when to skip Phase A (PP boundary).
+    # -1 means not yet initialised.
+    pipeline_last_layer_id: int = -1
+
+    # Carries the local-transfer-ready CUDA Event from one layer's comm_stream
+    # work to the next layer's main_stream wait.
+    # - Reset to None at the start of the FIRST sub-forward of each batch.
+    # - Preserved across sub-forwards so comm_stream work started at the tail of
+    #   sub-forward N is picked up by sub-forward N+1 without double-launch.
+    _pending_ltr_event: Optional[torch.cuda.Event] = None
+
+    # True after the first call to init_pipeline_state_for_forward() for this
+    # batch.  Prevents _pending_ltr_event from being cleared on subsequent
+    # sub-forward calls in split-prefill.
+    pipeline_initialized: bool = False
+
+    def set_pipeline_comm_stream(
+        self, stream: Optional[torch.cuda.Stream]
+    ) -> None:
+        """Inject or replace the comm_stream used for pipeline overlap.
+
+        Pass None to disable pipeline overlap and fall back to synchronous mode.
+        The stream is not owned by this object; callers are responsible for its
+        lifetime.
+        """
+        self.comm_stream = stream
+
+    def init_pipeline_state_for_forward(
+        self,
+        pp_last_layer_id: int,
+        *,
+        force_reset: bool = False,
+    ) -> None:
+        """Initialise pipeline state before a forward (or sub-forward) pass.
+
+        Must be called once per forward / split-prefill chunk, BEFORE the layer
+        loop.  For split-prefill the same ``SharePrefixBatchInfo`` is reused
+        across sub-forwards; this method therefore distinguishes "first call"
+        from "subsequent calls" via ``pipeline_initialized``:
+
+        * First call  → reset ``_pending_ltr_event`` and record
+          ``pipeline_last_layer_id`` (the PP-rank's true last layer, fixed for
+          the entire batch).
+        * Later calls → only update ``pipeline_last_layer_id`` if it hasn't been
+          set yet (shouldn't happen), but do NOT touch ``_pending_ltr_event`` so
+          comm_stream work started during the previous sub-forward is inherited.
+
+        Parameters
+        ----------
+        pp_last_layer_id:
+            ``self.end_layer - 1`` for the current PP rank.  This is the layer
+            at which comm_stream is drained and Phase A is no longer launched.
+        force_reset:
+            If True, always reset as if this were the first call.  Used by the
+            regular (non-split) ``forward()`` path which always starts fresh.
+        """
+        if force_reset or not self.pipeline_initialized:
+            self._pending_ltr_event = None
+            self.pipeline_last_layer_id = pp_last_layer_id
+            self.pipeline_initialized = True
+            logger.debug(
+                "[share_prefix_pipeline] pipeline init: pp_last_layer=%d "
+                "force_reset=%s",
+                pp_last_layer_id,
+                force_reset,
+            )
+
     def ensure_combined_buf_allocated(
         self,
         kv_cache_dim: int,
@@ -967,6 +1047,20 @@ def compute_share_prefix_info(
         local_dp_rank, total_transfer, n,
     )
     log_share_prefix_batch_stats(info, elem_size=2)
+
+    # Buffer layout summary (token counts) for verifying prefix distribution.
+    # kv_cache_dim is not known yet (allocated lazily), so we report token counts.
+    total_combined_toks = sum(seq_lens_cpu)
+    logger.info(
+        "[share_prefix] buffer layout: dp_rank=%d bs=%d local_toks=%d "
+        "xfer_toks=%d ext_toks=%d combined_toks=%d | "
+        "per_req min_prefix=%s max_prefix=%s transfer_len=%s",
+        local_dp_rank, n,
+        local_block_size, total_transfer,
+        total_combined_toks - extend_block_start, total_combined_toks,
+        min_prefix_list, max_prefix_list, transfer_len_list,
+    )
+
     return info
 
 
@@ -1040,8 +1134,48 @@ def fill_transfer_region_for_layer(
 # Helper: fill_local_and_extend_for_layer
 # ---------------------------------------------------------------------------
 
+def fill_local_block_for_layer(
+    info: "SharePrefixBatchInfo",
+    kv_buf: torch.Tensor,  # token_to_kv_pool.get_key_buffer(layer_id)
+) -> None:
+    """
+    Fill combined_kv_buf[:local_block_size] via a single batched indexed gather.
+
+    This region contains the min-prefix KV tokens that every DP rank already has
+    locally.  The fill is independent of the current layer's hidden-state output,
+    so it can safely run on a separate comm_stream in the pipeline overlap scheme.
+
+    The transfer_block and extend_block are NOT touched by this function.
+    """
+    if info.local_block_size > 0:
+        info.combined_kv_buf[: info.local_block_size] = kv_buf[
+            info.all_local_src_indices
+        ].to(info.combined_kv_buf.dtype)
+
+
+def fill_extend_block_for_layer(
+    info: "SharePrefixBatchInfo",
+    k_nope: torch.Tensor,  # [total_extend_tokens, 1, kv_lora_rank]
+    k_pe: torch.Tensor,    # [total_extend_tokens, 1, qk_rope_head_dim]
+) -> None:
+    """
+    Fill combined_kv_buf[extend_block_start:] from k_nope / k_pe.
+
+    k_nope and k_pe come from the current layer's qkv projection and must
+    therefore run on main_stream after the qkv_proj kernel completes.  They
+    write to the extend_block region, which is disjoint from the local_block
+    and transfer_block regions written by fill_local_block_for_layer and
+    fill_transfer_region_for_layer respectively.
+    """
+    total_extend = k_nope.shape[0]
+    if total_extend > 0:
+        buf_ext = info.combined_kv_buf[info.extend_block_start :]
+        buf_ext[:, 0, : info.kv_lora_rank] = k_nope[:, 0]
+        buf_ext[:, 0, info.kv_lora_rank :] = k_pe[:, 0]
+
+
 def fill_local_and_extend_for_layer(
-    info: SharePrefixBatchInfo,
+    info: "SharePrefixBatchInfo",
     k_nope: torch.Tensor,   # [total_extend_tokens, 1, kv_lora_rank]
     k_pe: torch.Tensor,     # [total_extend_tokens, 1, qk_rope_head_dim]
     kv_buf: torch.Tensor,   # token_to_kv_pool.get_key_buffer(layer_id)
@@ -1049,33 +1183,22 @@ def fill_local_and_extend_for_layer(
     """
     Fill the local_block and extend_block of combined_kv_buf for the current layer.
 
+    Compatibility wrapper that calls fill_local_block_for_layer and
+    fill_extend_block_for_layer sequentially on the current stream.  Used by
+    the legacy synchronous path in _share_prefix_attn_mqa.
+
     local_block  [0 .. local_block_size):
         One batched indexed gather from kv_buf using pre-computed all_local_src_indices.
-        This replaces the per-request loop in the old build_combined_kv_for_layer.
 
     extend_block [extend_block_start .. total_combined):
         Two contiguous writes – one for the k_nope component, one for k_pe.
-        extend_hidden_starts aligns k_nope/k_pe (in max_prefix-based order) with
-        the extend_block positions.
 
     The transfer_block [local_block_size .. extend_block_start) is handled
     separately by reset_transfer_region + fill_transfer_region_for_layer +
     all_reduce, so this function does NOT touch it.
     """
-    dtype = k_nope.dtype
-
-    # ---- local_block ----
-    if info.local_block_size > 0:
-        info.combined_kv_buf[: info.local_block_size] = (
-            kv_buf[info.all_local_src_indices].to(dtype)
-        )
-
-    # ---- extend_block ----
-    total_extend = k_nope.shape[0]
-    if total_extend > 0:
-        buf_ext = info.combined_kv_buf[info.extend_block_start :]
-        buf_ext[:, 0, : info.kv_lora_rank] = k_nope[:, 0]
-        buf_ext[:, 0, info.kv_lora_rank :] = k_pe[:, 0]
+    fill_local_block_for_layer(info, kv_buf)
+    fill_extend_block_for_layer(info, k_nope, k_pe)
 
 
 # ---------------------------------------------------------------------------
@@ -1085,6 +1208,183 @@ def fill_local_and_extend_for_layer(
 def reset_transfer_region(info: SharePrefixBatchInfo) -> None:
     """Zero the transfer_block in combined_kv_buf before each layer's fill + all_reduce."""
     info.combined_kv_buf[info.local_block_size : info.extend_block_start].zero_()
+
+
+# ---------------------------------------------------------------------------
+# Pipeline overlap helpers: Phase A and Phase C
+# ---------------------------------------------------------------------------
+#
+# Helper: KV pool layer membership check
+# ---------------------------------------------------------------------------
+
+
+def _kv_pool_has_layer(token_to_kv_pool, layer_id: int) -> bool:
+    """Return True if token_to_kv_pool contains KV data for layer_id.
+
+    In pipeline-parallel setups each PP rank owns a contiguous sub-range of
+    layers [start_layer, start_layer + len(kv_buffer)).  Phase A must NOT call
+    get_key_buffer() for layers outside this range.
+    """
+    start = token_to_kv_pool.start_layer
+    return start <= layer_id < start + len(token_to_kv_pool.kv_buffer)
+
+
+#
+# Phase A (runs on comm_stream):
+#   reset_transfer_region + fill_transfer_region_for_layer + all_reduce + fill_local_block
+#   Independent of the current layer's hidden-state; can overlap with MLP.
+#
+# Phase C (runs on comm_stream after main_stream signals attn_done):
+#   save_dp_local_kv for the just-finished layer, then Phase A for the next layer.
+#
+# Event flow per layer:
+#   main_stream records attn_done_event  ──►  comm_stream waits, runs Phase C + Phase A(next)
+#   comm_stream records ltr_event        ──►  main_stream waits, runs fill_extend + flash_attn
+
+
+def _launch_phase_a(
+    info: SharePrefixBatchInfo,
+    layer_id: int,
+    kv_buf: torch.Tensor,
+    tp_group,
+    comm_stream: torch.cuda.Stream,
+) -> torch.cuda.Event:
+    """
+    Launch Phase A on comm_stream for the given layer.
+
+    Phase A fills the local_block and (when total_transfer_tokens > 0) also
+    resets / fills / all_reduces the transfer_block.  Both writes are
+    independent of the current batch's hidden-state computation, so they can
+    safely run on comm_stream while main_stream executes MLP or qkv_proj.
+
+    Returns a CUDA Event recorded at the end of Phase A on comm_stream.
+    The caller (or the next layer's _share_prefix_attn_mqa) must call
+        torch.cuda.current_stream().wait_event(returned_event)
+    before issuing fill_extend_block_for_layer / flash_attn.
+
+    Parameters
+    ----------
+    info        : SharePrefixBatchInfo with combined_kv_buf already allocated.
+    layer_id    : transformer layer index (used only for logging).
+    kv_buf      : token_to_kv_pool.get_key_buffer(layer_id).
+    tp_group    : NCCL group for all_reduce.
+    comm_stream : CUDA stream on which to schedule all kernels.
+    """
+    ltr_event = torch.cuda.Event()
+    with torch.cuda.stream(comm_stream):
+        if info.total_transfer_tokens > 0:
+            reset_transfer_region(info)
+            fill_transfer_region_for_layer(info, layer_id, kv_buf)
+            dist.all_reduce(
+                info.combined_kv_buf[info.local_block_size : info.extend_block_start],
+                op=dist.ReduceOp.SUM,
+                group=tp_group.device_group,
+            )
+        fill_local_block_for_layer(info, kv_buf)
+        ltr_event.record(comm_stream)
+
+    logger.debug(
+        "[share_prefix_pipeline] Phase A launched on comm_stream: "
+        "layer=%d xfer_toks=%d local_toks=%d combined_toks=%d stream_id=%d",
+        layer_id,
+        info.total_transfer_tokens,
+        info.local_block_size,
+        sum(info.seq_lens),
+        comm_stream.cuda_stream,
+    )
+    return ltr_event
+
+
+def _launch_phase_c_and_maybe_next_phase_a(
+    info: SharePrefixBatchInfo,
+    layer_id: int,
+    layer,                        # RadixAttention – used for layer_id lookup in save_dp_local_kv
+    out_cache_loc: torch.Tensor,
+    token_to_kv_pool,
+    tp_group,
+    attn_done_event: torch.cuda.Event,
+    next_layer_id: int,           # -1 means last layer (no Phase A follows)
+) -> Optional[torch.cuda.Event]:
+    """
+    Launch Phase C (save_kv for layer_id) and optionally Phase A (for next_layer_id)
+    on info.comm_stream, gated by attn_done_event from main_stream.
+
+    Sequence on comm_stream:
+      1. wait(attn_done_event)         — wait for flash_attn(layer_id) to finish
+      2. save_dp_local_kv(layer_id)    — write transfer + extend KV to out_cache_loc
+      3. if next_layer_id >= 0:
+             Phase A(next_layer_id)    — prefetch next layer's local + transfer KV
+             record ltr_event
+
+    Returns the ltr_event for next_layer_id, or None if next_layer_id < 0.
+
+    Parameters
+    ----------
+    attn_done_event : CUDA Event recorded on main_stream after flash_attn.
+    next_layer_id   : layer_id + 1 for normal layers; -1 for the last layer.
+    """
+    comm_stream = info.comm_stream
+    next_ltr_event: Optional[torch.cuda.Event] = None
+
+    if next_layer_id >= 0:
+        next_ltr_event = torch.cuda.Event()
+
+    with torch.cuda.stream(comm_stream):
+        comm_stream.wait_event(attn_done_event)
+
+        # Phase C: save KV for the just-finished layer
+        save_dp_local_kv(
+            info=info,
+            layer=layer,
+            out_cache_loc=out_cache_loc,
+            token_to_kv_pool=token_to_kv_pool,
+        )
+        logger.debug(
+            "[share_prefix_pipeline] Phase C (save_kv) launched on comm_stream: "
+            "layer=%d dp_local_reqs=%d stream_id=%d",
+            layer_id,
+            len(info.dp_local_req_global_indices),
+            comm_stream.cuda_stream,
+        )
+
+        # Phase A for next layer (if any).
+        # Guard: next_layer_id must be within this PP rank's KV pool.  If it falls
+        # outside (PP boundary), skip Phase A – the next PP rank owns that layer.
+        if next_layer_id >= 0 and not _kv_pool_has_layer(token_to_kv_pool, next_layer_id):
+            logger.debug(
+                "[share_prefix_pipeline] Phase A skipped: next_layer_id=%d is outside "
+                "PP rank KV pool (start=%d len=%d) — treating as last layer",
+                next_layer_id,
+                token_to_kv_pool.start_layer,
+                len(token_to_kv_pool.kv_buffer),
+            )
+            next_layer_id = -1     # demote to last-layer path
+            next_ltr_event = None  # discard the pre-allocated event
+
+        if next_layer_id >= 0:
+            next_kv_buf = token_to_kv_pool.get_key_buffer(next_layer_id)
+            if info.total_transfer_tokens > 0:
+                reset_transfer_region(info)
+                fill_transfer_region_for_layer(info, next_layer_id, next_kv_buf)
+                dist.all_reduce(
+                    info.combined_kv_buf[
+                        info.local_block_size : info.extend_block_start
+                    ],
+                    op=dist.ReduceOp.SUM,
+                    group=tp_group.device_group,
+                )
+            fill_local_block_for_layer(info, next_kv_buf)
+            next_ltr_event.record(comm_stream)
+            logger.debug(
+                "[share_prefix_pipeline] Phase A (next layer) launched on comm_stream: "
+                "next_layer=%d xfer_toks=%d local_toks=%d stream_id=%d",
+                next_layer_id,
+                info.total_transfer_tokens,
+                info.local_block_size,
+                comm_stream.cuda_stream,
+            )
+
+    return next_ltr_event
 
 
 # ---------------------------------------------------------------------------

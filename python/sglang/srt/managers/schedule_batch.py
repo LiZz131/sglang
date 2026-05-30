@@ -99,6 +99,32 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Module-level comm_stream for share-prefix pipeline overlap
+# ---------------------------------------------------------------------------
+# One stream per (device, stream_index) – created lazily, reused across batches
+# to avoid the overhead of torch.cuda.Stream() on every batch.
+
+_SHARE_PREFIX_COMM_STREAMS: dict = {}
+
+
+def _get_or_create_share_prefix_comm_stream(
+    device: torch.device,
+    stream_index: int = 0,
+) -> "torch.cuda.Stream":
+    """Return a persistent CUDA stream for share-prefix communication overlap.
+
+    The stream is created once per (device, stream_index) and cached for the
+    lifetime of the process.  Pass stream_index > 0 if you need multiple
+    independent comm streams for the same device.
+    """
+    key = (str(device), stream_index)
+    if key not in _SHARE_PREFIX_COMM_STREAMS:
+        with torch.cuda.device(device):
+            _SHARE_PREFIX_COMM_STREAMS[key] = torch.cuda.Stream()
+    return _SHARE_PREFIX_COMM_STREAMS[key]
+
+
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
         self.is_error = is_error
@@ -1811,6 +1837,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.share_prefix_info.total_transfer_tokens,
                     len(reqs),
                 )
+                # Inject a dedicated comm_stream for pipeline overlap when the
+                # flag is set.  A module-level stream is created once per
+                # (device, index) and reused across batches to avoid overhead.
+                if server_args.enable_share_prefix_pipeline_overlap:
+                    _comm_stream = _get_or_create_share_prefix_comm_stream(self.device)
+                    self.share_prefix_info.set_pipeline_comm_stream(_comm_stream)
+                    logger.debug(
+                        "[share_prefix_pipeline] pipeline overlap enabled, "
+                        "comm_stream=%d on device=%s",
+                        _comm_stream.cuda_stream,
+                        self.device,
+                    )
             else:
                 logger.debug("[share_prefix] share_prefix_info is None (trivial transfer).")
         else:

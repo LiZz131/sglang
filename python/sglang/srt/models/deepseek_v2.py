@@ -4823,15 +4823,23 @@ class DeepseekV2AttentionMLA(nn.Module):
         """
         Share-prefix MLA attention for split_prefill special DP attention.
 
-        Data flow per layer
-        -------------------
-        1. Lazily allocate transfer_buffer (first layer only).
-        2. Zero transfer_buffer.
-        3. fill_transfer_buffer_for_layer: max_rank + attn_tp_rank==0 copies
-           KV[min_prefix : max_prefix] into transfer_buffer; others leave zeros.
-        4. all_reduce(transfer_buffer) – every rank now holds complete transfer KV.
-        5. build_combined_kv_for_layer: combined_kv = [local_prefix | transfer | extend].
-        6. Call flash_attn_with_kvcache with combined_kv as the paged KV cache.
+        Two execution modes, selected by info.comm_stream:
+
+        Synchronous (comm_stream is None)
+        ----------------------------------
+        Each layer runs sequentially: reset/fill_xfer/all_reduce →
+        fill_local/fill_extend → flash_attn → save_kv.
+
+        Pipelined (comm_stream is not None)
+        ------------------------------------
+        Phase A (comm_stream): reset/fill_xfer/all_reduce/fill_local for layer i+1
+          is overlapped with MLP(i) + qkv_proj(i+1) on main_stream.
+        Phase B (main_stream): fill_extend(i+1) + flash_attn(i+1).
+        Phase C (comm_stream): save_kv(i), then Phase A(i+1).
+
+        Event flow:
+          main_stream records attn_done_event  →  comm_stream starts Phase C+A
+          comm_stream records ltr_event        →  main_stream can run flash_attn
 
         Returns
         -------
@@ -4842,6 +4850,9 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         from sglang.srt.distributed.parallel_state import get_tp_group
         from sglang.srt.multiplex.share_prefix_helper import (
+            _launch_phase_a,
+            _launch_phase_c_and_maybe_next_phase_a,
+            fill_extend_block_for_layer,
             fill_local_and_extend_for_layer,
             fill_transfer_region_for_layer,
             reset_transfer_region,
@@ -4863,6 +4874,119 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
         kv_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)
+        tp_group = get_tp_group()
+        layer = self.attn_mqa_normal_tp
+
+        # ======================================================================
+        # PIPELINED PATH
+        # ======================================================================
+        if info.comm_stream is not None:
+            # ---- Phase A: ensure local+transfer blocks are ready ----
+            # For the first layer (no prior Phase A), launch it now on comm_stream.
+            # For subsequent layers, _pending_ltr_event was recorded by the previous
+            # layer's Phase C+A work on comm_stream.
+            if info._pending_ltr_event is None:
+                logger.debug(
+                    "[share_prefix_pipeline] layer=%d: first layer, "
+                    "launching Phase A immediately on comm_stream",
+                    layer_id,
+                )
+                with share_prefix_nvtx_range(info, layer_id, "phase_a_comm", elem_size=elem_size):
+                    ltr_event = _launch_phase_a(
+                        info, layer_id, kv_buf, tp_group, info.comm_stream
+                    )
+            else:
+                ltr_event = info._pending_ltr_event
+
+            # main_stream waits for comm_stream's Phase A to finish.
+            # This is a CUDA stream dependency (not a Python block): kernel
+            # launches after this point are queued but won't execute until
+            # the event is satisfied.
+            torch.cuda.current_stream().wait_event(ltr_event)
+
+            # ---- Phase B: fill extend + flash_attn (main_stream) ----
+            with share_prefix_nvtx_range(info, layer_id, "phase_b_extend", elem_size=elem_size):
+                fill_extend_block_for_layer(info, k_nope, k_pe)
+
+            combined_kv_paged = info.combined_kv_buf.unsqueeze(1)
+            k_rope_c = combined_kv_paged[:, :, :, self.kv_lora_rank :]
+            c_kv_c = combined_kv_paged[:, :, :, : self.kv_lora_rank]
+
+            metadata = forward_batch.attn_backend.forward_metadata
+            cu_seqlens_q = metadata.cu_seqlens_q
+            max_seqlen_q = metadata.max_seq_len_q
+
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[share_prefix_pipeline] layer=%d flash_attn: q_pe=%s "
+                    "q_nope_out=%s combined=%s page_table=%s",
+                    layer_id,
+                    tuple(q_pe.shape), tuple(q_nope_out.shape),
+                    tuple(info.combined_kv_buf.shape),
+                    tuple(info.page_table_cached.shape),
+                )
+
+            with share_prefix_nvtx_range(info, layer_id, "flash_attn", elem_size=elem_size):
+                result = flash_attn_with_kvcache(
+                    q=q_pe,
+                    k_cache=k_rope_c,
+                    v_cache=c_kv_c,
+                    qv=q_nope_out,
+                    page_table=info.page_table_cached,
+                    cache_seqlens=info.cache_seqlens_tensor,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=info.cu_seqlens_k_new_tensor,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    softcap=layer.logit_cap,
+                )
+
+            # Record attn_done on main_stream; comm_stream will wait for it
+            # before starting save_kv (Phase C).
+            attn_done_event = torch.cuda.Event()
+            attn_done_event.record()  # records on torch.cuda.current_stream()
+
+            is_last = layer_id == info.pipeline_last_layer_id
+            next_layer_id = -1 if is_last else layer_id + 1
+
+            # ---- Phase C + next Phase A (comm_stream, async) ----
+            with share_prefix_nvtx_range(info, layer_id, "phase_c_launch", elem_size=elem_size):
+                next_ltr_event = _launch_phase_c_and_maybe_next_phase_a(
+                    info=info,
+                    layer_id=layer_id,
+                    layer=layer,
+                    out_cache_loc=forward_batch.out_cache_loc,
+                    token_to_kv_pool=forward_batch.token_to_kv_pool,
+                    tp_group=tp_group,
+                    attn_done_event=attn_done_event,
+                    next_layer_id=next_layer_id,
+                )
+
+            info._pending_ltr_event = next_ltr_event
+
+            # For the last layer, drain comm_stream before returning so that
+            # save_kv completes before any downstream op reads the KV pool.
+            if is_last:
+                torch.cuda.current_stream().wait_stream(info.comm_stream)
+                logger.debug(
+                    "[share_prefix_pipeline] drained comm_stream at last_layer=%d",
+                    layer_id,
+                )
+
+            logger.info(
+                "[share_prefix_pipeline] layer=%d pipeline step done "
+                "(is_last=%s dp_local_reqs=%d total_transfer=%d)",
+                layer_id, is_last,
+                len(info.dp_local_req_global_indices),
+                info.total_transfer_tokens,
+            )
+
+            return result.view(-1, self.tp_num_heads * self.kv_lora_rank)
+
+        # ======================================================================
+        # SYNCHRONOUS PATH (original, unchanged)
+        # ======================================================================
 
         # ---- 2. Fill + all-reduce transfer_block (skip when nothing to transfer) ----
         if info.total_transfer_tokens > 0:
@@ -4876,7 +5000,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                         info.local_block_size : info.extend_block_start
                     ],
                     op=dist.ReduceOp.SUM,
-                    group=get_tp_group().device_group,
+                    group=tp_group.device_group,
                 )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -4907,8 +5031,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         metadata = forward_batch.attn_backend.forward_metadata
         cu_seqlens_q = metadata.cu_seqlens_q
         max_seqlen_q = metadata.max_seq_len_q
-
-        layer = self.attn_mqa_normal_tp
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -5760,6 +5882,17 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = self.first_k_dense_replace
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
+        # Pipeline overlap: initialise per-forward state before the layer loop.
+        # force_reset=True because the regular (non-split) forward always starts a
+        # brand-new pass; there is no prior sub-forward that may have left a valid
+        # _pending_ltr_event.  pp_last_layer_id = self.end_layer - 1 (PP boundary).
+        _sp_info = getattr(forward_batch, "share_prefix_info", None)
+        if _sp_info is not None and _sp_info.comm_stream is not None:
+            _sp_info.init_pipeline_state_for_forward(
+                pp_last_layer_id=self.end_layer - 1,
+                force_reset=True,
+            )
+
         aux_hidden_states = []
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
@@ -6013,8 +6146,25 @@ class DeepseekV2ForCausalLM(nn.Module):
         # Layers that this rank owns and fall in [start, end)
         layer_start = max(start, self.model.start_layer)
         layer_end = min(end, self.model.end_layer)
-        # TODO(lbz): remove this after debugging, for checking the kv cache type
-        # forward batch kv cache: <sglang.srt.mem_cache.memory_pool.MLATokenToKVPool object at 0x7c9f5015d0a0>
+
+        # Pipeline overlap init: called once per sub-forward.
+        # init_pipeline_state_for_forward() only resets _pending_ltr_event on the
+        # FIRST sub-forward (pipeline_initialized == False); subsequent sub-forwards
+        # inherit the event so Phase A work started at the tail of the previous chunk
+        # is correctly awaited by this chunk without a double-launch.
+        _sp_info = getattr(forward_batch, "share_prefix_info", None)
+        if _sp_info is not None and _sp_info.comm_stream is not None and layer_start < layer_end:
+            _sp_info.init_pipeline_state_for_forward(
+                pp_last_layer_id=self.model.end_layer - 1,
+            )
+            logger.debug(
+                "[share_prefix_pipeline] split_prefill chunk [%d, %d) on pp_layers=[%d, %d) "
+                "last_layer=%d pending_ltr=%s",
+                start, end, layer_start, layer_end,
+                _sp_info.pipeline_last_layer_id,
+                _sp_info._pending_ltr_event is not None,
+            )
+
         if layer_start < layer_end:
             device = forward_batch.hidden_states.device
             num_layers_this_chunk = layer_end - layer_start
