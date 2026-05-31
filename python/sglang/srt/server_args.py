@@ -645,6 +645,9 @@ class ServerArgs:
     enable_save_kv_cache_for_dp: bool = False
     enable_special_dp_attention_prefix_0: bool = False
     enable_share_prefix_for_special_dp_attention: bool = False
+    # Fall back to MHA (prefix-0) when the prefix benefit is low
+    enable_share_prefix_fall_mha: bool = False
+    share_prefix_fallback_mha_threshold: float = 0.5
     enable_share_prefix_nvtx: bool = False
     share_prefix_nvtx_layer_stride: int = 1
     enable_share_prefix_pipeline_overlap: bool = False
@@ -4626,6 +4629,24 @@ class ServerArgs:
             "--enable-share-prefix-for-special-dp-attention",
             action="store_true",
             help="Enable share prefix across DP ranks for special dp attention.",
+        )
+        parser.add_argument(
+            "--enable-share-prefix-fall-mha",
+            action="store_true",
+            help=(
+                "Fall back to MHA (prefix-0 treatment) for batches where the prefix "
+                "benefit is low (see --share-prefix-fallback-mha-threshold)."
+            ),
+        )
+        parser.add_argument(
+            "--share-prefix-fallback-mha-threshold",
+            type=float,
+            default=ServerArgs.share_prefix_fallback_mha_threshold,
+            help=(
+                "Ratio threshold for MHA fallback: if "
+                "sum(max_prefix)/sum(seq_lens) < threshold, fall back to MHA. "
+                "Effective only when --enable-share-prefix-fall-mha is set."
+            ),
         )
         parser.add_argument(
             "--enable-share-prefix-nvtx",

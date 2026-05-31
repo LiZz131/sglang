@@ -1312,6 +1312,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     dp_local_orig_seq_lens: Optional[torch.Tensor] = None
     dp_local_prefix_lens: Optional[List[int]] = None
     dp_local_extend_lens: Optional[List[int]] = None
+    # MHA fallback: per-dp-local-req kv_a slice boundaries (set when _mha_fallback=True)
+    dp_local_kv_save_starts: Optional[List[int]] = None
+    dp_local_kv_save_ends: Optional[List[int]] = None
 
     # Stream
     has_stream: bool = False
@@ -1498,12 +1501,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             and _server_args.enable_share_prefix_for_special_dp_attention
         )
         _gathered_prefix_data = None  # cached for compute_share_prefix_info below
+        _mha_fallback = False         # True when share-prefix is bypassed this batch
         if _share_prefix_active and len(reqs) > 0:
             from sglang.srt.distributed.parallel_state import get_tp_group
             from sglang.srt.multiplex.share_prefix_helper import gather_prefix_data
             _gathered_prefix_data = gather_prefix_data(
-                reqs, get_tp_group(), self.device
+                reqs, get_tp_group().cpu_group, self.device
             )
+
+            # Per-batch MHA fallback: if the prefix ratio is below the threshold,
+            # skip share-prefix entirely and fall back to prefix-0 (MHA) for this
+            # batch.  The decision is made after the all-gather so that
+            # sum(max_prefix) is globally consistent across all TP/DP ranks.
+            if _server_args.enable_share_prefix_fall_mha:
+                _seq_lens_sum = sum(len(r.fill_ids) for r in reqs)
+                _max_prefix_sum = sum(_gathered_prefix_data.max_prefix_list)
+                _ratio = _max_prefix_sum / _seq_lens_sum if _seq_lens_sum > 0 else 0.0
+                _threshold = _server_args.share_prefix_fallback_mha_threshold
+                if _ratio < _threshold:
+                    logger.info(
+                        "[share_prefix] MHA fallback triggered: "
+                        "max_prefix_ratio=%.3f < threshold=%.3f — skipping share-prefix",
+                        _ratio, _threshold,
+                    )
+                    _gathered_prefix_data = None
+                    _mha_fallback = True
 
         # Init tensors
         # When share-prefix is active, input_ids uses max_prefix (not local_prefix)
@@ -1513,6 +1535,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # KV-allocation fields (dp_local_prefix_lens / dp_local_extend_lens) keep
         # local_prefix as base because they must allocate space for both the
         # transfer region AND the true extend region.
+        # When MHA fallback is active, we treat all requests as prefix-0 (extend =
+        # full seq_len) so that every TP rank processes the same token count.
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         if _gathered_prefix_data is not None:
@@ -1524,6 +1548,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 "[share_prefix] prepare_for_extend: input_ids adjusted to max_prefix; "
                 "max_prefix=%s extend_lens=%s",
                 _max_prefix, extend_lens,
+            )
+        elif _mha_fallback:
+            # prefix-0 treatment: full sequence as extend, globally consistent across
+            # all TP/DP ranks.  The locally-cached prefix KV is already in the pool
+            # and will be re-used by the decoder; we only save the new tokens.
+            input_ids = [r.fill_ids for r in reqs]
+            prefix_lens = [0] * len(reqs)
+            extend_lens = list(seq_lens)
+            logger.info(
+                "[share_prefix] MHA fallback: prefix-0 treatment, extend_lens=%s",
+                extend_lens,
             )
         else:
             input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
@@ -1600,6 +1635,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_local_extend_num_tokens = self.dp_local_token_end - self.dp_local_token_start
             logger.info(f"dp_local_token_start: {self.dp_local_token_start}, dp_local_token_end: {self.dp_local_token_end}, dp_local_extend_num_tokens: {dp_local_extend_num_tokens}")
             self.dp_local_req_indices = [i for i, req in enumerate(reqs) if req.decode_dp_rank is not None and req.decode_dp_rank == self.dp_rank]
+
+            # MHA fallback: precompute per-request kv_a slice boundaries.
+            # In prefix-0 mode, kv_a has shape [sum(seq_lens), kv_dim].
+            # For each dp-local req, we only need to SAVE tokens [local_prefix, seq_len)
+            # since [0, local_prefix) is already in the KV pool from a previous pass.
+            self.dp_local_kv_save_starts = None
+            self.dp_local_kv_save_ends = None
+            if _mha_fallback:
+                starts, ends = [], []
+                offset = 0
+                for req in reqs:
+                    L = len(req.fill_ids)         # seq_len (= extend in prefix-0)
+                    P = len(req.prefix_indices)   # local_prefix (already in pool)
+                    if (
+                        req.decode_dp_rank is not None
+                        and req.decode_dp_rank == self.dp_rank
+                    ):
+                        starts.append(offset + P)  # skip cached prefix tokens
+                        ends.append(offset + L)
+                    offset += L
+                self.dp_local_kv_save_starts = starts
+                self.dp_local_kv_save_ends = ends
+                logger.info(
+                    "[share_prefix] MHA fallback: dp_local_kv_save_starts=%s ends=%s",
+                    starts, ends,
+                )
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
             r.dimensions is not None for r in reqs
@@ -1818,6 +1879,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if (
             server_special_dp_attention
             and server_args.enable_share_prefix_for_special_dp_attention
+            and not _mha_fallback  # skip when this batch has fallen back to MHA
         ):
             from sglang.srt.distributed.parallel_state import get_tp_group
             from sglang.srt.multiplex.share_prefix_helper import compute_share_prefix_info
@@ -2428,6 +2490,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_local_token_start=self.dp_local_token_start,
             dp_local_token_end=self.dp_local_token_end,
             share_prefix_info=self.share_prefix_info,
+            dp_local_kv_save_starts=self.dp_local_kv_save_starts,
+            dp_local_kv_save_ends=self.dp_local_kv_save_ends,
         )
 
     def copy(self):
@@ -2506,6 +2570,9 @@ class ModelWorkerBatch:
     dp_local_token_end: Optional[int]
     # share prefix across DP ranks (SharePrefixBatchInfo | None)
     share_prefix_info: Optional[Any]
+    # MHA fallback: per-dp-local-req kv_a slice boundaries (None = standard path)
+    dp_local_kv_save_starts: Optional[List[int]]
+    dp_local_kv_save_ends: Optional[List[int]]
 
     # For extend
     extend_num_tokens: Optional[int]

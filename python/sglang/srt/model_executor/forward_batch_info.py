@@ -302,6 +302,9 @@ class ForwardBatch:
     dp_local_token_end: Optional[int] = None
     # for share prefix across DP ranks (SharePrefixBatchInfo | None)
     share_prefix_info: Optional[Any] = None
+    # MHA fallback: per-dp-local-req kv_a slice boundaries (None = standard path)
+    dp_local_kv_save_starts: Optional[List[int]] = None
+    dp_local_kv_save_ends: Optional[List[int]] = None
 
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether the kv cache needs to be attended in current pass
@@ -455,6 +458,8 @@ class ForwardBatch:
             dp_local_token_start=batch.dp_local_token_start,
             dp_local_token_end=batch.dp_local_token_end,
             share_prefix_info=getattr(batch, "share_prefix_info", None),
+            dp_local_kv_save_starts=getattr(batch, "dp_local_kv_save_starts", None),
+            dp_local_kv_save_ends=getattr(batch, "dp_local_kv_save_ends", None),
         )
         device = model_runner.device
 

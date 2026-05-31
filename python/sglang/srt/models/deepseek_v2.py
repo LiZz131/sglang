@@ -3175,13 +3175,18 @@ class DeepseekV2AttentionMLA(nn.Module):
             and self.enable_pdmux
             and forward_batch.forward_mode.is_split_prefill()
         ):
-            if get_global_server_args().enable_share_prefix_for_special_dp_attention:
+            if (
+                get_global_server_args().enable_share_prefix_for_special_dp_attention
+                and getattr(forward_batch, "share_prefix_info", None) is not None
+            ):
                 # share-prefix split_prefill must always use the MLA path so that
                 # _share_prefix_attn_mqa is invoked.  The FA3/FlashInfer backend may
                 # dispatch to MHA_ONE_SHOT or MHA_CHUNKED_KV when
                 # sum(extend_prefix_lens) >= chunked_prefix_cache_threshold because
                 # share-prefix sets prefix_lens = max_prefix (which is large).
                 # We override that decision here unconditionally.
+                # NOTE: when share_prefix_info is None (MHA fallback), we do NOT
+                # force MLA — the backend's decision is correct for that batch.
                 if result != AttnForwardMethod.MLA:
                     logger.debug(
                         "[share_prefix] dispatch: split_prefill backend chose %s "
@@ -4776,9 +4781,29 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
-            # Save latent cache
-            # slice kv_a and k_pe according to forward_batch.dp_local_token_start and forward_batch.dp_local_token_end
-            # out_cache_loc has been sliced
+            # MHA fallback path: kv_a covers the full seq (prefix-0 treatment).
+            # Each dp-local req's save range is precomputed as [start, end) in kv_a,
+            # skipping the first local_prefix tokens that are already in the KV pool.
+            if getattr(forward_batch, "dp_local_kv_save_starts", None) is not None:
+                out_ptr = 0
+                for start, end in zip(
+                    forward_batch.dp_local_kv_save_starts,
+                    forward_batch.dp_local_kv_save_ends,
+                ):
+                    n = end - start
+                    if n > 0:
+                        forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                            self.attn_mha,
+                            forward_batch.out_cache_loc[out_ptr : out_ptr + n],
+                            kv_a[start:end].unsqueeze(1),
+                            k_pe[start:end],
+                        )
+                    out_ptr += n
+                return
+
+            # Standard path (prefix-0 with local_prefix=0, or plain special-dp-attn).
+            # kv_a and k_pe are indexed by dp_local_token_start/end which correspond
+            # to the contiguous dp-local token block in the flat extend tensor.
             local_tok_n = forward_batch.dp_local_token_end - forward_batch.dp_local_token_start
             oc_n = forward_batch.out_cache_loc.shape[0]
             if oc_n != local_tok_n:
