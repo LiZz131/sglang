@@ -651,6 +651,8 @@ class ServerArgs:
     enable_share_prefix_nvtx: bool = False
     share_prefix_nvtx_layer_stride: int = 1
     enable_share_prefix_pipeline_overlap: bool = False
+    # Grow-only scratch buffers for split-prefill big tensors (bmm / flash / moe)
+    enable_prefill_scratch_pool: bool = False
     auto_adjust_stream_group: bool = True
     manual_stream_group_idx: int = 0
     # PD-Multiplexing time model (special-DP event loop): choose stream group by predicted decode run
@@ -4666,6 +4668,15 @@ class ServerArgs:
                 "Overlap share-prefix all_reduce + fill_local (comm_stream) with "
                 "MLP computation (main_stream) using CUDA events. "
                 "Requires enable_share_prefix_for_special_dp_attention=True."
+            ),
+        )
+        parser.add_argument(
+            "--enable-prefill-scratch-pool",
+            action="store_true",
+            help=(
+                "Use grow-only persistent scratch buffers for split-prefill big "
+                "tensor allocations (q_nope bmm, flash_attn out, fused_moe cache). "
+                "Disabled during CUDA graph capture and piecewise CUDA graph."
             ),
         )
         parser.add_argument(

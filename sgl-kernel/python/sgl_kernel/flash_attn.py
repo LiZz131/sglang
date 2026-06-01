@@ -68,6 +68,7 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
+    out=None,
     ver=3,
 ):
     """
@@ -227,7 +228,7 @@ def flash_attn_with_kvcache(
         k,
         v,
         qv,
-        None,  # out
+        out,
         cu_seqlens_q,
         None,  # cu_seqlens_k
         cu_seqlens_k_new,

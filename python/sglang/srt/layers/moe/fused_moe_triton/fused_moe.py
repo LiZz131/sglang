@@ -373,11 +373,22 @@ def fused_experts_impl(
         min(M * topk, E + 1) * (max_block_m - 1) if down_moe_use_tma else 0
     )
     total_tokens = M * topk + max_padded_tokens
-    cache = torch.empty(
-        total_tokens * max(N, w2.shape[1]),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
+    cache_numel = total_tokens * max(N, w2.shape[1])
+    pool = None
+    try:
+        from sglang.srt.utils.prefill_scratch_pool import PrefillScratchBufferPool
+
+        pool = PrefillScratchBufferPool.get_active()
+    except Exception:
+        pool = None
+    if pool is not None:
+        cache = pool.acquire_moe_1d(cache_numel)
+    else:
+        cache = torch.empty(
+            cache_numel,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
     intermediate_cache3 = cache[: M * topk * w2.shape[1]].view(
         (M, topk, w2.shape[1]),
     )

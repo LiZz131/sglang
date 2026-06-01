@@ -165,6 +165,10 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.prefill_scratch_pool import (
+    PrefillScratchBufferPool,
+    compute_scratch_requirements,
+)
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -3908,7 +3912,16 @@ class DeepseekV2AttentionMLA(nn.Module):
             # q_nope: torch.Size([9, 64, 128])
             # w_kc: torch.Size([128, 128, 512]), w_kc_normal_tp: torch.Size([128, 64, 512])
             if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
-                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc_normal_tp)
+                q_bmm = q_nope.transpose(0, 1)
+                pool = forward_batch.prefill_scratch_pool
+                if pool is not None and PrefillScratchBufferPool.enabled(forward_batch):
+                    bmm_out = pool.acquire_attn_bmm(
+                        (q_bmm.shape[0], q_bmm.shape[1], self.w_kc_normal_tp.shape[2])
+                    )
+                    torch.bmm(q_bmm, self.w_kc_normal_tp, out=bmm_out)
+                    q_nope_out = bmm_out
+                else:
+                    q_nope_out = torch.bmm(q_bmm, self.w_kc_normal_tp)
             else:
                 q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
@@ -4952,6 +4965,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
 
             with share_prefix_nvtx_range(info, layer_id, "flash_attn", elem_size=elem_size):
+                pool = forward_batch.prefill_scratch_pool
+                flash_out = None
+                if pool is not None and PrefillScratchBufferPool.enabled(forward_batch):
+                    flash_out = pool.acquire_flash_out(
+                        (q_pe.shape[0], q_pe.shape[1], self.kv_lora_rank)
+                    )
                 result = flash_attn_with_kvcache(
                     q=q_pe,
                     k_cache=k_rope_c,
@@ -4965,6 +4984,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     softmax_scale=layer.scaling,
                     causal=True,
                     softcap=layer.logit_cap,
+                    out=flash_out,
                 )
 
             # Record attn_done on main_stream; comm_stream will wait for it
@@ -5073,6 +5093,12 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
 
         with share_prefix_nvtx_range(info, layer_id, "flash_attn", elem_size=elem_size):
+            pool = forward_batch.prefill_scratch_pool
+            flash_out = None
+            if pool is not None and PrefillScratchBufferPool.enabled(forward_batch):
+                flash_out = pool.acquire_flash_out(
+                    (q_pe.shape[0], q_pe.shape[1], self.kv_lora_rank)
+                )
             result = flash_attn_with_kvcache(
                 q=q_pe,
                 k_cache=k_rope_c,
@@ -5086,6 +5112,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 softmax_scale=layer.scaling,
                 causal=True,
                 softcap=layer.logit_cap,
+                out=flash_out,
             )
 
         # ---- 5. Save KV for dp-local requests ----
@@ -6220,34 +6247,45 @@ class DeepseekV2ForCausalLM(nn.Module):
                     scaling_beta=self.model.llama_4_scaling_config["beta"],
                     positions=positions,
                 )
-            for i in range(layer_start, layer_end):
-                # logger.info(f"prefill layer {i} forward, start={layer_start}, end={layer_end}")
-                layer_gpu_handle = nvtx.range_start(f"{layer_start} : {layer_end} prefill layer {i} launch, start={layer_start}, end={layer_end}")
-                with get_global_expert_distribution_recorder().with_current_layer(i):
-                    layer = self.model.layers[i]
-                    forward_batch.hidden_states, forward_batch.residual = layer(
-                        positions,
-                        forward_batch.hidden_states,
-                        forward_batch,
-                        forward_batch.residual,
-                        zero_allocator,
-                        gemm_output_zero_allocator,
-                        llama_4_scaling,
-                    )
-                    logger.debug(f"causal split prefill, layer {i}, hidden_states: {forward_batch.hidden_states.shape}, residual: {forward_batch.residual.shape if forward_batch.residual is not None else None}")
-                    _debug_save_layer_hidden_if_enabled(
-                        "split_prefill",
-                        i,
-                        "layer_out",
-                        forward_batch.hidden_states,
-                        forward_batch.residual,
-                        forward_batch,
-                        input_ids,
-                        positions,
-                        split_interval=split_interval,
-                    )
+            num_tokens = forward_batch.hidden_states.shape[0]
+            attn_numel, moe_numel = compute_scratch_requirements(
+                self.model, layer_start, num_tokens
+            )
+            with PrefillScratchBufferPool.binding(
+                forward_batch,
+                device,
+                forward_batch.hidden_states.dtype,
+                attn_numel=attn_numel,
+                moe_numel=moe_numel,
+            ):
+                for i in range(layer_start, layer_end):
+                    # logger.info(f"prefill layer {i} forward, start={layer_start}, end={layer_end}")
+                    layer_gpu_handle = nvtx.range_start(f"{layer_start} : {layer_end} prefill layer {i} launch, start={layer_start}, end={layer_end}")
+                    with get_global_expert_distribution_recorder().with_current_layer(i):
+                        layer = self.model.layers[i]
+                        forward_batch.hidden_states, forward_batch.residual = layer(
+                            positions,
+                            forward_batch.hidden_states,
+                            forward_batch,
+                            forward_batch.residual,
+                            zero_allocator,
+                            gemm_output_zero_allocator,
+                            llama_4_scaling,
+                        )
+                        logger.debug(f"causal split prefill, layer {i}, hidden_states: {forward_batch.hidden_states.shape}, residual: {forward_batch.residual.shape if forward_batch.residual is not None else None}")
+                        _debug_save_layer_hidden_if_enabled(
+                            "split_prefill",
+                            i,
+                            "layer_out",
+                            forward_batch.hidden_states,
+                            forward_batch.residual,
+                            forward_batch,
+                            input_ids,
+                            positions,
+                            split_interval=split_interval,
+                        )
 
-                nvtx.range_end(layer_gpu_handle)
+                    nvtx.range_end(layer_gpu_handle)
         if end == self.model.num_hidden_layers and self.pp_group.is_last_rank:
             if forward_batch.residual is None:
                 hidden_states = self.model.norm(forward_batch.hidden_states)
