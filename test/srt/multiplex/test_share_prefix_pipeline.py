@@ -22,7 +22,7 @@ from sglang.srt.multiplex.share_prefix_helper import (
     SharePrefixBatchInfo,
     _launch_phase_a,
     _launch_phase_c_and_maybe_next_phase_a,
-    clear_persistent_combined_kv_buf,
+    clear_persistent_share_prefix_bufs,
     fill_extend_block_for_layer,
     fill_local_and_extend_for_layer,
     fill_local_block_for_layer,
@@ -223,7 +223,7 @@ class TestFillLocalBlockForLayer:
     """fill_local_block_for_layer writes only the local_block region."""
 
     def setup_method(self):
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
 
     def test_local_block_values(self):
         info, kv_buf, _, _ = _standard_batch()
@@ -260,7 +260,7 @@ class TestFillLocalBlockForLayer:
 
     def test_empty_local_block(self):
         """When local_block_size == 0 the function is a no-op."""
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
         info = _make_info(
             seq_lens=[5], local_prefix=[0], min_prefix=[0], max_prefix=[3],
             max_rank=[0], local_dp_rank=1, local_attn_tp_rank=0,
@@ -282,7 +282,7 @@ class TestFillExtendBlockForLayer:
     """fill_extend_block_for_layer writes only the extend_block region."""
 
     def setup_method(self):
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
 
     def test_extend_nope_values(self):
         info, _, k_nope, k_pe = _standard_batch()
@@ -325,12 +325,12 @@ class TestFillExtendBlockForLayer:
         fill_local_block + fill_extend_block together should produce the same
         result as fill_local_and_extend_for_layer.
         """
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
         info_split, kv_buf, k_nope, k_pe = _standard_batch()
         fill_local_block_for_layer(info_split, kv_buf)
         fill_extend_block_for_layer(info_split, k_nope, k_pe)
 
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
         info_combined, kv_buf2, k_nope2, k_pe2 = _standard_batch()
         # pre-fill transfer block the same way
         info_combined.combined_kv_buf[
@@ -360,11 +360,11 @@ class TestLaunchPhaseA:
     """
 
     def setup_method(self):
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
         torch.cuda.empty_cache()
 
     def _cuda_batch(self):
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
         info, kv_buf, k_nope, k_pe = _standard_batch(device=_TEST_CUDA_DEVICE)
         # Remove the pre-filled transfer block (Phase A will reset it)
         info.combined_kv_buf.zero_()
@@ -445,7 +445,7 @@ class TestPipelineEventLifecycle:
     """
 
     def setup_method(self):
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
         torch.cuda.empty_cache()
 
     def _make_minimal_info(self):
@@ -454,7 +454,7 @@ class TestPipelineEventLifecycle:
         Allocates combined_kv_buf directly to avoid the persistent buffer's
         large minimum capacity which can cause OOM on memory-constrained GPUs.
         """
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
         kv_cache_dim, kv_lora_rank = 4, 3
         info = _make_info(
             seq_lens=[6], local_prefix=[2], min_prefix=[2], max_prefix=[2],
@@ -490,6 +490,8 @@ class TestPipelineEventLifecycle:
             layer_id = 0
 
         class _FakeKVPool:
+            start_layer = 0
+            kv_buffer = [kv_buf] * 3   # layers 0, 1, 2 – same tensor, for _kv_pool_has_layer
             def get_key_buffer(self, layer_id):
                 return kv_buf
             def set_mla_kv_buffer(self, *args, **kwargs):
@@ -559,7 +561,7 @@ class TestPipelineMatchesSynchronous:
     """
 
     def setup_method(self):
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
         torch.cuda.empty_cache()
 
     def test_combined_kv_buf_matches_sync(self):
@@ -605,7 +607,7 @@ class TestPipelineMatchesSynchronous:
         independent of what Phase A does (Phase A does not write to extend_block).
         """
         device = _TEST_CUDA_DEVICE
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
         info, kv_buf, k_nope, k_pe = _standard_batch(device)
         info.total_transfer_tokens = 0
         info.combined_kv_buf.zero_()
@@ -631,7 +633,7 @@ class TestPipelineMatchesSynchronous:
         (simulates flash_attn reading from combined_kv_buf after the dependency).
         """
         device = _TEST_CUDA_DEVICE
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
         info, kv_buf, k_nope, k_pe = _standard_batch(device)
         info.total_transfer_tokens = 0
         info.combined_kv_buf.zero_()
@@ -649,3 +651,212 @@ class TestPipelineMatchesSynchronous:
         assert buf[0, 0, 0].item() == pytest.approx(0.0)
         # Slot 2: kv_buf[all_local_src_indices[2]] = kv_buf[10] → 10.0
         assert buf[2, 0, 0].item() == pytest.approx(10.0)
+
+# ---------------------------------------------------------------------------
+# 6. TestPipelineInitForSplitPrefill
+# ---------------------------------------------------------------------------
+
+class TestPipelineInitForSplitPrefill:
+    """
+    Unit tests for SharePrefixBatchInfo.init_pipeline_state_for_forward() and
+    the _kv_pool_has_layer() guard, covering:
+      - first / subsequent sub-forward init behaviour
+      - force_reset semantics
+      - _pending_ltr_event preservation across sub-forwards
+      - KV pool boundary guard (PP safety)
+    """
+
+    def setup_method(self):
+        clear_persistent_share_prefix_bufs()
+
+    # ------------------------------------------------------------------
+    # 6a. init_pipeline_state_for_forward – CPU-only (no CUDA needed)
+    # ------------------------------------------------------------------
+
+    def test_first_call_resets_pending_event(self):
+        """First sub-forward must clear any stale _pending_ltr_event."""
+        info, _, _, _ = _standard_batch()
+        # Simulate a stale event left over from a prior run
+        info._pending_ltr_event = object()  # any non-None sentinel
+        info.pipeline_initialized = False   # pretend new batch
+
+        info.init_pipeline_state_for_forward(pp_last_layer_id=59)
+
+        assert info._pending_ltr_event is None
+        assert info.pipeline_last_layer_id == 59
+        assert info.pipeline_initialized is True
+
+    def test_subsequent_call_preserves_pending_event(self):
+        """Subsequent sub-forward must NOT overwrite _pending_ltr_event."""
+        info, _, _, _ = _standard_batch()
+        sentinel = object()
+
+        # First sub-forward
+        info.init_pipeline_state_for_forward(pp_last_layer_id=59)
+        # Simulate Phase A having produced an event during sub-forward 1
+        info._pending_ltr_event = sentinel
+
+        # Second sub-forward (pipeline_initialized already True)
+        info.init_pipeline_state_for_forward(pp_last_layer_id=59)
+
+        assert info._pending_ltr_event is sentinel, \
+            "Subsequent sub-forward must not clear _pending_ltr_event"
+
+    def test_force_reset_clears_pending_event(self):
+        """force_reset=True always clears _pending_ltr_event."""
+        info, _, _, _ = _standard_batch()
+        sentinel = object()
+        info._pending_ltr_event = sentinel
+        info.pipeline_initialized = True   # already initialised
+
+        info.init_pipeline_state_for_forward(pp_last_layer_id=59, force_reset=True)
+
+        assert info._pending_ltr_event is None
+        assert info.pipeline_last_layer_id == 59
+
+    def test_pipeline_last_layer_id_set_to_pp_boundary(self):
+        """pipeline_last_layer_id must equal pp_last_layer_id, not sub-forward end."""
+        info, _, _, _ = _standard_batch()
+        info.pipeline_initialized = False
+
+        # Simulates: 60-layer model, PP=1, sub-forward processes layers 0-14
+        info.init_pipeline_state_for_forward(pp_last_layer_id=59)
+
+        # Must be 59 (whole PP rank last layer), NOT 14 (sub-forward end)
+        assert info.pipeline_last_layer_id == 59
+
+    def test_pipeline_initialized_gates_resets(self):
+        """pipeline_initialized correctly gates the reset across multiple calls."""
+        info, _, _, _ = _standard_batch()
+
+        assert info.pipeline_initialized is False
+
+        # First call → initialises
+        info.init_pipeline_state_for_forward(pp_last_layer_id=29)
+        assert info.pipeline_initialized is True
+        assert info.pipeline_last_layer_id == 29
+
+        # Manufacture a pending event
+        sentinel = object()
+        info._pending_ltr_event = sentinel
+
+        # Second call (same batch, next sub-forward) → must not reinit
+        info.init_pipeline_state_for_forward(pp_last_layer_id=29)
+        assert info._pending_ltr_event is sentinel
+
+    # ------------------------------------------------------------------
+    # 6b. _kv_pool_has_layer – CPU-only
+    # ------------------------------------------------------------------
+
+    def test_kv_pool_has_layer_in_range(self):
+        """Layers within [start_layer, start_layer+len) must return True."""
+        from sglang.srt.multiplex.share_prefix_helper import _kv_pool_has_layer
+
+        class _FakePool:
+            start_layer = 10
+            kv_buffer = [None] * 5   # layers 10..14
+
+        pool = _FakePool()
+        for lid in [10, 11, 12, 13, 14]:
+            assert _kv_pool_has_layer(pool, lid), f"layer {lid} should be in pool"
+
+    def test_kv_pool_has_layer_out_of_range(self):
+        """Layers outside the pool range must return False."""
+        from sglang.srt.multiplex.share_prefix_helper import _kv_pool_has_layer
+
+        class _FakePool:
+            start_layer = 10
+            kv_buffer = [None] * 5   # layers 10..14
+
+        pool = _FakePool()
+        for lid in [9, 15, 20]:
+            assert not _kv_pool_has_layer(pool, lid), f"layer {lid} should NOT be in pool"
+
+    # ------------------------------------------------------------------
+    # 6c. Cross-sub-forward CUDA event preservation (CUDA only)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+    def test_pending_ltr_event_survives_second_init_call(self):
+        """
+        Simulate two sub-forward init calls:
+          1. First call  → resets _pending_ltr_event, launches Phase A → ltr_event
+          2. Second call → must NOT clear ltr_event
+          3. main_stream.wait_event(ltr_event) must succeed
+        """
+        device = _TEST_CUDA_DEVICE
+        info, kv_buf, k_nope, k_pe = _standard_batch(device)
+        info.total_transfer_tokens = 0
+        info.combined_kv_buf.zero_()
+
+        comm_stream = torch.cuda.Stream(device=device)
+        info.set_pipeline_comm_stream(comm_stream)
+
+        # --- Sub-forward 1 init ---
+        info.init_pipeline_state_for_forward(pp_last_layer_id=59)
+        assert info._pending_ltr_event is None
+
+        # Simulate Phase A launched during sub-forward 1
+        ltr_event = _launch_phase_a(info, layer_id=0, kv_buf=kv_buf,
+                                     tp_group=None, comm_stream=comm_stream)
+        info._pending_ltr_event = ltr_event
+
+        # --- Sub-forward 2 init (should NOT clear ltr_event) ---
+        info.init_pipeline_state_for_forward(pp_last_layer_id=59)
+        assert info._pending_ltr_event is ltr_event, \
+            "Second sub-forward init must not clear _pending_ltr_event"
+
+        # Verify the event is usable: main_stream waits on it
+        torch.cuda.current_stream().wait_event(info._pending_ltr_event)
+        fill_extend_block_for_layer(info, k_nope, k_pe)
+        torch.cuda.synchronize()
+
+        # Extend block should be filled correctly
+        ext = info.combined_kv_buf[info.extend_block_start :].cpu()
+        assert ext[:, 0, : info.kv_lora_rank].min().item() == pytest.approx(7.0)
+
+    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+    def test_kv_pool_guard_demotes_next_layer_to_last(self):
+        """
+        When next_layer_id is outside the KV pool, _launch_phase_c_and_maybe_next_phase_a
+        must return None (treating the layer as last) without crashing.
+        """
+        device = _TEST_CUDA_DEVICE
+        info, kv_buf, k_nope, k_pe = _standard_batch(device)
+        info.total_transfer_tokens = 0
+        info.combined_kv_buf.zero_()
+
+        comm_stream = torch.cuda.Stream(device=device)
+        info.set_pipeline_comm_stream(comm_stream)
+        info.pipeline_last_layer_id = 13  # PP rank has layers 0..13
+
+        class _FakeLayer:
+            layer_id = 13
+
+        class _FakePool:
+            start_layer = 0
+            kv_buffer = [kv_buf] * 14   # layers 0..13 only
+
+            def get_key_buffer(self, lid):
+                from sglang.srt.multiplex.share_prefix_helper import _kv_pool_has_layer
+                if not _kv_pool_has_layer(self, lid):
+                    raise IndexError(f"layer {lid} out of range")
+                return self.kv_buffer[lid - self.start_layer]
+
+            def set_mla_kv_buffer(self, *a, **kw):
+                pass
+
+        out_cache_loc = torch.zeros(0, dtype=torch.int64, device=device)
+        attn_done = torch.cuda.Event()
+        attn_done.record()
+
+        # next_layer_id=14 is outside pool[0..13] → should return None safely
+        result = _launch_phase_c_and_maybe_next_phase_a(
+            info=info, layer_id=13, layer=_FakeLayer,
+            out_cache_loc=out_cache_loc, token_to_kv_pool=_FakePool(),
+            tp_group=None, attn_done_event=attn_done,
+            next_layer_id=14,   # out of range
+        )
+        torch.cuda.synchronize()
+        assert result is None, \
+            "Should return None when next_layer_id is outside KV pool range"

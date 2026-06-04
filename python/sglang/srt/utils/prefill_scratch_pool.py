@@ -2,8 +2,8 @@
 Grow-only scratch buffer pool for split-prefill (PD-MUX prefill) big tensors.
 
 Avoids repeated torch.empty / PyTorch CUDACachingAllocator cudaMalloc on hot
-paths (q_nope bmm, flash_attn out, fused_moe cache).  Disabled during CUDA
-graph capture, decode, and piecewise CUDA graph.
+paths (q_nope bmm, flash_attn out, w_vc bmm, fused_moe cache).  Disabled during
+CUDA graph capture, decode, and piecewise CUDA graph.
 """
 
 from __future__ import annotations
@@ -37,18 +37,27 @@ def _grow_capacity(current: int, needed: int) -> int:
     return cap
 
 
+def _numel_from_shape(shape: Tuple[int, ...]) -> int:
+    numel = 1
+    for d in shape:
+        numel *= int(d)
+    return numel
+
+
 class PrefillScratchBufferPool:
-    """Per-(device, dtype) grow-only scratch buffers for split-prefill."""
+    """Per-(device, dtype) grow-only scratch buffer for split-prefill."""
 
     def __init__(self, device: torch.device, dtype: torch.dtype) -> None:
         self.device = device
         self.dtype = dtype
-        self._attn_buf: Optional[torch.Tensor] = None
-        self._moe_buf: Optional[torch.Tensor] = None
-        self._attn_cap: int = 0
-        self._moe_cap: int = 0
-        # Per-layer sub-region sizes (set by acquire_* each layer)
-        self._attn_region_numel: int = 0
+        self._buf: Optional[torch.Tensor] = None
+        self._cap: int = 0
+        # Logical partitions (sum layout); set by ensure_capacity each bind/chunk.
+        self._attn_numel: int = 0
+        self._moe_numel: int = 0
+        # Attn sub-regions within [0, _attn_numel): kc bmm | flash out | w_vc bmm.
+        self._kc_numel: int = 0
+        self._flash_numel: int = 0
 
     @classmethod
     def get(cls, device: torch.device, dtype: torch.dtype) -> "PrefillScratchBufferPool":
@@ -92,68 +101,65 @@ class PrefillScratchBufferPool:
     def ensure_capacity(self, *, attn_numel: int, moe_numel: int) -> None:
         attn_numel = max(int(attn_numel), 0)
         moe_numel = max(int(moe_numel), 0)
+        # Sum layout: [attn | moe].  Future PR: + fp8_numel as third partition.
+        total_needed = attn_numel + moe_numel
+        self._attn_numel = attn_numel
+        self._moe_numel = moe_numel
 
-        if attn_numel > self._attn_cap:
-            old = self._attn_cap
-            new_cap = _grow_capacity(self._attn_cap, attn_numel)
-            self._attn_buf = torch.empty(new_cap, device=self.device, dtype=self.dtype)
-            self._attn_cap = new_cap
+        if total_needed > self._cap:
+            old = self._cap
+            new_cap = _grow_capacity(self._cap, total_needed)
+            self._buf = None
+            self._buf = torch.empty(new_cap, device=self.device, dtype=self.dtype)
+            self._cap = new_cap
             logger.info(
-                "[prefill_scratch] GROW attn: old_cap=%d new_cap=%d device=%s dtype=%s",
+                "[prefill_scratch] GROW total: old_cap=%d new_cap=%d "
+                "attn_numel=%d moe_numel=%d device=%s dtype=%s",
                 old,
                 new_cap,
+                attn_numel,
+                moe_numel,
                 self.device,
                 self.dtype,
             )
-
-        if moe_numel > self._moe_cap:
-            old = self._moe_cap
-            new_cap = _grow_capacity(self._moe_cap, moe_numel)
-            self._moe_buf = torch.empty(new_cap, device=self.device, dtype=self.dtype)
-            self._moe_cap = new_cap
-            logger.info(
-                "[prefill_scratch] GROW moe: old_cap=%d new_cap=%d device=%s dtype=%s",
-                old,
-                new_cap,
-                self.device,
-                self.dtype,
-            )
-
-        if attn_numel > 0 or moe_numel > 0:
+        elif total_needed > 0:
             logger.debug(
-                "[prefill_scratch] REUSE attn_cap=%d moe_cap=%d need_attn=%d need_moe=%d",
-                self._attn_cap,
-                self._moe_cap,
+                "[prefill_scratch] REUSE cap=%d need_total=%d attn=%d moe=%d",
+                self._cap,
+                total_needed,
                 attn_numel,
                 moe_numel,
             )
 
-    def set_attn_region_numel(self, region_numel: int) -> None:
-        """Size of one attn sub-region (q_nope / flash out each use one region)."""
-        self._attn_region_numel = max(int(region_numel), 0)
+    def _view_attn_region(self, offset: int, shape: Tuple[int, ...]) -> torch.Tensor:
+        numel = _numel_from_shape(shape)
+        end = offset + numel
+        assert self._buf is not None and end <= self._attn_numel
+        return self._buf[offset:end].view(*shape)
 
     def acquire_attn_bmm(self, shape: Tuple[int, ...]) -> torch.Tensor:
-        numel = 1
-        for d in shape:
-            numel *= int(d)
-        self.set_attn_region_numel(numel)
-        assert self._attn_buf is not None and numel <= self._attn_cap
-        return self._attn_buf[:numel].view(*shape)
+        numel = _numel_from_shape(shape)
+        self._kc_numel = numel
+        self._flash_numel = 0
+        return self._view_attn_region(0, shape)
 
     def acquire_flash_out(self, shape: Tuple[int, ...]) -> torch.Tensor:
-        numel = 1
-        for d in shape:
-            numel *= int(d)
-        region = self._attn_region_numel or numel
+        numel = _numel_from_shape(shape)
+        region = self._kc_numel or numel
         offset = region
-        end = offset + numel
-        assert self._attn_buf is not None and end <= self._attn_cap
-        return self._attn_buf[offset:end].view(*shape)
+        self._flash_numel = numel
+        return self._view_attn_region(offset, shape)
+
+    def acquire_vc_bmm(self, shape: Tuple[int, ...]) -> torch.Tensor:
+        offset = self._kc_numel + self._flash_numel
+        return self._view_attn_region(offset, shape)
 
     def acquire_moe_1d(self, numel: int) -> torch.Tensor:
         numel = int(numel)
-        assert self._moe_buf is not None and numel <= self._moe_cap
-        return self._moe_buf[:numel]
+        offset = self._attn_numel
+        end = offset + numel
+        assert self._buf is not None and end <= self._cap
+        return self._buf[offset:end]
 
     @classmethod
     @contextmanager
@@ -178,9 +184,11 @@ class PrefillScratchBufferPool:
         _active_local.pool = pool
         try:
             logger.debug(
-                "[prefill_scratch] binding enabled=1 attn_numel=%d moe_numel=%d device=%s",
+                "[prefill_scratch] binding enabled=1 attn_numel=%d moe_numel=%d "
+                "total=%d device=%s",
                 attn_numel,
                 moe_numel,
+                attn_numel + moe_numel,
                 device,
             )
             yield pool
@@ -204,14 +212,20 @@ def compute_scratch_requirements(
     layers = getattr(model, "layers", None)
     attn_heads = 128
     kv_lora_rank = 512
+    v_head_dim = 512
     if layers is not None and len(layers) > layer_start_idx:
         layer = layers[layer_start_idx]
         sa = getattr(layer, "self_attn", None)
         if sa is not None:
             attn_heads = int(getattr(sa, "tp_num_heads", attn_heads))
             kv_lora_rank = int(getattr(sa, "kv_lora_rank", kv_lora_rank))
+            v_head_dim = int(getattr(sa, "v_head_dim", kv_lora_rank))
 
-    attn_numel = 2 * num_tokens * attn_heads * kv_lora_rank
+    # kc bmm [H,T,kv] + flash out [T,H,kv] + w_vc bmm [H,T,v]
+    attn_numel = (
+        2 * num_tokens * attn_heads * kv_lora_rank
+        + num_tokens * attn_heads * v_head_dim
+    )
 
     config = getattr(model, "config", None)
     topk = int(getattr(config, "num_experts_per_tok", 8) or 8)
@@ -220,6 +234,5 @@ def compute_scratch_requirements(
     max_dim = max(intermediate, hidden)
 
     m = min(num_tokens, _MOE_CHUNK_SIZE)
-    # Conservative: token*topk plus TMA padding headroom (same order as fused_moe)
     moe_numel = (m * topk + m * topk) * max_dim
     return attn_numel, moe_numel

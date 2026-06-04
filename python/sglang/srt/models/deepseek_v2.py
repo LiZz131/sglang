@@ -4309,22 +4309,37 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
             else:
                 if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
-                    # logger.debug(f"w_vc: {self.w_vc.shape}, w_vc_normal_tp: {self.w_vc_normal_tp.shape}")
-                    # logger.debug(f"attn_output: {attn_output.shape}")
-                    attn_bmm_output = torch.empty(
-                        (attn_output.shape[0], self.tp_num_heads * self.v_head_dim),
-                        dtype=attn_output.dtype,
-                        device=attn_output.device,
-                    )
-                    # logger.debug(f"attn_bmm_output: {attn_bmm_output.shape}")
-                    torch.bmm(
-                        attn_output.transpose(0, 1),
-                        self.w_vc_normal_tp,
-                        out=attn_bmm_output.view(
-                            -1, self.tp_num_heads, self.v_head_dim
-                        ).transpose(0, 1),
-                    )
-                    # logger.debug(f"attn_bmm_output: {attn_bmm_output.shape}")
+                    pool = forward_batch.prefill_scratch_pool
+                    if pool is not None and PrefillScratchBufferPool.enabled(forward_batch):
+                        vc_bmm_out = pool.acquire_vc_bmm(
+                            (
+                                self.tp_num_heads,
+                                attn_output.shape[0],
+                                self.v_head_dim,
+                            )
+                        )
+                        torch.bmm(
+                            attn_output.transpose(0, 1),
+                            self.w_vc_normal_tp,
+                            out=vc_bmm_out,
+                        )
+                        attn_bmm_output = vc_bmm_out.transpose(0, 1).reshape(
+                            attn_output.shape[0],
+                            self.tp_num_heads * self.v_head_dim,
+                        )
+                    else:
+                        attn_bmm_output = torch.empty(
+                            (attn_output.shape[0], self.tp_num_heads * self.v_head_dim),
+                            dtype=attn_output.dtype,
+                            device=attn_output.device,
+                        )
+                        torch.bmm(
+                            attn_output.transpose(0, 1),
+                            self.w_vc_normal_tp,
+                            out=attn_bmm_output.view(
+                                -1, self.tp_num_heads, self.v_head_dim
+                            ).transpose(0, 1),
+                        )
                 else:
                     #  attn_output: torch.Size([2, 128, 512]), w_vc: torch.Size([128, 512, 128])
                     # logger.debug(f"attn_output: {attn_output.shape}, w_vc: {self.w_vc.shape}")

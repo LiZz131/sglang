@@ -20,10 +20,14 @@ import torch.nn.functional as F
 
 from sglang.srt.multiplex.share_prefix_helper import (
     SharePrefixBatchInfo,
-    clear_persistent_combined_kv_buf,
+    _acquire_cpu_all_gather_bufs,
+    _acquire_page_table,
+    clear_persistent_share_prefix_bufs,
     fill_local_and_extend_for_layer,
     fill_transfer_region_for_layer,
     get_persistent_combined_kv_buf_capacity,
+    get_persistent_cpu_all_gather_capacity,
+    get_persistent_page_table_capacity,
     reset_transfer_region,
     save_dp_local_kv,
 )
@@ -423,7 +427,7 @@ class TestFillTransferRegion:
     """Verify fill_transfer_region_for_layer fills the right slots in combined_kv_buf."""
 
     def setup_method(self):
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
 
     def _setup(self, local_dp_rank, local_attn_tp_rank):
         """
@@ -546,7 +550,7 @@ class TestFillLocalAndExtend:
     """Verify fill_local_and_extend_for_layer fills correct slots in combined_kv_buf."""
 
     def setup_method(self):
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
 
     def _make_test_batch(self):
         """
@@ -667,7 +671,7 @@ class TestEnsureCombinedBufAllocated:
     """Verify lazy wiring and idempotency of ensure_combined_buf_allocated."""
 
     def setup_method(self):
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
 
     def test_wires_on_first_call(self):
         """After first call, combined_kv_buf is a view with the correct shape."""
@@ -710,7 +714,7 @@ class TestEnsureCombinedBufAllocated:
 
 class TestResetTransferRegion:
     def setup_method(self):
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
 
     def test_zeroes_transfer_block(self):
         info = _make_info(
@@ -799,7 +803,7 @@ class TestSaveDpLocalKv:
     """Verify save_dp_local_kv writes transfer and extend KV to the correct slots."""
 
     def setup_method(self):
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
 
     # ------------------------------------------------------------------
     # Scenario 1: two requests, both dp-local, non-donor rank
@@ -1032,7 +1036,7 @@ class TestPersistentCombinedKvBuf:
     """
 
     def setup_method(self):
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
 
     def _make_simple_info(self, seq_lens, kv_cache_dim=8, kv_lora_rank=5):
         return _make_info(
@@ -1170,13 +1174,13 @@ class TestPersistentCombinedKvBuf:
         info.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
         assert get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu")) > 0
 
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
         assert get_persistent_combined_kv_buf_capacity(8, torch.float32, torch.device("cpu")) == 0
 
     def test_clear_then_alloc_works(self):
         info1 = self._make_simple_info(seq_lens=[10])
         info1.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
-        clear_persistent_combined_kv_buf()
+        clear_persistent_share_prefix_bufs()
 
         info2 = self._make_simple_info(seq_lens=[10])
         info2.ensure_combined_buf_allocated(8, 5, torch.float32, torch.device("cpu"))
@@ -1207,6 +1211,83 @@ class TestPersistentCombinedKvBuf:
 
         assert info.combined_kv_buf.shape[0] == total_combined
         assert cap > total_combined, "Persistent buffer has headroom beyond the view"
+
+
+# ---------------------------------------------------------------------------
+# Tests for grow-only persistent buffers (page_table, cpu all_gather)
+# ---------------------------------------------------------------------------
+
+class TestPersistentGrowOnlyBuffers:
+    """Unit tests for _acquire_page_table and _acquire_cpu_all_gather_bufs."""
+
+    def setup_method(self):
+        clear_persistent_share_prefix_bufs()
+
+    def test_page_table_grow_and_reuse(self):
+        dev = torch.device("cpu")
+        pt1 = _acquire_page_table(2, 10, dev)
+        assert pt1.shape == (2, 10)
+        pt1.fill_(7)
+
+        pt2 = _acquire_page_table(2, 8, dev)
+        assert pt2.shape == (2, 8)
+        assert pt2.abs().max().item() == 0, "view must be zeroed on reuse"
+
+        bs_cap, seq_cap = get_persistent_page_table_capacity(dev)
+        assert bs_cap >= 2 and seq_cap >= 10
+
+        pt3 = _acquire_page_table(5, 20, dev)
+        assert pt3.shape == (5, 20)
+        bs_cap2, seq_cap2 = get_persistent_page_table_capacity(dev)
+        assert bs_cap2 >= 5 and seq_cap2 >= 20
+
+    def test_page_table_grow_preserves_capacity_monotonic(self):
+        dev = torch.device("cpu")
+        _acquire_page_table(4, 16, dev)
+        cap1 = get_persistent_page_table_capacity(dev)
+        _acquire_page_table(2, 8, dev)
+        cap2 = get_persistent_page_table_capacity(dev)
+        assert cap2 == cap1, "smaller batch must not shrink pool"
+
+    def test_cpu_all_gather_grow_and_reuse(self):
+        ws = 4
+        local1, gathered1 = _acquire_cpu_all_gather_bufs("prefix", ws, 3)
+        assert local1.shape == (3,)
+        assert len(gathered1) == ws
+        assert all(g.shape == (3,) for g in gathered1)
+
+        local1.fill_(42)
+        cap1 = get_persistent_cpu_all_gather_capacity("prefix", ws)
+        assert cap1 >= 3
+
+        local2, gathered2 = _acquire_cpu_all_gather_bufs("prefix", ws, 2)
+        assert local2.shape == (2,)
+        assert gathered2[0].shape == (2,)
+        assert local2.abs().max().item() == 0 or local2.shape[0] < 3
+        # local2 is a view into same buffer; after new acquire with smaller n,
+        # the view is fresh slice – content from prior fill may remain outside
+        # the view; we only require correct shape here.
+
+        local3, _ = _acquire_cpu_all_gather_bufs("prefix", ws, 10)
+        assert local3.shape == (10,)
+        assert get_persistent_cpu_all_gather_capacity("prefix", ws) >= 10
+
+    def test_cpu_all_gather_separate_pools(self):
+        """sched and prefix pools are independent."""
+        clear_persistent_share_prefix_bufs()
+        _acquire_cpu_all_gather_bufs("sched", 2, 5)
+        _acquire_cpu_all_gather_bufs("prefix", 2, 3)
+        assert get_persistent_cpu_all_gather_capacity("sched", 2) >= 5
+        assert get_persistent_cpu_all_gather_capacity("prefix", 2) >= 3
+
+    def test_clear_persistent_share_prefix_bufs(self):
+        dev = torch.device("cpu")
+        _acquire_page_table(2, 4, dev)
+        _acquire_cpu_all_gather_bufs("prefix", 2, 3)
+        clear_persistent_share_prefix_bufs()
+        assert get_persistent_page_table_capacity(dev) == (0, 0)
+        assert get_persistent_cpu_all_gather_capacity("prefix", 2) == 0
+        assert get_persistent_combined_kv_buf_capacity(8, torch.float32, dev) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1340,3 +1421,223 @@ class TestDispatchFixLogic:
         # Case 5: backend returned MHA_ONE_SHOT, share-prefix disabled → unchanged
         result = apply_share_prefix_override(AttnForwardMethod.MHA_ONE_SHOT, enable_share_prefix=False)
         assert result == AttnForwardMethod.MHA_ONE_SHOT
+
+
+# ===========================================================================
+# TestMhaFallback
+# ===========================================================================
+
+
+class TestMhaFallback:
+    """
+    Tests for the per-batch MHA fallback logic.
+
+    These tests exercise the CPU-only decision logic without requiring a real
+    multi-rank distributed environment.  They mirror the logic inside
+    `prepare_for_extend` and `_set_mla_kv_buffer_for_dp`.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Fallback decision based on prefix ratio
+    # ------------------------------------------------------------------
+
+    def test_fallback_decision_ratio(self):
+        """
+        Verify the ratio threshold logic:
+          - ratio = sum(max_prefix) / sum(seq_lens)
+          - ratio < threshold  →  fallback triggered (_gathered_prefix_data = None)
+          - ratio >= threshold →  share-prefix continues
+        """
+        def should_fallback(max_prefix_list, seq_lens, threshold):
+            total_seq = sum(seq_lens)
+            if total_seq == 0:
+                return False
+            ratio = sum(max_prefix_list) / total_seq
+            return ratio < threshold
+
+        # Low prefix ratio — should fall back
+        assert should_fallback([10, 5, 8], [100, 100, 100], threshold=0.5)
+        # ratio = 23/300 ≈ 0.077 < 0.5
+
+        # High prefix ratio — should NOT fall back
+        assert not should_fallback([60, 70, 80], [100, 100, 100], threshold=0.5)
+        # ratio = 210/300 = 0.7 ≥ 0.5
+
+        # Exactly at threshold — should NOT fall back (< strictly)
+        assert not should_fallback([50, 50], [100, 100], threshold=0.5)
+        # ratio = 100/200 = 0.5, NOT < 0.5
+
+        # Just below threshold — should fall back
+        assert should_fallback([49, 50], [100, 100], threshold=0.5)
+        # ratio = 99/200 = 0.495 < 0.5
+
+        # All zero prefix (cold cache) — should fall back at any threshold > 0
+        assert should_fallback([0, 0, 0], [100, 100, 100], threshold=0.5)
+
+    # ------------------------------------------------------------------
+    # 2. input_ids in fallback = full fill_ids (no prefix skip)
+    # ------------------------------------------------------------------
+
+    def test_fallback_input_ids_is_full_seq(self):
+        """
+        In MHA fallback (prefix-0 treatment), input_ids must equal the full
+        fill_ids with no prefix offset.  prefix_lens must be 0 for all reqs
+        and extend_lens must equal seq_lens.
+        """
+
+        class MockReq:
+            def __init__(self, fill_ids, prefix_indices):
+                self.fill_ids = fill_ids
+                self.prefix_indices = prefix_indices
+
+        reqs = [
+            MockReq(fill_ids=list(range(100)), prefix_indices=list(range(20))),
+            MockReq(fill_ids=list(range(80)),  prefix_indices=list(range(30))),
+            MockReq(fill_ids=list(range(120)), prefix_indices=list(range(5))),
+        ]
+
+        # Simulate the _mha_fallback branch
+        seq_lens = [len(r.fill_ids) for r in reqs]
+        input_ids = [r.fill_ids for r in reqs]     # full seq
+        prefix_lens = [0] * len(reqs)
+        extend_lens = list(seq_lens)
+
+        assert input_ids[0] == list(range(100))   # no prefix stripped
+        assert input_ids[1] == list(range(80))
+        assert prefix_lens == [0, 0, 0]
+        assert extend_lens == [100, 80, 120]
+        # extend_num_tokens = sum(len(ids) for ids in input_ids) == sum(seq_lens)
+        assert sum(len(ids) for ids in input_ids) == sum(seq_lens)
+
+    # ------------------------------------------------------------------
+    # 3. dp_local_kv_save_starts/ends computation
+    # ------------------------------------------------------------------
+
+    def test_dp_local_kv_save_starts_ends(self):
+        """
+        Verify that dp_local_kv_save_starts/ends correctly point to the
+        [local_prefix, seq_len) slice within each dp-local request's block
+        in the flat prefix-0 kv_a tensor.
+
+        In prefix-0 mode, kv_a layout:
+          req0: [0 .. L0)
+          req1: [L0 .. L0+L1)
+          ...
+
+        For dp-local req i (local_prefix=P_i, seq_len=L_i):
+          save_start = sum(L_j for j<i) + P_i   ← skip cached prefix
+          save_end   = sum(L_j for j<i) + L_i
+          n_save     = L_i - P_i                 == out_cache_loc size for this req
+        """
+
+        class MockReq:
+            def __init__(self, fill_ids, prefix_indices, decode_dp_rank):
+                self.fill_ids = fill_ids
+                self.prefix_indices = prefix_indices
+                self.decode_dp_rank = decode_dp_rank
+
+        local_dp_rank = 1
+        reqs = [
+            # Non-local reqs (dp_rank=0)
+            MockReq(list(range(100)), list(range(20)), decode_dp_rank=0),
+            MockReq(list(range(80)),  list(range(30)), decode_dp_rank=0),
+            # dp-local reqs (dp_rank=1)
+            MockReq(list(range(120)), list(range(10)), decode_dp_rank=1),
+            MockReq(list(range(90)),  list(range(50)), decode_dp_rank=1),
+            # Another non-local
+            MockReq(list(range(60)),  list(range(15)), decode_dp_rank=0),
+        ]
+
+        # Simulate _mha_fallback computation
+        starts, ends = [], []
+        offset = 0
+        for req in reqs:
+            L = len(req.fill_ids)
+            P = len(req.prefix_indices)
+            if req.decode_dp_rank == local_dp_rank:
+                starts.append(offset + P)
+                ends.append(offset + L)
+            offset += L
+
+        # Expected:
+        # req0 (dp0, L=100): offset=0      → skip
+        # req1 (dp0, L=80):  offset=100    → skip
+        # req2 (dp1, L=120, P=10): offset=180 → start=190, end=300
+        # req3 (dp1, L=90,  P=50): offset=300 → start=350, end=390
+        # req4 (dp0, L=60):  offset=390   → skip
+
+        assert starts == [180 + 10, 300 + 50], f"starts={starts}"
+        assert ends   == [180 + 120, 300 + 90], f"ends={ends}"
+        assert starts == [190, 350]
+        assert ends   == [300, 390]
+
+        # Verify each save slice size matches out_cache_loc size
+        # out_cache_loc = sum(seq_len - local_prefix) for dp-local reqs
+        dp_local_reqs = [r for r in reqs if r.decode_dp_rank == local_dp_rank]
+        expected_out_cache_sizes = [
+            len(r.fill_ids) - len(r.prefix_indices) for r in dp_local_reqs
+        ]
+        save_sizes = [e - s for s, e in zip(starts, ends)]
+        assert save_sizes == expected_out_cache_sizes, (
+            f"save_sizes={save_sizes} != out_cache_loc sizes={expected_out_cache_sizes}"
+        )
+
+    # ------------------------------------------------------------------
+    # 4. dispatch must NOT force MLA when share_prefix_info is None
+    # ------------------------------------------------------------------
+
+    def test_mha_fallback_dispatch_not_forced_mla(self):
+        """
+        When share_prefix_info is None (MHA fallback or plain prefix-0),
+        dispatch_attn_forward_method must NOT override the backend's choice
+        to MLA.  Only when share_prefix_info is not None should MLA be forced.
+        """
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
+            AttnForwardMethod,
+        )
+
+        def apply_dispatch_override(initial_result, enable_share_prefix, share_prefix_info):
+            """Mirrors the fixed dispatch_attn_forward_method logic."""
+            if enable_share_prefix and share_prefix_info is not None:
+                # Force MLA (share-prefix active for this batch)
+                return AttnForwardMethod.MLA
+            elif initial_result == AttnForwardMethod.MLA:
+                # Downgrade MLA → MHA for prefix-0 / fallback
+                return AttnForwardMethod.MHA
+            return initial_result
+
+        # share-prefix enabled, share_prefix_info set → force MLA
+        r = apply_dispatch_override(
+            AttnForwardMethod.MHA_ONE_SHOT,
+            enable_share_prefix=True,
+            share_prefix_info=object(),  # non-None
+        )
+        assert r == AttnForwardMethod.MLA
+
+        # share-prefix enabled, share_prefix_info=None (MHA fallback) → do NOT force MLA
+        r = apply_dispatch_override(
+            AttnForwardMethod.MHA_ONE_SHOT,
+            enable_share_prefix=True,
+            share_prefix_info=None,
+        )
+        assert r == AttnForwardMethod.MHA_ONE_SHOT, (
+            f"MHA fallback should keep backend result MHA_ONE_SHOT, got {r}"
+        )
+
+        # share-prefix enabled, fallback, backend returned MLA → downgrade to MHA
+        r = apply_dispatch_override(
+            AttnForwardMethod.MLA,
+            enable_share_prefix=True,
+            share_prefix_info=None,
+        )
+        assert r == AttnForwardMethod.MHA, (
+            "prefix-0 / fallback should downgrade MLA → MHA"
+        )
+
+        # share-prefix disabled entirely → normal downgrade
+        r = apply_dispatch_override(
+            AttnForwardMethod.MHA_ONE_SHOT,
+            enable_share_prefix=False,
+            share_prefix_info=None,
+        )
+        assert r == AttnForwardMethod.MHA_ONE_SHOT

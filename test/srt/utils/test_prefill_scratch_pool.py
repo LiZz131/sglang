@@ -96,46 +96,52 @@ class TestEnabledGuards:
 
 
 class TestGrowOnly:
-    def test_grow_only_attn_moe(self):
+    def test_grow_only_single_buffer(self):
         pool = PrefillScratchBufferPool.get(torch.device("cpu"), torch.float32)
         pool.ensure_capacity(attn_numel=100, moe_numel=200)
-        attn_ptr = pool._attn_buf.data_ptr()
-        moe_ptr = pool._moe_buf.data_ptr()
+        buf_ptr = pool._buf.data_ptr()
+        assert pool._cap >= 300
 
         pool.ensure_capacity(attn_numel=50, moe_numel=80)
-        assert pool._attn_buf.data_ptr() == attn_ptr
-        assert pool._moe_buf.data_ptr() == moe_ptr
+        assert pool._buf.data_ptr() == buf_ptr
 
         pool.ensure_capacity(attn_numel=500, moe_numel=600)
-        assert pool._attn_buf.data_ptr() != attn_ptr
-        assert pool._moe_buf.data_ptr() != moe_ptr
-        assert pool._attn_cap >= 500
-        assert pool._moe_cap >= 600
+        assert pool._buf.data_ptr() != buf_ptr
+        assert pool._cap >= 1100
 
 
 class TestAcquireRegions:
-    def test_acquire_attn_two_regions_no_overlap(self):
+    def test_acquire_attn_three_regions_no_overlap(self):
         pool = PrefillScratchBufferPool.get(torch.device("cpu"), torch.float32)
-        pool.ensure_capacity(attn_numel=200, moe_numel=0)
+        kc_shape = (2, 3, 4)
+        fa_shape = (3, 2, 4)
+        vc_shape = (2, 3, 5)
+        attn_numel = 24 + 24 + 30
+        pool.ensure_capacity(attn_numel=attn_numel, moe_numel=0)
 
-        bmm = pool.acquire_attn_bmm((2, 3, 4))
-        flash = pool.acquire_flash_out((2, 3, 4))
+        kc = pool.acquire_attn_bmm(kc_shape)
+        fa = pool.acquire_flash_out(fa_shape)
+        vc = pool.acquire_vc_bmm(vc_shape)
 
-        assert bmm.numel() == 24
-        assert flash.numel() == 24
-        assert bmm.data_ptr() == pool._attn_buf.data_ptr()
-        assert flash.data_ptr() == pool._attn_buf.data_ptr() + 24 * bmm.element_size()
-        bmm.fill_(1.0)
-        flash.fill_(2.0)
-        assert pool._attn_buf[0].item() == 1.0
-        assert pool._attn_buf[24].item() == 2.0
+        assert kc.numel() == 24
+        assert fa.numel() == 24
+        assert vc.numel() == 30
+        assert kc.data_ptr() == pool._buf.data_ptr()
+        assert fa.data_ptr() == pool._buf.data_ptr() + 24 * kc.element_size()
+        assert vc.data_ptr() == pool._buf.data_ptr() + 48 * kc.element_size()
+        kc.fill_(1.0)
+        fa.fill_(2.0)
+        vc.fill_(3.0)
+        assert pool._buf[0].item() == 1.0
+        assert pool._buf[24].item() == 2.0
+        assert pool._buf[48].item() == 3.0
 
-    def test_acquire_moe_1d(self):
+    def test_acquire_moe_after_attn_partition(self):
         pool = PrefillScratchBufferPool.get(torch.device("cpu"), torch.float32)
-        pool.ensure_capacity(attn_numel=0, moe_numel=128)
-        buf = pool.acquire_moe_1d(64)
-        assert buf.shape == (64,)
-        assert buf.data_ptr() == pool._moe_buf.data_ptr()
+        pool.ensure_capacity(attn_numel=64, moe_numel=128)
+        moe = pool.acquire_moe_1d(64)
+        assert moe.shape == (64,)
+        assert moe.data_ptr() == pool._buf.data_ptr() + 64 * moe.element_size()
 
 
 class TestBinding:
@@ -190,6 +196,25 @@ class TestAttnBmmShape:
         assert q_nope_out.shape == (T, H, D)
         assert q_nope_out.shape == ref.shape
 
+    def test_pool_vc_bmm_matches_direct_bmm_shape(self):
+        H, T, K, V = 8, 32, 512, 128
+        pool = PrefillScratchBufferPool.get(torch.device("cpu"), torch.float32)
+        attn_numel = 2 * H * T * K + H * T * V
+        pool.ensure_capacity(attn_numel=attn_numel, moe_numel=0)
+        pool.acquire_attn_bmm((H, T, K))
+        pool.acquire_flash_out((T, H, K))
+
+        attn = torch.randn(T, H, K)
+        w_vc = torch.randn(H, K, V)
+
+        vc_out = pool.acquire_vc_bmm((H, T, V))
+        torch.bmm(attn.transpose(0, 1), w_vc, out=vc_out)
+        pooled = vc_out.transpose(0, 1).reshape(T, H * V)
+
+        ref = torch.bmm(attn.transpose(0, 1), w_vc).transpose(0, 1).reshape(T, H * V)
+        assert pooled.shape == (T, H * V)
+        assert pooled.shape == ref.shape
+
 
 class TestComputeRequirements:
     def test_compute_scratch_requirements_smoke(self):
@@ -200,6 +225,7 @@ class TestComputeRequirements:
         self_attn = MagicMock()
         self_attn.tp_num_heads = 16
         self_attn.kv_lora_rank = 512
+        self_attn.v_head_dim = 128
         layer = MagicMock()
         layer.self_attn = self_attn
         model = MagicMock()
@@ -207,7 +233,7 @@ class TestComputeRequirements:
         model.config = config
 
         attn, moe = compute_scratch_requirements(model, 0, num_tokens=32)
-        assert attn == 2 * 32 * 16 * 512
+        assert attn == 2 * 32 * 16 * 512 + 32 * 16 * 128
         assert moe > 0
 
 
@@ -218,4 +244,4 @@ class TestClearAll:
         PrefillScratchBufferPool.clear_all()
         assert PrefillScratchBufferPool.get_active() is None
         new_pool = PrefillScratchBufferPool.get(torch.device("cpu"), torch.float32)
-        assert new_pool._attn_cap == 0
+        assert new_pool._cap == 0

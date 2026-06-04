@@ -75,6 +75,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.cuda.nvtx as nvtx
 import torch.distributed as dist
@@ -195,6 +196,114 @@ def clear_persistent_combined_kv_buf() -> None:
     """
     _PERSISTENT_COMBINED_KV_BUF.clear()
     logger.debug("[share_prefix] persistent combined_kv_buf cleared")
+
+
+# ---------------------------------------------------------------------------
+# Persistent (grow-only) page_table + CPU all_gather buffers
+# ---------------------------------------------------------------------------
+# page_table_cached and the small int64 vectors used in scheduling / prefix
+# metadata all_gather are allocated once per (device) or (pool_key, world_size)
+# and reused as views across batches.
+
+_PERSISTENT_PAGE_TABLE: dict[str, torch.Tensor] = {}
+
+# pool_key -> {"local": Tensor, "gathered": List[Tensor], "capacity": int}
+# pool_key is "sched" (scheduling gather) or "prefix" (prepare_for_extend gather)
+_PERSISTENT_CPU_ALL_GATHER: dict[tuple[str, int], dict] = {}
+
+
+def _acquire_page_table(
+    batch_size: int,
+    max_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a zeroed [batch_size, max_seq_len] int32 view on a persistent buffer."""
+    key = str(device)
+    buf = _PERSISTENT_PAGE_TABLE.get(key)
+    if (
+        buf is None
+        or buf.shape[0] < batch_size
+        or buf.shape[1] < max_seq_len
+    ):
+        old_bs = buf.shape[0] if buf is not None else 0
+        old_seq = buf.shape[1] if buf is not None else 0
+        new_bs = max(batch_size * 2, old_bs * 2, batch_size)
+        new_seq = max(max_seq_len * 2, old_seq * 2, max_seq_len)
+        buf = torch.zeros((new_bs, new_seq), dtype=torch.int32, device=device)
+        _PERSISTENT_PAGE_TABLE[key] = buf
+        logger.info(
+            "[share_prefix] persistent page_table GROW: "
+            "old=(%d,%d) new=(%d,%d) need=(%d,%d) device=%s alloc_KB=%.1f",
+            old_bs, old_seq, new_bs, new_seq, batch_size, max_seq_len,
+            device, new_bs * new_seq * 4 / 1024,
+        )
+    else:
+        logger.debug(
+            "[share_prefix] persistent page_table REUSE: "
+            "capacity=(%d,%d) need=(%d,%d) headroom=(%d,%d)",
+            buf.shape[0], buf.shape[1], batch_size, max_seq_len,
+            buf.shape[0] - batch_size, buf.shape[1] - max_seq_len,
+        )
+    view = buf[:batch_size, :max_seq_len]
+    view.zero_()
+    return view
+
+
+def _acquire_cpu_all_gather_bufs(
+    pool_key: str,
+    world_size: int,
+    elem_count: int,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Return CPU int64 views (local, gathered) for dist.all_gather reuse.
+
+    ``gathered[i]`` receives rank-i data; all views have length ``elem_count``.
+    """
+    key = (pool_key, world_size)
+    state = _PERSISTENT_CPU_ALL_GATHER.get(key)
+    if state is None or state["capacity"] < elem_count:
+        old_cap = state["capacity"] if state is not None else 0
+        new_cap = max(elem_count * 2, old_cap * 2, elem_count)
+        local = torch.empty(new_cap, dtype=torch.int64)
+        gathered = [torch.empty(new_cap, dtype=torch.int64) for _ in range(world_size)]
+        state = {"local": local, "gathered": gathered, "capacity": new_cap}
+        _PERSISTENT_CPU_ALL_GATHER[key] = state
+        logger.info(
+            "[share_prefix] persistent cpu_all_gather GROW: "
+            "pool=%s world_size=%d old_cap=%d new_cap=%d need=%d alloc_KB=%.1f",
+            pool_key, world_size, old_cap, new_cap, elem_count,
+            new_cap * 8 * (1 + world_size) / 1024,
+        )
+    else:
+        logger.debug(
+            "[share_prefix] persistent cpu_all_gather REUSE: "
+            "pool=%s world_size=%d capacity=%d need=%d",
+            pool_key, world_size, state["capacity"], elem_count,
+        )
+    local = state["local"][:elem_count]
+    gathered = [g[:elem_count] for g in state["gathered"]]
+    return local, gathered
+
+
+def get_persistent_page_table_capacity(device: torch.device) -> tuple[int, int]:
+    """Return (max_batch_size, max_seq_len) capacity; (0, 0) if not allocated."""
+    buf = _PERSISTENT_PAGE_TABLE.get(str(device))
+    if buf is None:
+        return 0, 0
+    return buf.shape[0], buf.shape[1]
+
+
+def get_persistent_cpu_all_gather_capacity(pool_key: str, world_size: int) -> int:
+    """Return element capacity for a CPU all_gather pool; 0 if not allocated."""
+    state = _PERSISTENT_CPU_ALL_GATHER.get((pool_key, world_size))
+    return state["capacity"] if state is not None else 0
+
+
+def clear_persistent_share_prefix_bufs() -> None:
+    """Release all module-level persistent share-prefix buffers (tests / shutdown)."""
+    _PERSISTENT_COMBINED_KV_BUF.clear()
+    _PERSISTENT_PAGE_TABLE.clear()
+    _PERSISTENT_CPU_ALL_GATHER.clear()
+    logger.debug("[share_prefix] all persistent buffers cleared")
 
 
 # ---------------------------------------------------------------------------
@@ -663,12 +772,15 @@ def gather_scheduling_prefix_data(
 
     # ------------------------------------------------------------------ #
     # Step 3: all_gather  [prefix_len_0, …, prefix_len_{n-1}, budget]    #
-    #         via CPU (Gloo) group                                        #
+    #         via CPU (Gloo) group – persistent buffers                    #
     # ------------------------------------------------------------------ #
-    local_data = torch.tensor(
-        local_prefix_lens + [local_budget], dtype=torch.int64
+    elem_count = n + 1
+    local_data, gathered = _acquire_cpu_all_gather_bufs(
+        "sched", world_size, elem_count
     )
-    gathered = [torch.empty_like(local_data) for _ in range(world_size)]
+    local_data.copy_(
+        torch.tensor(local_prefix_lens + [local_budget], dtype=torch.int64)
+    )
     dist.all_gather(gathered, local_data, group=tp_cpu_group)
 
     # ------------------------------------------------------------------ #
@@ -721,7 +833,7 @@ def gather_scheduling_prefix_data(
 
 def gather_prefix_data(
     reqs,             # list of Req objects with .prefix_indices and .fill_ids
-    tp_group,         # GroupCoordinator (get_tp_group())
+    tp_cpu_group,     # Gloo CPU group (same as scheduling gather – small metadata)
     device: torch.device,
 ) -> "GatheredPrefixData":
     """
@@ -731,6 +843,10 @@ def gather_prefix_data(
     This is extracted so that prepare_for_extend can call it BEFORE slicing
     input_ids – every rank then uses max_prefix as the effective base so all
     ranks feed the same number of tokens to the model per request.
+
+    Communication uses the CPU Gloo group (tp_cpu_group): only int64 metadata
+    (n prefix lengths per rank) is exchanged.  GPU NCCL would add unnecessary
+    device sync and allocation for payloads this small.
 
     Returns GatheredPrefixData (never None, but may be empty if n==0).
     """
@@ -756,13 +872,14 @@ def gather_prefix_data(
         local_dp_rank, local_attn_tp_rank, local_prefix_lens_cpu, seq_lens_cpu,
     )
 
-    # All-gather across tp_group (covers all DP ranks × attn_tp ranks)
-    local_tensor = torch.tensor(
-        local_prefix_lens_cpu, dtype=torch.int64, device=device
+    # All-gather prefix lengths via CPU Gloo (persistent buffers)
+    world_size = dist.get_world_size(group=tp_cpu_group)
+    local_data, gathered = _acquire_cpu_all_gather_bufs("prefix", world_size, n)
+    local_data.copy_(
+        torch.tensor(local_prefix_lens_cpu, dtype=torch.int64)
     )
-    gathered = [torch.empty_like(local_tensor) for _ in range(tp_size * dp_size)]
     with share_prefix_nvtx_range(None, -1, "gather_prefix"):
-        dist.all_gather(gathered, local_tensor, group=tp_group.device_group)
+        dist.all_gather(gathered, local_data, group=tp_cpu_group)
 
     # dp_prefix_matrix[dp_rank][req_idx] = prefix len (use attn_tp_rank 0 per DP group)
     dp_prefix_matrix: List[List[int]] = []
@@ -879,7 +996,7 @@ def compute_share_prefix_info(
     # 1. All-gather (or reuse cached data)                                  #
     # ------------------------------------------------------------------ #
     if gathered_data is None:
-        gathered_data = gather_prefix_data(reqs, tp_group, device)
+        gathered_data = gather_prefix_data(reqs, tp_group.cpu_group, device)
 
     local_prefix_lens_cpu = gathered_data.local_prefix_lens
     seq_lens_cpu = gathered_data.seq_lens
@@ -968,9 +1085,7 @@ def compute_share_prefix_info(
             all_local_src_indices = torch.empty(0, dtype=torch.int64, device=device)
 
         max_seq_len = max(seq_lens_cpu)
-        page_table_cached = torch.zeros(
-            (n, max_seq_len), dtype=torch.int32, device=device
-        )
+        page_table_cached = _acquire_page_table(n, max_seq_len, device)
         for i in range(n):
             min_p = min_prefix_list[i]
             max_p = max_prefix_list[i]
@@ -1475,3 +1590,236 @@ def save_dp_local_kv(
         total_transfer_written,
         total_extend_written,
     )
+
+
+# ---------------------------------------------------------------------------
+# Bench helpers (bench_attn_path.py)
+# ---------------------------------------------------------------------------
+
+_BENCH_PREFIX_SCATTER_STRIDE = 17
+
+
+def bench_compute_max_prefix_len(input_len: int, prefix_ratio: float) -> int:
+    """Tokens cached as prefix on the donor DP rank (fraction of input_len)."""
+    if prefix_ratio <= 0.0:
+        return 0
+    if prefix_ratio >= 1.0:
+        raise ValueError(f"prefix_ratio must be in [0, 1), got {prefix_ratio}")
+    return max(1, int(input_len * prefix_ratio))
+
+
+def bench_local_prefix_len(
+    owner_dp_rank: int,
+    attn_dp_rank: int,
+    max_prefix: int,
+) -> int:
+    """Local radix hit length on this attn DP rank (0 on non-owner ranks)."""
+    if max_prefix <= 0:
+        return 0
+    return max_prefix if attn_dp_rank == owner_dp_rank else 0
+
+
+def bench_allocate_scattered_prefix_slots(
+    allocator,
+    prefix_len: int,
+    seed: int,
+) -> torch.Tensor:
+    """Allocate ``prefix_len`` KV-pool slots with gaps (non-contiguous indices).
+
+    Reserves ``prefix_len * stride`` slots from the allocator, picks one slot
+    per window with a pseudo-random in-window offset, and returns the unused
+    slots to the free list.
+    """
+    if prefix_len <= 0:
+        device = getattr(allocator, "device", "cpu")
+        return torch.empty(0, dtype=torch.int64, device=device)
+
+    stride = _BENCH_PREFIX_SCATTER_STRIDE
+    need = prefix_len * stride
+    block = allocator.alloc(need)
+    if block is None:
+        raise RuntimeError(
+            f"[bench_attn_path] failed to allocate {need} KV slots "
+            f"for scattered prefix (prefix_len={prefix_len})"
+        )
+    block = block.to(dtype=torch.int64, device=allocator.device)
+
+    rng = np.random.default_rng(seed)
+    chosen: List[int] = []
+    for i in range(prefix_len):
+        off = int(rng.integers(0, max(stride - 1, 1)))
+        chosen.append(int(block[i * stride + off].item()))
+
+    used = set(chosen)
+    unused = [int(block[j].item()) for j in range(need) if int(block[j].item()) not in used]
+    if unused:
+        allocator.free(
+            torch.tensor(unused, dtype=torch.int64, device=allocator.device)
+        )
+    return torch.tensor(chosen, dtype=torch.int64, device=allocator.device)
+
+
+@torch.no_grad()
+def bench_seed_prefix_kv_cache(
+    model_runner,
+    slot_indices: torch.Tensor,
+    seed: int,
+) -> None:
+    """Write deterministic dummy MLA KV into prefix slots (all layers)."""
+    if slot_indices.numel() == 0:
+        return
+
+    kv_pool = model_runner.token_to_kv_pool
+    start = kv_pool.start_layer
+    end = start + len(kv_pool.kv_buffer)
+    kv_dim = kv_pool.kv_cache_dim
+    device = model_runner.device
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed & 0xFFFFFFFF)
+
+    slots = slot_indices.to(device=device, dtype=torch.int64)
+    n = slots.numel()
+    for layer_id in range(start, end):
+        buf = kv_pool.get_key_buffer(layer_id)
+        values = (
+            torch.randn(n, 1, kv_dim, device=device, generator=gen, dtype=torch.float32)
+            * 0.01
+        ).to(buf.dtype)
+        buf[slots] = values
+
+
+def bench_seed_all_prefix_kv_caches(model_runner, reqs, base_seed: int) -> None:
+    for i, req in enumerate(reqs):
+        pi = getattr(req, "prefix_indices", None)
+        if pi is not None and pi.numel() > 0:
+            bench_seed_prefix_kv_cache(model_runner, pi, base_seed + i * 10007)
+
+
+def bench_setup_prefix_kv_for_reqs(
+    reqs,
+    model_runner,
+    base_seed: int,
+) -> None:
+    """Allocate scattered prefix slots and seed KV for each request."""
+    allocator = model_runner.token_to_kv_pool_allocator
+    for i, req in enumerate(reqs):
+        plen = int(getattr(req, "_bench_local_prefix_len", 0))
+        if plen <= 0:
+            req.prefix_indices = torch.empty(0, dtype=torch.int64, device=allocator.device)
+            continue
+        req.prefix_indices = bench_allocate_scattered_prefix_slots(
+            allocator, plen, base_seed + i * 10007 + 1
+        )
+    bench_seed_all_prefix_kv_caches(model_runner, reqs, base_seed)
+
+
+def log_bench_attn_path_config(
+    attn_path: str,
+    batch_size: int,
+    input_len: int,
+    num_layers: int,
+    dp_size: int,
+    tp_size: int,
+    prefix_ratio: float = 0.0,
+) -> None:
+    """Log benchmark configuration for prefix0 vs share_prefix comparison."""
+    if attn_path == "prefix0":
+        attn_route = "MHA (forward_normal_prepare/core)"
+    else:
+        attn_route = "MLA (forward_absorb_prepare/core + _share_prefix_attn_mqa)"
+    logger.info(
+        "[bench_attn_path] config: path=%s route=%s bs=%d input_len=%d prefix_ratio=%.3f "
+        "max_prefix=%d layers=%d dp=%d tp=%d mode=split_prefill(full_chunk)",
+        attn_path,
+        attn_route,
+        batch_size,
+        input_len,
+        prefix_ratio,
+        bench_compute_max_prefix_len(input_len, prefix_ratio),
+        num_layers,
+        dp_size,
+        tp_size,
+    )
+
+
+def log_bench_attn_path_batch_context(batch, attn_path: str) -> None:
+    """Log batch-level context after prepare_for_split_prefill."""
+    from sglang.srt.server_args import get_global_server_args
+
+    info = getattr(batch, "share_prefix_info", None)
+    decode_dp_ranks = [getattr(r, "decode_dp_rank", None) for r in batch.reqs]
+    prefix_lens = [len(getattr(r, "prefix_indices", [])) for r in batch.reqs]
+    try:
+        server_args = get_global_server_args()
+        pipeline_overlap = server_args.enable_share_prefix_pipeline_overlap
+    except ValueError:
+        pipeline_overlap = False
+
+    logger.info(
+        "[bench_attn_path] batch: path=%s forward_mode=%s bs=%d "
+        "extend_num_tokens=%d decode_dp_ranks=%s prefix_lens=%s "
+        "dp_local_reqs=%s pipeline_overlap=%s",
+        attn_path,
+        getattr(batch.forward_mode, "name", batch.forward_mode),
+        batch.batch_size(),
+        batch.extend_num_tokens,
+        decode_dp_ranks,
+        prefix_lens,
+        getattr(batch, "dp_local_req_indices", None),
+        pipeline_overlap,
+    )
+    if info is None:
+        logger.info(
+            "[bench_attn_path] share_prefix_info=None (expected for path=prefix0)"
+        )
+        return
+
+    combined_cap = 0
+    kv_cache_dim = getattr(info, "kv_cache_dim", 0)
+    if kv_cache_dim > 0:
+        dtype = (
+            info.combined_kv_buf.dtype
+            if info.combined_kv_buf is not None
+            else torch.float16
+        )
+        combined_cap = get_persistent_combined_kv_buf_capacity(
+            kv_cache_dim, dtype, batch.device
+        )
+    page_cap = get_persistent_page_table_capacity(batch.device)
+    logger.info(
+        "[bench_attn_path] share_prefix buffer: dp_rank=%d total_transfer=%d "
+        "local_block=%d extend_block_start=%d combined_toks=%d | "
+        "min_prefix=%s max_prefix=%s transfer_len=%s max_rank=%s",
+        info.local_dp_rank,
+        info.total_transfer_tokens,
+        info.local_block_size,
+        info.extend_block_start,
+        sum(info.seq_lens),
+        info.min_prefix,
+        info.max_prefix,
+        info.transfer_len,
+        info.max_rank,
+    )
+    logger.info(
+        "[bench_attn_path] persistent pools: combined_kv_cap=%d page_table_cap=%s "
+        "combined_buf_allocated=%s",
+        combined_cap,
+        page_cap,
+        info.combined_kv_buf is not None,
+    )
+    if info.page_table_cached is not None:
+        logger.info(
+            "[bench_attn_path] page_table shape=%s",
+            tuple(info.page_table_cached.shape),
+        )
+    if info.total_transfer_tokens > 0:
+        logger.info(
+            "[bench_attn_path] comm expected: all_reduce on transfer_block "
+            "xfer_tokens=%d per_layer (check [share_prefix] L*/all_reduce logs)",
+            info.total_transfer_tokens,
+        )
+    else:
+        logger.info(
+            "[bench_attn_path] comm expected: transfer_tokens=0, "
+            "all_reduce payload empty (still builds combined_kv_buf on share_prefix path)"
+        )
