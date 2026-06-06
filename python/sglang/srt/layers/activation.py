@@ -72,7 +72,13 @@ class SiluAndMul(MultiPlatformOp):
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        from sglang.srt.utils.prefill_scratch_pool import try_acquire_scratch
+
+        out = try_acquire_scratch(
+            tuple(output_shape), dtype=x.dtype, device=x.device, kind="aux"
+        )
+        if out is None:
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         silu_and_mul(x, out)
         return out
 

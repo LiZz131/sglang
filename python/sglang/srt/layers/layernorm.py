@@ -129,7 +129,15 @@ class RMSNorm(MultiPlatformOp):
                 residual = residual + post_residual_addition
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
-        out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+        from sglang.srt.utils.prefill_scratch_pool import try_acquire_scratch
+
+        out = try_acquire_scratch(
+            tuple(x.shape), dtype=x.dtype, device=x.device, kind="aux"
+        )
+        if out is None:
+            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+        else:
+            rmsnorm(x, self.weight.data, self.variance_epsilon, out=out)
         return out
 
     def forward_npu(

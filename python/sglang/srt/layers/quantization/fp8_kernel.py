@@ -425,6 +425,19 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
 ):
+    from sglang.srt.utils.prefill_scratch_pool import try_acquire_scratch
+
+    def _alloc(raw_shape, dtype):
+        buf = try_acquire_scratch(
+            tuple(raw_shape),
+            dtype=dtype,
+            device=device,
+            kind="int" if dtype in (torch.int, torch.int32) else "fp32",
+        )
+        if buf is not None:
+            return buf
+        return torch.empty(raw_shape, device=device, dtype=dtype)
+
     if scale_ue8m0:
         assert column_major_scales and scale_tma_aligned
         *x_batch, x_q_mn, x_q_k = x_shape
@@ -432,32 +445,28 @@ def create_per_token_group_quant_fp8_output_scale(
         aligned_mn = ceil_align(x_s_mn, 4)
         aligned_k = ceil_align(x_s_k, 4)
         # TODO(FIXME): Fix cuda kernel and recover here to empty.
-        return torch.empty(
+        return _alloc(
             (*x_batch, aligned_k // 4, aligned_mn),
-            device=device,
-            dtype=torch.int,
+            torch.int,
         ).transpose(-1, -2)[..., :x_s_mn, :]
     elif column_major_scales:
         if scale_tma_aligned:
             # TODO extract "align" function
             # aligned to 4 * sizeof(float)
             aligned_size = (x_shape[-2] + 3) // 4 * 4
-            return torch.empty(
+            return _alloc(
                 x_shape[:-2] + (x_shape[-1] // group_size, aligned_size),
-                device=device,
-                dtype=torch.float32,
+                torch.float32,
             ).transpose(-1, -2)[: x_shape[-2], :]
         else:
-            return torch.empty(
+            return _alloc(
                 (x_shape[-1] // group_size,) + x_shape[:-1],
-                device=device,
-                dtype=torch.float32,
+                torch.float32,
             ).permute(-1, -2)
     else:
-        return torch.empty(
+        return _alloc(
             x_shape[:-1] + (x_shape[-1] // group_size,),
-            device=device,
-            dtype=torch.float32,
+            torch.float32,
         )
 
 
@@ -479,7 +488,13 @@ def sglang_per_token_group_quant_fp8(
 
     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
 
-    x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
+    from sglang.srt.utils.prefill_scratch_pool import try_acquire_scratch
+
+    x_q = try_acquire_scratch(
+        out_shape, dtype=fp8_dtype, device=x.device, kind="fp8"
+    )
+    if x_q is None:
+        x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
         x_shape=out_shape,
         device=x.device,
@@ -1050,7 +1065,13 @@ def prepare_block_fp8_matmul_inputs(
         raise NotImplementedError
 
     C_shape = A.shape[:-1] + (N,)
-    C = A.new_empty(C_shape, dtype=output_dtype)
+    from sglang.srt.utils.prefill_scratch_pool import try_acquire_scratch
+
+    C = try_acquire_scratch(
+        C_shape, dtype=output_dtype, device=A.device, kind="aux"
+    )
+    if C is None:
+        C = A.new_empty(C_shape, dtype=output_dtype)
 
     return M, N, K, C
 
