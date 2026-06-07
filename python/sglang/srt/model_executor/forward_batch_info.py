@@ -302,8 +302,8 @@ class ForwardBatch:
     dp_local_token_end: Optional[int] = None
     # for share prefix across DP ranks (SharePrefixBatchInfo | None)
     share_prefix_info: Optional[Any] = None
-    # split-prefill grow-only scratch pool (PrefillScratchBufferPool | None)
-    prefill_scratch_pool: Optional[Any] = None
+    # split-prefill mem_stream scratch binding active
+    prefill_mem_stream_active: bool = False
     # MHA fallback: per-dp-local-req kv_a slice boundaries (None = standard path)
     dp_local_kv_save_starts: Optional[List[int]] = None
     dp_local_kv_save_ends: Optional[List[int]] = None

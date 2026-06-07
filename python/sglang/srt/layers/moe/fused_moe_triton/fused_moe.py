@@ -374,16 +374,26 @@ def fused_experts_impl(
     )
     total_tokens = M * topk + max_padded_tokens
     cache_numel = total_tokens * max(N, w2.shape[1])
-    pool = None
     try:
-        from sglang.srt.utils.prefill_scratch_pool import PrefillScratchBufferPool
+        from sglang.srt.utils.prefill_mem_stream import (
+            is_active,
+            scratch_empty,
+            scratch_empty_1d,
+        )
 
-        pool = PrefillScratchBufferPool.get_active()
+        if is_active():
+            cache = scratch_empty_1d(
+                cache_numel,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        else:
+            cache = torch.empty(
+                cache_numel,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
     except Exception:
-        pool = None
-    if pool is not None:
-        cache = pool.acquire_moe_1d(cache_numel)
-    else:
         cache = torch.empty(
             cache_numel,
             device=hidden_states.device,
@@ -440,11 +450,25 @@ def fused_experts_impl(
         intermediate_cache1 = cache[: total_tokens * N].view(
             (total_tokens, N),
         )
-        intermediate_cache2 = torch.empty(
-            (total_tokens, N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
+        try:
+            if is_active():
+                intermediate_cache2 = scratch_empty(
+                    (total_tokens, N // 2),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+            else:
+                intermediate_cache2 = torch.empty(
+                    (total_tokens, N // 2),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+        except Exception:
+            intermediate_cache2 = torch.empty(
+                (total_tokens, N // 2),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]

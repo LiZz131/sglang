@@ -651,8 +651,8 @@ class ServerArgs:
     enable_share_prefix_nvtx: bool = False
     share_prefix_nvtx_layer_stride: int = 1
     enable_share_prefix_pipeline_overlap: bool = False
-    # Grow-only scratch buffers for split-prefill big tensors (bmm / flash / moe)
-    enable_prefill_scratch_pool: bool = False
+    # mem_stream scratch alloc for split-prefill big tensors (bmm / flash / moe)
+    enable_prefill_mem_stream: bool = False
     auto_adjust_stream_group: bool = True
     manual_stream_group_idx: int = 0
     # PD-Multiplexing time model (special-DP event loop): choose stream group by predicted decode run
@@ -4671,12 +4671,12 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
-            "--enable-prefill-scratch-pool",
+            "--enable-prefill-mem-stream",
             action="store_true",
             help=(
-                "Use grow-only persistent scratch buffers for split-prefill big "
-                "tensor allocations (q_nope bmm, flash_attn out, fused_moe cache). "
-                "Disabled during CUDA graph capture and piecewise CUDA graph."
+                "Allocate split-prefill scratch tensors on a dedicated CUDA stream "
+                "(mem_stream) with event sync (q_nope bmm, flash_attn out, moe cache, "
+                "etc.). Disabled during CUDA graph capture and piecewise CUDA graph."
             ),
         )
         parser.add_argument(

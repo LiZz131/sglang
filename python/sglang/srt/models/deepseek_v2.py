@@ -165,9 +165,9 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.prefill_scratch_pool import (
-    PrefillScratchBufferPool,
-    compute_scratch_requirements,
+from sglang.srt.utils.prefill_mem_stream import (
+    PrefillMemStream,
+    scratch_empty,
 )
 from sglang.srt.utils import (
     BumpAllocator,
@@ -3913,10 +3913,14 @@ class DeepseekV2AttentionMLA(nn.Module):
             # w_kc: torch.Size([128, 128, 512]), w_kc_normal_tp: torch.Size([128, 64, 512])
             if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
                 q_bmm = q_nope.transpose(0, 1)
-                pool = forward_batch.prefill_scratch_pool
-                if pool is not None and PrefillScratchBufferPool.enabled(forward_batch):
-                    bmm_out = pool.acquire_attn_bmm(
-                        (q_bmm.shape[0], q_bmm.shape[1], self.w_kc_normal_tp.shape[2])
+                if (
+                    forward_batch.prefill_mem_stream_active
+                    and PrefillMemStream.enabled(forward_batch)
+                ):
+                    bmm_out = scratch_empty(
+                        (q_bmm.shape[0], q_bmm.shape[1], self.w_kc_normal_tp.shape[2]),
+                        dtype=q_bmm.dtype,
+                        device=q_bmm.device,
                     )
                     torch.bmm(q_bmm, self.w_kc_normal_tp, out=bmm_out)
                     q_nope_out = bmm_out
@@ -4309,14 +4313,18 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
             else:
                 if forward_batch.forward_mode.is_split_prefill() and self.enable_special_dp_attention:
-                    pool = forward_batch.prefill_scratch_pool
-                    if pool is not None and PrefillScratchBufferPool.enabled(forward_batch):
-                        vc_bmm_out = pool.acquire_vc_bmm(
+                    if (
+                        forward_batch.prefill_mem_stream_active
+                        and PrefillMemStream.enabled(forward_batch)
+                    ):
+                        vc_bmm_out = scratch_empty(
                             (
                                 self.tp_num_heads,
                                 attn_output.shape[0],
                                 self.v_head_dim,
-                            )
+                            ),
+                            dtype=attn_output.dtype,
+                            device=attn_output.device,
                         )
                         torch.bmm(
                             attn_output.transpose(0, 1),
@@ -4980,11 +4988,15 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
 
             with share_prefix_nvtx_range(info, layer_id, "flash_attn", elem_size=elem_size):
-                pool = forward_batch.prefill_scratch_pool
                 flash_out = None
-                if pool is not None and PrefillScratchBufferPool.enabled(forward_batch):
-                    flash_out = pool.acquire_flash_out(
-                        (q_pe.shape[0], q_pe.shape[1], self.kv_lora_rank)
+                if (
+                    forward_batch.prefill_mem_stream_active
+                    and PrefillMemStream.enabled(forward_batch)
+                ):
+                    flash_out = scratch_empty(
+                        (q_pe.shape[0], q_pe.shape[1], self.kv_lora_rank),
+                        dtype=q_pe.dtype,
+                        device=q_pe.device,
                     )
                 result = flash_attn_with_kvcache(
                     q=q_pe,
@@ -5062,6 +5074,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                     op=dist.ReduceOp.SUM,
                     group=tp_group.device_group,
                 )
+                # info.combined_kv_buf[info.local_block_size : info.extend_block_start] = \
+                #     tensor_model_parallel_all_reduce(
+                #     info.combined_kv_buf[
+                #         info.local_block_size : info.extend_block_start
+                #     ]
+                # )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "[share_prefix] layer=%d all_reduce done, transfer norm=%.4f",
@@ -5080,6 +5098,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         with share_prefix_nvtx_range(info, layer_id, "fill_local_extend", elem_size=elem_size):
             fill_local_and_extend_for_layer(info, k_nope, k_pe, kv_buf)
 
+        # TODO(lbz, share-prefix): page size seems not necessary here?
         # ---- 4. Flash attention (all layout tensors are pre-computed, no new allocs) ----
         # combined_kv_buf: [total_combined, 1, kv_cache_dim]
         # Reshape to paged format with page_size=1:
@@ -5108,11 +5127,15 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
 
         with share_prefix_nvtx_range(info, layer_id, "flash_attn", elem_size=elem_size):
-            pool = forward_batch.prefill_scratch_pool
             flash_out = None
-            if pool is not None and PrefillScratchBufferPool.enabled(forward_batch):
-                flash_out = pool.acquire_flash_out(
-                    (q_pe.shape[0], q_pe.shape[1], self.kv_lora_rank)
+            if (
+                forward_batch.prefill_mem_stream_active
+                and PrefillMemStream.enabled(forward_batch)
+            ):
+                flash_out = scratch_empty(
+                    (q_pe.shape[0], q_pe.shape[1], self.kv_lora_rank),
+                    dtype=q_pe.dtype,
+                    device=q_pe.device,
                 )
             result = flash_attn_with_kvcache(
                 q=q_pe,
@@ -6262,17 +6285,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     scaling_beta=self.model.llama_4_scaling_config["beta"],
                     positions=positions,
                 )
-            num_tokens = forward_batch.hidden_states.shape[0]
-            attn_numel, moe_numel = compute_scratch_requirements(
-                self.model, layer_start, num_tokens
-            )
-            with PrefillScratchBufferPool.binding(
-                forward_batch,
-                device,
-                forward_batch.hidden_states.dtype,
-                attn_numel=attn_numel,
-                moe_numel=moe_numel,
-            ):
+            with PrefillMemStream.binding(forward_batch):
                 for i in range(layer_start, layer_end):
                     # logger.info(f"prefill layer {i} forward, start={layer_start}, end={layer_end}")
                     layer_gpu_handle = nvtx.range_start(f"{layer_start} : {layer_end} prefill layer {i} launch, start={layer_start}, end={layer_end}")

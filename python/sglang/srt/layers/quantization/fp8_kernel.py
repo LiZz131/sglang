@@ -425,17 +425,11 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
 ):
-    from sglang.srt.utils.prefill_scratch_pool import try_acquire_scratch
+    from sglang.srt.utils.prefill_mem_stream import is_active, scratch_empty
 
     def _alloc(raw_shape, dtype):
-        buf = try_acquire_scratch(
-            tuple(raw_shape),
-            dtype=dtype,
-            device=device,
-            kind="int" if dtype in (torch.int, torch.int32) else "fp32",
-        )
-        if buf is not None:
-            return buf
+        if is_active():
+            return scratch_empty(tuple(raw_shape), dtype=dtype, device=device)
         return torch.empty(raw_shape, device=device, dtype=dtype)
 
     if scale_ue8m0:
@@ -488,12 +482,11 @@ def sglang_per_token_group_quant_fp8(
 
     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
 
-    from sglang.srt.utils.prefill_scratch_pool import try_acquire_scratch
+    from sglang.srt.utils.prefill_mem_stream import is_active, scratch_empty
 
-    x_q = try_acquire_scratch(
-        out_shape, dtype=fp8_dtype, device=x.device, kind="fp8"
-    )
-    if x_q is None:
+    if is_active():
+        x_q = scratch_empty(out_shape, dtype=fp8_dtype, device=x.device)
+    else:
         x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
         x_shape=out_shape,
@@ -1065,12 +1058,11 @@ def prepare_block_fp8_matmul_inputs(
         raise NotImplementedError
 
     C_shape = A.shape[:-1] + (N,)
-    from sglang.srt.utils.prefill_scratch_pool import try_acquire_scratch
+    from sglang.srt.utils.prefill_mem_stream import is_active, scratch_empty
 
-    C = try_acquire_scratch(
-        C_shape, dtype=output_dtype, device=A.device, kind="aux"
-    )
-    if C is None:
+    if is_active():
+        C = scratch_empty(C_shape, dtype=output_dtype, device=A.device)
+    else:
         C = A.new_empty(C_shape, dtype=output_dtype)
 
     return M, N, K, C
